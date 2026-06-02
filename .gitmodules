@@ -7,3 +7,6 @@
 [submodule "carbide2-control"]
 	path = carbide2-control
 	url = https://github.com/fdimitri/carbide2-control.git
+[submodule "carbide2-worker"]
+	path = carbide2-worker
+	url = https://github.com/fdimitri/carbide2-worker.git

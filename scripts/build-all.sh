@@ -12,15 +12,17 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLIENT="$ROOT/carbide2-client"
 SERVER="$ROOT/carbide2-server"
 CONTROL="$ROOT/carbide2-control"
+WORKER="$ROOT/carbide2-worker"
 
-for d in "$CLIENT" "$SERVER" "$CONTROL"; do
-  [ -d "$d" ] || { echo "missing submodule: $d (run: git submodule update --init --recursive)" >&2; exit 1; }
+for d in "$CLIENT" "$SERVER" "$CONTROL" "$WORKER"; do
+  [ -d "$d" ] || { echo "missing submodule: $d (run: git submodule update --init)" >&2; exit 1; }
 done
 
 echo "==> [1/2] carbide2:dev (workspace pod)"
 docker buildx build --load \
   -t carbide2:dev \
   --build-context "client=$CLIENT" \
+  --build-context "worker=$WORKER" \
   "$SERVER"
 
 echo "==> [2/2] carbide2-control:dev (control plane + dashboard)"
