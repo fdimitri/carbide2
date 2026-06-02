@@ -1,0 +1,9 @@
+[submodule "carbide2-client"]
+	path = carbide2-client
+	url = https://github.com/fdimitri/carbide2-client.git
+[submodule "carbide2-server"]
+	path = carbide2-server
+	url = https://github.com/fdimitri/carbide2-server.git
+[submodule "carbide2-control"]
+	path = carbide2-control
+	url = https://github.com/fdimitri/carbide2-control.git
