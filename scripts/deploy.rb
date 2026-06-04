@@ -29,9 +29,12 @@
 #   ./scripts/deploy.rb                 full build + deploy
 #   ./scripts/deploy.rb --no-build      skip image build (re-import + redeploy)
 #   ./scripts/deploy.rb --no-infra      skip cluster/infra bring-up
+#   ./scripts/deploy.rb --no-tls        skip mkcert TLS setup (Traefik default cert)
 #   ./scripts/deploy.rb --help
 
 require 'optparse'
+require 'tmpdir'
+require 'tempfile'
 
 # Bundler/inline installs the two helper gems at runtime, which needs a ruby
 # whose gem dir is writable. A bare system ruby (e.g. /usr/bin/ruby on Debian)
@@ -145,6 +148,7 @@ module Carbide
       import_images
       apply_crd
       install_control_plane
+      setup_tls unless @opts[:no_tls]
       roll_deployments
       verify
       summary
@@ -186,6 +190,97 @@ module Carbide
           warn_ "  #{img} not present locally — skipping import (build it first)"
         end
       end
+    end
+
+    # Generate a locally-trusted TLS cert with mkcert and install it as the
+    # Traefik *default* certificate, so every IngressRoute that leaves its tls
+    # block empty (tls: {}) — the control-plane route AND the operator's
+    # per-workspace ws-* routes — serves a trusted cert. Without this Traefik
+    # falls back to its built-in "TRAEFIK DEFAULT CERT" (wrong host, untrusted),
+    # which browsers let you click through for page loads but NOT for wss://
+    # WebSocket handshakes — so the IDE socket fails with no response headers.
+    def setup_tls
+      ns     = ENV.fetch('TRAEFIK_NS', 'traefik')
+      secret = ENV.fetch('TLS_SECRET', 'carbide-tls')
+
+      if @cmd.run!('kubectl', '-n', ns, 'get', "secret/#{secret}").success?
+        log "TLS secret #{ns}/#{secret} already present — reusing (delete it to regenerate)"
+        ensure_tls_store(ns, secret)
+        return
+      end
+
+      unless system('command -v mkcert >/dev/null 2>&1')
+        abort <<~ERR
+          \e[1;31mxx mkcert not found.\e[0m It is required to mint a locally-trusted TLS
+          cert for the ingress. Without a trusted cert the dashboard loads after a
+          browser click-through, but the IDE WebSocket (wss://) silently fails.
+
+          Install mkcert, then re-run this script:
+            # Debian/Ubuntu
+            sudo apt-get install -y libnss3-tools
+            curl -JLO "https://dl.filippo.io/mkcert/latest?for=linux/amd64"
+            chmod +x mkcert-v*-linux-amd64 && sudo mv mkcert-v*-linux-amd64 /usr/local/bin/mkcert
+            mkcert -install
+
+          Alternatives:
+            - set TLS_SECRET to an existing kubernetes TLS secret in the
+              '#{ns}' namespace to skip mkcert, or
+            - re-run with --no-tls to leave Traefik on its (untrusted) default cert.
+        ERR
+      end
+
+      hosts = tls_hosts
+      log "minting locally-trusted cert via mkcert for: #{hosts.join(' ')}"
+      Dir.mktmpdir do |dir|
+        crt = File.join(dir, 'tls.crt')
+        key = File.join(dir, 'tls.key')
+        @cmd.run('mkcert', '-cert-file', crt, '-key-file', key, *hosts)
+        @cmd.run('kubectl', '-n', ns, 'create', 'secret', 'tls', secret,
+                 "--cert=#{crt}", "--key=#{key}")
+      end
+      ensure_tls_store(ns, secret)
+
+      caroot, = @cmd.run!('mkcert', '-CAROOT')
+      caroot = (caroot || '').strip
+      warn_ "Trust mkcert's root CA on the machine running your browser, or wss:// still fails:"
+      warn_ "  rootCA: #{caroot}/rootCA.pem"
+      warn_ "  (copy it to that machine and `mkcert -install`, or import it into the OS/browser trust store)"
+    end
+
+    # The TLSStore named 'default' in Traefik's namespace is the cert Traefik
+    # serves whenever an IngressRoute's tls block names no explicit secret.
+    def ensure_tls_store(ns, secret)
+      store = <<~YAML
+        apiVersion: traefik.io/v1alpha1
+        kind: TLSStore
+        metadata:
+          name: default
+          namespace: #{ns}
+        spec:
+          defaultCertificate:
+            secretName: #{secret}
+      YAML
+      Tempfile.create(['tlsstore', '.yaml']) do |f|
+        f.write(store)
+        f.flush
+        @cmd.run('kubectl', 'apply', '-f', f.path)
+      end
+    end
+
+    # Hostnames/IPs the cert is valid for. Override with TLS_HOSTS="a b c";
+    # otherwise auto-detect this host's FQDN, short name, and IPs plus loopback.
+    def tls_hosts
+      return ENV['TLS_HOSTS'].split if ENV['TLS_HOSTS'] && !ENV['TLS_HOSTS'].strip.empty?
+
+      hosts = %w[localhost 127.0.0.1 ::1]
+      %w[-f -s].each do |flag|
+        out, = @cmd.run!('hostname', flag)
+        v = (out || '').strip
+        hosts << v unless v.empty?
+      end
+      ips, = @cmd.run!('hostname', '-I')
+      hosts.concat((ips || '').strip.split)
+      hosts.uniq
     end
 
     def apply_crd
@@ -275,16 +370,18 @@ module Carbide
         Re-run this script any time to rebuild + redeploy. Flags:
           --no-build   skip image build (just re-import + redeploy)
           --no-infra   skip cluster/infra bring-up
+          --no-tls     skip mkcert TLS setup (leave Traefik default cert)
       MSG
     end
   end
 end
 
-opts = { no_build: false, no_infra: false }
+opts = { no_build: false, no_infra: false, no_tls: false }
 OptionParser.new do |o|
-  o.banner = 'Usage: deploy.rb [--no-build] [--no-infra]'
+  o.banner = 'Usage: deploy.rb [--no-build] [--no-infra] [--no-tls]'
   o.on('--no-build', 'Skip image build (just re-import + redeploy)') { opts[:no_build] = true }
   o.on('--no-infra', 'Skip cluster/infra bring-up')                  { opts[:no_infra] = true }
+  o.on('--no-tls',   'Skip mkcert TLS setup (Traefik default cert)')  { opts[:no_tls] = true }
   o.on('-h', '--help', 'Show this help') { puts o; exit 0 }
 end.parse!(ARGV)
 
