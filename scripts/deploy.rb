@@ -31,10 +31,21 @@
 #   ./scripts/deploy.rb --no-infra      skip cluster/infra bring-up
 #   ./scripts/deploy.rb --no-tls        skip mkcert TLS setup (Traefik default cert)
 #   ./scripts/deploy.rb --help
+#
+# Real (non-mkcert) certs — e.g. internal-test.carbidecore.online signed by an
+# internal/corporate CA. Two standalone steps bracket your CA; neither touches
+# the build pipeline:
+#   PUBLIC_HOST=internal-test.carbidecore.online ./scripts/deploy.rb --csr
+#       -> writes <host>.key + <host>.csr to TLS_OUT_DIR (default ./tls).
+#          Submit the .csr to your CA.
+#   ./scripts/deploy.rb --import-cert ./tls/<host>.crt
+#       -> loads the signed cert (+ the .key) into the TLS_SECRET k8s secret and
+#          wires it as Traefik's default cert. Later deploys reuse that secret.
 
 require 'optparse'
 require 'tmpdir'
 require 'tempfile'
+require 'fileutils'
 
 # Bundler/inline installs the two helper gems at runtime, which needs a ruby
 # whose gem dir is writable. A bare system ruby (e.g. /usr/bin/ruby on Debian)
@@ -148,6 +159,9 @@ module Carbide
     end
 
     def run
+      return generate_csr if @opts[:csr]
+      return import_cert if @opts[:import_cert]
+
       require_tools
       ensure_infra unless @opts[:no_infra]
       build_images unless @opts[:no_build]
@@ -229,6 +243,8 @@ module Carbide
             mkcert -install
 
           Alternatives:
+            - bring a real CA-signed cert: ./scripts/deploy.rb --csr  then
+              ./scripts/deploy.rb --import-cert <signed.crt>, or
             - set TLS_SECRET to an existing kubernetes TLS secret in the
               '#{ns}' namespace to skip mkcert, or
             - re-run with --no-tls to leave Traefik on its (untrusted) default cert.
@@ -288,6 +304,116 @@ module Carbide
       ips, = @cmd.run!('hostname', '-I')
       hosts.concat((ips || '').strip.split)
       hosts.uniq
+    end
+
+    # --- bring-your-own-CA cert flow -------------------------------------------
+    # For a real cert (internal/corporate CA, public ACME-portal, etc.) you don't
+    # want a locally-trusted mkcert cert — you want a CSR your CA can sign. These
+    # two steps bracket the CA and exit without touching the build pipeline.
+
+    # Where --csr writes the key/CSR and where --import-cert looks for the key.
+    def csr_dir = File.expand_path(ENV.fetch('TLS_OUT_DIR', 'tls'))
+
+    # Pick the cert CN: prefer an explicit FQDN (PUBLIC_HOST or a dotted SAN),
+    # falling back to the first host so the file naming stays predictable.
+    def csr_common_name(hosts)
+      return @public_host unless @public_host.empty? || @public_host == 'localhost'
+
+      hosts.find { |h| h.include?('.') && !h.match?(/\A[0-9.]+\z/) } || hosts.first
+    end
+
+    def dns_san?(host) = !host.include?(':') && !host.match?(/\A[0-9.]+\z/)
+
+    def openssl_csr_config(cn, hosts)
+      sans = hosts.each_with_index
+                  .map { |h, i| "#{dns_san?(h) ? 'DNS' : 'IP'}.#{i + 1} = #{h}" }
+                  .join("\n")
+      <<~CNF
+        [req]
+        distinguished_name = dn
+        req_extensions = v3_req
+        prompt = no
+        [dn]
+        CN = #{cn}
+        [v3_req]
+        basicConstraints = CA:FALSE
+        keyUsage = digitalSignature, keyEncipherment
+        extendedKeyUsage = serverAuth
+        subjectAltName = @alt
+        [alt]
+        #{sans}
+      CNF
+    end
+
+    def generate_csr
+      unless system('command -v openssl >/dev/null 2>&1')
+        abort "\e[1;31mxx\e[0m openssl not found — required to generate a CSR."
+      end
+
+      hosts = tls_hosts
+      cn    = csr_common_name(hosts)
+      FileUtils.mkdir_p(csr_dir)
+      key = File.join(csr_dir, "#{cn}.key")
+      csr = File.join(csr_dir, "#{cn}.csr")
+      log "generating RSA key + CSR for CN=#{cn}"
+      log "  SANs: #{hosts.join(' ')}"
+      Tempfile.create(['csr', '.cnf']) do |cfg|
+        cfg.write(openssl_csr_config(cn, hosts))
+        cfg.flush
+        @cmd.run('openssl', 'req', '-new', '-newkey', 'rsa:2048', '-nodes',
+                 '-keyout', key, '-out', csr, '-config', cfg.path)
+      end
+      File.chmod(0o600, key)
+      puts <<~MSG
+
+        \e[1;32mCSR written.\e[0m Keep the key private; submit the CSR to your CA.
+          key: #{key}   (private — do not share)
+          csr: #{csr}
+
+        When your CA returns the signed certificate (PEM), import it:
+          ./scripts/deploy.rb --import-cert #{csr.sub(/\.csr\z/, '.crt')}
+
+        If the CA gives you a chain, concatenate the leaf + intermediates into
+        that .crt (leaf first) before importing.
+      MSG
+    end
+
+    def import_cert
+      unless system('command -v kubectl >/dev/null 2>&1')
+        abort "\e[1;31mxx\e[0m kubectl not found — required to import the cert."
+      end
+
+      ns     = ENV.fetch('TRAEFIK_NS', 'traefik')
+      secret = ENV.fetch('TLS_SECRET', 'carbide-tls')
+      crt    = File.expand_path(@opts[:import_cert])
+      abort "\e[1;31mxx\e[0m cert not found: #{crt}" unless File.file?(crt)
+
+      key = @opts[:key] ? File.expand_path(@opts[:key]) : default_csr_key
+      unless key && File.file?(key)
+        abort "\e[1;31mxx\e[0m private key not found. Pass --key PATH (or run " \
+              "--csr first so the key lives in #{csr_dir})."
+      end
+
+      log "importing cert into secret #{ns}/#{secret}"
+      log "  cert: #{crt}"
+      log "  key:  #{key}"
+      # Recreate so a re-import replaces an older cert rather than failing on AlreadyExists.
+      @cmd.run!('kubectl', '-n', ns, 'delete', 'secret', secret, '--ignore-not-found')
+      @cmd.run('kubectl', '-n', ns, 'create', 'secret', 'tls', secret,
+               "--cert=#{crt}", "--key=#{key}")
+      ensure_tls_store(ns, secret)
+      puts <<~MSG
+
+        \e[1;32mCert imported.\e[0m Traefik now serves #{ns}/#{secret} as its default cert.
+        Run ./scripts/deploy.rb (it reuses an existing TLS_SECRET) or, if the
+        stack is already up, the new cert is live immediately.
+      MSG
+    end
+
+    # The single .key left in TLS_OUT_DIR by --csr, when --key isn't given.
+    def default_csr_key
+      keys = Dir.glob(File.join(csr_dir, '*.key'))
+      keys.first if keys.size == 1
     end
 
     def apply_crd
@@ -384,12 +510,15 @@ module Carbide
   end
 end
 
-opts = { no_build: false, no_infra: false, no_tls: false }
+opts = { no_build: false, no_infra: false, no_tls: false, csr: false, import_cert: nil, key: nil }
 OptionParser.new do |o|
-  o.banner = 'Usage: deploy.rb [--no-build] [--no-infra] [--no-tls]'
+  o.banner = 'Usage: deploy.rb [--no-build] [--no-infra] [--no-tls] [--csr | --import-cert FILE]'
   o.on('--no-build', 'Skip image build (just re-import + redeploy)') { opts[:no_build] = true }
   o.on('--no-infra', 'Skip cluster/infra bring-up')                  { opts[:no_infra] = true }
   o.on('--no-tls',   'Skip mkcert TLS setup (Traefik default cert)')  { opts[:no_tls] = true }
+  o.on('--csr', 'Generate a private key + CSR (TLS_HOSTS/PUBLIC_HOST) in TLS_OUT_DIR, then exit') { opts[:csr] = true }
+  o.on('--import-cert FILE', 'Load a CA-signed cert into TLS_SECRET as Traefik default, then exit') { |v| opts[:import_cert] = v }
+  o.on('--key FILE', 'Private key for --import-cert (default: the .key from --csr in TLS_OUT_DIR)') { |v| opts[:key] = v }
   o.on('-h', '--help', 'Show this help') { puts o; exit 0 }
 end.parse!(ARGV)
 
