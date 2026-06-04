@@ -18,19 +18,32 @@ for d in "$CLIENT" "$SERVER" "$CONTROL" "$WORKER"; do
   [ -d "$d" ] || { echo "missing submodule: $d (run: git submodule update --init)" >&2; exit 1; }
 done
 
-echo "==> [1/2] carbide2:dev (workspace pod)"
+echo "==> [1/3] carbide2:dev (workspace pod)"
 docker buildx build --load \
   -t carbide2:dev \
   --build-context "client=$CLIENT" \
   --build-context "worker=$WORKER" \
   "$SERVER"
 
-echo "==> [2/2] carbide2-control:dev (control plane + dashboard)"
+echo "==> [2/3] carbide2-control:dev (control plane + dashboard)"
 docker buildx build --load \
   -t carbide2-control:dev \
   --build-context "client=$CLIENT" \
   "$CONTROL"
 
+# The workspace shell pod (per-project terminal container) runs this image.
+# The operator defaults CARBIDE_SHELL_IMAGE to carbide2-shell:dev, so the
+# cluster expects this tag to exist or shell pods ImagePullBackOff.
+echo "==> [3/3] carbide2-shell:dev (per-project terminal container)"
+docker buildx build --load \
+  -t carbide2-shell:dev \
+  -f "$SERVER/Dockerfile.shell" \
+  "$SERVER"
+
 echo
 echo "Done. Images:"
-docker images --format '  {{.Repository}}:{{.Tag}}  {{.Size}}' | grep -E '^  carbide2(-control)?:dev'
+# docker --format strips leading literal spaces, so anchor on the repo name and
+# indent the display ourselves with sed.
+docker images --format '{{.Repository}}:{{.Tag}}  {{.Size}}' \
+  | grep -E '^(carbide2|carbide2-control|carbide2-shell):dev' \
+  | sed 's/^/  /'

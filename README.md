@@ -49,18 +49,42 @@ Requires Docker with BuildKit (`docker buildx`):
 ./scripts/build-all.sh
 ```
 
-Produces two images locally:
+Produces three images locally:
 
 - `carbide2:dev` — workspace pod (used by the operator for per-project pods)
 - `carbide2-control:dev` — control-plane Rails + operator + bundled dashboard SPA
+- `carbide2-shell:dev` — per-project terminal container the workspace pod spawns
 
-## Local k3d stack
+## Deploy the local k3d stack
+
+One idempotent command takes a machine from nothing to a serving dashboard.
+It builds the images, brings up the `carbide-dev` cluster (CNPG, Traefik,
+Postgres), imports the images into the cluster, installs the Workspace CRD,
+and installs/upgrades the control-plane (Rails dashboard + operator):
 
 ```bash
-./scripts/dev-cluster.sh   # creates the carbide-dev cluster + installs CNPG, traefik, control plane
+./scripts/deploy.rb
 ```
 
-Then visit <http://localhost:8088/> for the dashboard.
+Re-run it any time to rebuild and redeploy after a code change — it also
+rolls the workspace pods. Flags: `--no-build` (skip image build, just
+re-import + redeploy) and `--no-infra` (skip cluster/infra bring-up).
+
+The orchestrator is Ruby: it shells out to `docker`/`k3d`/`helm` for the
+build/deploy steps but reads cluster state (pod readiness, Workspace CR
+phases) through `kubeclient` — the same client the operator uses — for its
+verification report. Requires `ruby` + `bundler` on the host; the two gems
+it needs are installed on first run via `bundler/inline`.
+
+Then visit <https://localhost:8443/> for the dashboard (the plain-HTTP
+<http://localhost:8080/> redirects there; the dev cert is self-signed, so
+your browser will warn the first time). The seed user is
+`admin@example.com` / `password`.
+
+> `./scripts/build-all.sh` only builds images; `./scripts/deploy.rb` is what
+> actually puts the stack on the cluster. Running `build-all.sh` plus the
+> infra-only `carbide2-server/scripts/dev-cluster.sh` leaves Traefik up with
+> no routes — every URL 404s until the control plane is deployed.
 
 ## Licence
 
