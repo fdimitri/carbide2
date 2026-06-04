@@ -139,6 +139,12 @@ module Carbide
       @release    = ENV.fetch('RELEASE', 'carbide-control')
       @http_port  = ENV.fetch('HTTP_PORT', '8080')
       @https_port = ENV.fetch('HTTPS_PORT', '8443')
+      # The hostname the BROWSER uses to reach the ingress. Drives the TLS cert
+      # SANs, the public URL the control-plane advertises, and the Rails host
+      # allowlist for workspace pods. Defaults to localhost for a purely-local
+      # cluster; set PUBLIC_HOST=dev1.frankd.local for a LAN-reachable dev box.
+      @public_host = ENV.fetch('PUBLIC_HOST', 'localhost')
+      @public_url  = ENV.fetch('PUBLIC_URL_BASE', "https://#{@public_host}:#{@https_port}")
     end
 
     def run
@@ -273,6 +279,7 @@ module Carbide
       return ENV['TLS_HOSTS'].split if ENV['TLS_HOSTS'] && !ENV['TLS_HOSTS'].strip.empty?
 
       hosts = %w[localhost 127.0.0.1 ::1]
+      hosts << @public_host unless @public_host.empty?
       %w[-f -s].each do |flag|
         out, = @cmd.run!('hostname', flag)
         v = (out || '').strip
@@ -297,6 +304,7 @@ module Carbide
                '--namespace', @control_ns, '--create-namespace',
                '--set', "ingress.publicPort=#{@http_port}",
                '--set', "ingress.publicHttpsPort=#{@https_port}",
+               '--set', "publicUrlBase=#{@public_url}",
                '--set-json', 'ingress.entryPoints=["web","websecure"]',
                '--set-json', 'ingress.tls={}',
                '--wait', '--timeout', '5m')
@@ -360,7 +368,7 @@ module Carbide
 
         \e[1;32mStack deployed to cluster '#{@cluster}'.\e[0m
 
-          Dashboard:   https://localhost:#{@https_port}/   (http://localhost:#{@http_port}/ redirects here)
+          Dashboard:   #{@public_url}/   (http://#{@public_host}:#{@http_port}/ redirects here)
           Seeded user: admin@example.com / password   (carbide2-control db/seeds.rb)
 
         Inspect:
