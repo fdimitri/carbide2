@@ -216,13 +216,43 @@ module Carbide
 
     def import_images
       log "importing images into k3d cluster '#{@cluster}'"
+      node = "k3d-#{@cluster}-server-0"
       IMAGES.each do |img|
-        if @cmd.run!("docker image inspect #{img}").success?
-          log "  import #{img}"
-          @cmd.run('k3d', 'image', 'import', img, '-c', @cluster)
-        else
-          warn_ "  #{img} not present locally — skipping import (build it first)"
+        # Every image here is required. A missing local image used to only warn
+        # and let the deploy finish — leaving the cluster in a broken state where
+        # pods ImagePullBackOff against docker.io (the image is local-only and was
+        # never pushed). Fail loudly instead so the operator builds it first.
+        unless @cmd.run!("docker image inspect #{img}").success?
+          abort "\e[1;31mxx\e[0m #{img} not present locally — build it first " \
+                "(scripts/build-all.sh) then re-run. Refusing to deploy a cluster " \
+                "that will ImagePullBackOff."
         end
+        log "  import #{img}"
+        @cmd.run('k3d', 'image', 'import', img, '-c', @cluster)
+        # Verify the image actually landed in the node's containerd. `k3d image
+        # import` has been observed to no-op/lose an image (e.g. shell image
+        # missing from the node despite a clean host build), which is invisible
+        # until the first pod tries to pull and falls back to docker.io.
+        unless node_has_image?(node, img)
+          abort "\e[1;31mxx\e[0m #{img} did not land in node '#{node}' containerd " \
+                "after import — pods would ImagePullBackOff. Aborting."
+        end
+      end
+    end
+
+    # True if the node's containerd holds <repo>:<tag>. crictl's positional and
+    # -q reference filters are unreliable across versions (they ignore the
+    # filter and list everything), so match repo+tag as exact columns instead.
+    # Local-only images normalize to the docker.io/library/ prefix in containerd.
+    def node_has_image?(node, img)
+      repo, tag = img.split(':', 2)
+      tag ||= 'latest'
+      ref = "docker.io/library/#{repo}"
+      res = @cmd.run!("docker exec #{node} crictl images")
+      return false unless res.success?
+      res.out.each_line.any? do |line|
+        cols = line.split
+        cols[0] == ref && cols[1] == tag
       end
     end
 
