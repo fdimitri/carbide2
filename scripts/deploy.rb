@@ -156,6 +156,20 @@ module Carbide
       # cluster; set PUBLIC_HOST=dev1.frankd.local for a LAN-reachable dev box.
       @public_host = ENV.fetch('PUBLIC_HOST', 'localhost')
       @public_url  = ENV.fetch('PUBLIC_URL_BASE', "https://#{@public_host}:#{@https_port}")
+      # Which deployments roll_deployments restarts after a redeploy:
+      #   all     — control-plane AND workspace deployments (+ orphaned shell
+      #             pods). Version-coherent: the editor SPA (served by the
+      #             workspace pod) and the dashboard SPA (served by control-
+      #             plane) move together, avoiding client:server skew. Cost:
+      #             restarting a workspace deployment kills its worker and
+      #             drops all live project terminals/PTYs.
+      #   control — control-plane deployments only. Preserves active project
+      #             terminals, but risks a new dashboard talking to an old
+      #             workspace API. Use when iterating on control-plane only.
+      #   none    — skip rolling entirely (helm/CRD changes only).
+      # Default is 'all' because every current environment is dev, where
+      # coherence matters more than terminal uptime. CLI --roll-scope overrides.
+      @roll_scope = (@opts[:roll_scope] || ENV.fetch('ROLL_SCOPE', 'all')).to_s
     end
 
     def run
@@ -437,12 +451,22 @@ module Carbide
     end
 
     def roll_deployments
+      if @roll_scope == 'none'
+        log "roll-scope=none — skipping deployment rollouts"
+        return
+      end
+
       # helm upgrade is a no-op for the pod spec when only image *contents* change
       # (same tag), so force a rollout to pull the freshly-imported images.
       log "rolling control-plane Deployments to pick up new images"
       %w[control-plane-rails control-plane-operator].each do |dep|
         @cmd.run('kubectl', '-n', @control_ns, 'rollout', 'restart', "deploy/#{dep}")
         @cmd.run('kubectl', '-n', @control_ns, 'rollout', 'status', "deploy/#{dep}", '--timeout=5m')
+      end
+
+      if @roll_scope == 'control'
+        log "roll-scope=control — leaving workspace deployments (and live terminals) untouched"
+        return
       end
 
       # Roll any existing workspace deployments so re-deploys refresh them too.
@@ -516,20 +540,25 @@ module Carbide
           helm -n #{@control_ns} get values #{@release}
 
         Re-run this script any time to rebuild + redeploy. Flags:
-          --no-build   skip image build (just re-import + redeploy)
-          --no-infra   skip cluster/infra bring-up
-          --no-tls     skip mkcert TLS setup (leave Traefik default cert)
+          --no-build         skip image build (just re-import + redeploy)
+          --no-infra         skip cluster/infra bring-up
+          --no-tls           skip mkcert TLS setup (leave Traefik default cert)
+          --roll-scope all   roll everything (default; coherent but drops terminals)
+          --roll-scope control   roll control-plane only (keeps project terminals alive)
+          --roll-scope none      skip rollouts (helm/CRD changes only)
       MSG
     end
   end
 end
 
-opts = { no_build: false, no_infra: false, no_tls: false, csr: false, import_cert: nil, key: nil }
+opts = { no_build: false, no_infra: false, no_tls: false, csr: false, import_cert: nil, key: nil, roll_scope: nil }
 OptionParser.new do |o|
-  o.banner = 'Usage: deploy.rb [--no-build] [--no-infra] [--no-tls] [--csr | --import-cert FILE]'
+  o.banner = 'Usage: deploy.rb [--no-build] [--no-infra] [--no-tls] [--roll-scope SCOPE] [--csr | --import-cert FILE]'
   o.on('--no-build', 'Skip image build (just re-import + redeploy)') { opts[:no_build] = true }
   o.on('--no-infra', 'Skip cluster/infra bring-up')                  { opts[:no_infra] = true }
   o.on('--no-tls',   'Skip mkcert TLS setup (Traefik default cert)')  { opts[:no_tls] = true }
+  o.on('--roll-scope SCOPE', %w[all control none],
+       'Which deployments to roll: all (default), control, none') { |v| opts[:roll_scope] = v }
   o.on('--csr', 'Generate a private key + CSR (TLS_HOSTS/PUBLIC_HOST) in TLS_OUT_DIR, then exit') { opts[:csr] = true }
   o.on('--import-cert FILE', 'Load a CA-signed cert into TLS_SECRET as Traefik default, then exit') { |v| opts[:import_cert] = v }
   o.on('--key FILE', 'Private key for --import-cert (default: the .key from --csr in TLS_OUT_DIR)') { |v| opts[:key] = v }
