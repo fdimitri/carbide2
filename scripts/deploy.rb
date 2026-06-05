@@ -451,6 +451,20 @@ module Carbide
 
         log "rolling workspace deployment #{ns}"
         @cmd.run('kubectl', '-n', ns, 'rollout', 'restart', "deploy/#{ns}")
+
+        # Delete orphaned per-project shell pods. The worker spawns these as
+        # bare pods (restartPolicy: Never, no controller), so the deployment
+        # rollout above does NOT recreate them. After a same-tag image
+        # re-import they keep running stale code, and any that were stuck in
+        # ImagePullBackOff (e.g. spawned before the image was imported) stay
+        # wedged in an exponential back-off forever — which makes terminal
+        # creation hang until the client times out. Restarting the worker
+        # wipes its in-memory pod map, so these are already orphaned; delete
+        # them here and the restarted worker respawns each one fresh against
+        # the freshly-imported image on the next terminal create.
+        @cmd.run('kubectl', '-n', ns, 'delete', 'pod',
+                 '-l', 'app.kubernetes.io/name=carbide2-shell',
+                 '--ignore-not-found')
       end
     end
 
