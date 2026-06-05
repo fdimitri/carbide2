@@ -30,7 +30,14 @@
 #   ./scripts/deploy.rb --no-build      skip image build (re-import + redeploy)
 #   ./scripts/deploy.rb --no-infra      skip cluster/infra bring-up
 #   ./scripts/deploy.rb --no-tls        skip mkcert TLS setup (Traefik default cert)
+#   ./scripts/deploy.rb --no-pull       skip the self-update (pull + submodules) step
 #   ./scripts/deploy.rb --help
+#
+# Self-update: by default the very first thing deploy.rb does is `git pull
+# --ff-only` the meta repo and `git submodule update --init --recursive`, so a
+# deploy always runs the latest orchestrator + submodule SHAs. If the pull
+# changes deploy.rb itself, the script re-execs the updated copy before doing
+# any work. Pass --no-pull to deploy exactly what's checked out right now.
 #
 # Real (non-mkcert) certs — e.g. internal-test.carbidecore.online signed by an
 # internal/corporate CA. Two standalone steps bracket your CA; neither touches
@@ -46,6 +53,7 @@ require 'optparse'
 require 'tmpdir'
 require 'tempfile'
 require 'fileutils'
+require 'digest'
 
 # Bundler/inline installs the two helper gems at runtime, which needs a ruby
 # whose gem dir is writable. A bare system ruby (e.g. /usr/bin/ruby on Debian)
@@ -173,6 +181,7 @@ module Carbide
     end
 
     def run
+      self_update
       return generate_csr if @opts[:csr]
       return import_cert if @opts[:import_cert]
 
@@ -192,6 +201,39 @@ module Carbide
 
     def log(msg) = puts("\e[1;34m==>\e[0m #{msg}")
     def warn_(msg) = warn("\e[1;33m!!\e[0m #{msg}")
+
+    # Pull the meta repo + refresh submodules BEFORE any deploy work, so a deploy
+    # always runs the newest orchestrator and the submodule SHAs it expects.
+    # Default on; --no-pull skips it. If the pull changes deploy.rb itself we
+    # re-exec the updated copy (CARBIDE_DEPLOY_PULLED guards against a loop —
+    # it's inherited across the exec, so the child skips this step).
+    def self_update
+      return if @opts[:no_pull]
+      return if ENV['CARBIDE_DEPLOY_PULLED']
+
+      log "self-update: git pull --ff-only + submodule update in #{@root}"
+      before = file_digest(__FILE__)
+      Dir.chdir(@root) do
+        unless @cmd.run!('git', 'pull', '--ff-only').success?
+          abort "\e[1;31mxx\e[0m self-update: 'git pull --ff-only' failed in #{@root}. " \
+                "Resolve the working tree (or pass --no-pull) and retry."
+        end
+        @cmd.run('git', 'submodule', 'update', '--init', '--recursive')
+      end
+      after = file_digest(__FILE__)
+
+      ENV['CARBIDE_DEPLOY_PULLED'] = '1'
+      return unless before && after && before != after
+
+      log 'self-update: deploy.rb changed — re-running the updated orchestrator'
+      exec(RbConfig.ruby, __FILE__, *ARGV)
+    end
+
+    def file_digest(path)
+      Digest::SHA256.file(path).hexdigest
+    rescue StandardError
+      nil
+    end
 
     def require_tools
       %w[docker k3d kubectl helm].each do |tool|
@@ -570,6 +612,7 @@ module Carbide
           helm -n #{@control_ns} get values #{@release}
 
         Re-run this script any time to rebuild + redeploy. Flags:
+          --no-pull          skip self-update (git pull + submodule update)
           --no-build         skip image build (just re-import + redeploy)
           --no-infra         skip cluster/infra bring-up
           --no-tls           skip mkcert TLS setup (leave Traefik default cert)
@@ -581,9 +624,10 @@ module Carbide
   end
 end
 
-opts = { no_build: false, no_infra: false, no_tls: false, csr: false, import_cert: nil, key: nil, roll_scope: nil }
+opts = { no_build: false, no_infra: false, no_tls: false, no_pull: false, csr: false, import_cert: nil, key: nil, roll_scope: nil }
 OptionParser.new do |o|
-  o.banner = 'Usage: deploy.rb [--no-build] [--no-infra] [--no-tls] [--roll-scope SCOPE] [--csr | --import-cert FILE]'
+  o.banner = 'Usage: deploy.rb [--no-pull] [--no-build] [--no-infra] [--no-tls] [--roll-scope SCOPE] [--csr | --import-cert FILE]'
+  o.on('--no-pull',  'Skip self-update (git pull + submodule update before deploy)') { opts[:no_pull] = true }
   o.on('--no-build', 'Skip image build (just re-import + redeploy)') { opts[:no_build] = true }
   o.on('--no-infra', 'Skip cluster/infra bring-up')                  { opts[:no_infra] = true }
   o.on('--no-tls',   'Skip mkcert TLS setup (Traefik default cert)')  { opts[:no_tls] = true }
