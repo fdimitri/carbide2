@@ -239,7 +239,24 @@ module Carbide
       %w[docker k3d kubectl helm].each do |tool|
         next if system("command -v #{tool} >/dev/null 2>&1")
 
-        abort "\e[1;31mxx\e[0m missing required tool: #{tool}"
+        abort "\e[1;31mxx\e[0m missing required tool: #{tool} " \
+              "(run scripts/setmeup.sh on a fresh host to install everything)"
+      end
+
+      # docker present but daemon unreachable is the #1 fresh-box gotcha: the
+      # user was added to the 'docker' group but hasn't re-logged in yet.
+      unless @cmd.run!('docker', 'info').success?
+        abort "\e[1;31mxx\e[0m docker is installed but the daemon isn't reachable. " \
+              "Is it running, and are you in the 'docker' group? " \
+              "(try: sudo systemctl enable --now docker; newgrp docker)"
+      end
+
+      # build-all.sh uses `docker buildx build --load` and `docker compose`.
+      # On Ubuntu these ship as SEPARATE packages (docker-buildx / docker-compose-v2)
+      # that a bare `docker.io` install omits — catch that here, not mid-build.
+      unless @opts[:no_build] || @cmd.run!('docker', 'buildx', 'version').success?
+        abort "\e[1;31mxx\e[0m 'docker buildx' is unavailable but image build needs it. " \
+              "Install the buildx plugin (apt: docker-buildx) or pass --no-build."
       end
     end
 

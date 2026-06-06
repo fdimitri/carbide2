@@ -27,6 +27,35 @@ Docker builds consume the client as a *named build context*
 (`--build-context client=...`), so the component Dockerfiles never need to
 clone anything — the meta-repo's checkout supplies the source tree.
 
+## Prerequisites
+
+Supported host: **Ubuntu 24.04 LTS** (known-working; other Debian-family
+releases likely work but are untested). You need Docker (with `buildx` +
+`compose`), `k3d`, `kubectl`, `helm`, and a managed Ruby + Bundler. On a fresh
+box, install all of it with the provisioner:
+
+```bash
+./scripts/setmeup.sh            # essentials only
+./scripts/setmeup.sh --all      # + Node (client build/Playwright), socat (LLM relay), mkcert (TLS)
+```
+
+It's idempotent and skips anything already present. After it runs, **log out
+and back in** (or `newgrp docker`) so the `docker` group and rbenv shell wiring
+take effect. Known-working versions (pinned in `setmeup.sh`, verified on Ubuntu
+24.04.2):
+
+| Tool | Version |
+|------|---------|
+| Docker engine (+ buildx + compose v2) | 29.x |
+| k3d | v5.8.3 |
+| kubectl | v1.30+ |
+| helm | v3.x |
+| Ruby (via rbenv) | 3.4.2 |
+
+> Other paths: `setmeup.sh` provisions the **k3d** deploy path used by
+> `scripts/deploy.rb` (below). For the simpler single-host docker-compose
+> stack instead, see `carbide2-server/INSTALL.md`.
+
 ## Clone
 
 ```bash
