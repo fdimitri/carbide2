@@ -429,11 +429,43 @@ module Carbide
       end
       ensure_tls_store(ns, secret)
 
+      announce_root_ca
+    end
+
+    # Tell the operator how to trust the signing CA on whatever machine runs the
+    # browser — that's the ONE manual step wss:// needs. We export the public
+    # root next to the repo as carbide-rootCA.pem (a friendlier name than
+    # mkcert's internal rootCA.pem) so it's easy to copy/import. When we're in
+    # WSL the browser lives on the Windows host, so we print the exact certutil
+    # one-liner that imports it into the Windows *user* Root store (no admin).
+    def announce_root_ca
       caroot, = @cmd.run!('mkcert', '-CAROOT')
       caroot = (caroot || '').strip
-      warn_ "Trust mkcert's root CA on the machine running your browser, or wss:// still fails:"
-      warn_ "  rootCA: #{caroot}/rootCA.pem"
-      warn_ "  (copy it to that machine and `mkcert -install`, or import it into the OS/browser trust store)"
+      src = File.join(caroot, 'rootCA.pem')
+      dest = File.expand_path('carbide-rootCA.pem', @root)
+      FileUtils.cp(src, dest) if File.exist?(src)
+
+      warn_ 'Trust the carbide root CA on the machine running your browser, or wss:// still fails:'
+      warn_ "  root CA exported to: #{dest}"
+
+      if wsl?
+        win_dest = 'C:\\Users\\Public\\carbide-rootCA.pem'
+        warn_ '  WSL detected — your browser runs on the Windows host. Import it there (no admin needed):'
+        warn_ "    cp '#{dest}' /mnt/c/Users/Public/carbide-rootCA.pem"
+        warn_ "    certutil.exe -addstore -user -f Root '#{win_dest}'"
+        warn_ '  then fully restart the browser. (Chromium/Edge use the Windows store; Firefox needs its own import.)'
+      else
+        warn_ '  Linux: sudo cp the file into /usr/local/share/ca-certificates/ (rename .crt) && sudo update-ca-certificates'
+        warn_ '  macOS: security add-trusted-cert -d -r trustRoot -k ~/Library/Keychains/login.keychain-db <file>'
+        warn_ '  or copy it to that machine and run `mkcert -install` there.'
+      end
+    end
+
+    # True when running under WSL — the browser then lives on the Windows host,
+    # so the CA must be trusted in Windows, not this Linux userland.
+    def wsl?
+      @wsl ||= File.exist?('/proc/version') &&
+               File.read('/proc/version').match?(/microsoft/i)
     end
 
     # The TLSStore named 'default' in Traefik's namespace is the cert Traefik
