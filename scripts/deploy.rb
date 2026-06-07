@@ -158,6 +158,12 @@ module Carbide
       @release    = ENV.fetch('RELEASE', 'carbide-control')
       @http_port  = ENV.fetch('HTTP_PORT', '8080')
       @https_port = ENV.fetch('HTTPS_PORT', '8443')
+      # Which meta-repo branch/ref this deploy builds from. self_update checks it
+      # out and fast-forwards it before doing anything, so the deployed images
+      # always match a known ref instead of "whatever happened to be checked
+      # out". Default 'main' (the deployable line); --ref/DEPLOY_REF can target
+      # 'dev' for a test deploy. The resolved ref + SHA are logged up front.
+      @deploy_ref = (@opts[:ref] || ENV.fetch('DEPLOY_REF', 'main')).to_s
       # The hostname the BROWSER uses to reach the ingress. Drives the TLS cert
       # SANs, the public URL the control-plane advertises, and the Rails host
       # allowlist. We refuse to silently guess 'localhost': that bakes the wrong
@@ -258,14 +264,25 @@ module Carbide
       return if @opts[:no_pull]
       return if ENV['CARBIDE_DEPLOY_PULLED']
 
-      log "self-update: git pull --ff-only + submodule update in #{@root}"
+      log "self-update: fetch + checkout '#{@deploy_ref}' + submodule update in #{@root}"
       before = file_digest(__FILE__)
       Dir.chdir(@root) do
-        unless @cmd.run!('git', 'pull', '--ff-only').success?
-          abort "\e[1;31mxx\e[0m self-update: 'git pull --ff-only' failed in #{@root}. " \
-                "Resolve the working tree (or pass --no-pull) and retry."
+        unless @cmd.run!('git', 'fetch', '--prune', 'origin').success?
+          abort "\e[1;31mxx\e[0m self-update: 'git fetch origin' failed in #{@root}. " \
+                "Check the network/remote (or pass --no-pull) and retry."
+        end
+        unless @cmd.run!('git', 'checkout', @deploy_ref).success?
+          abort "\e[1;31mxx\e[0m self-update: cannot checkout '#{@deploy_ref}' in #{@root}. " \
+                "Commit/stash local changes, or pick a valid --ref (or pass --no-pull), then retry."
+        end
+        unless @cmd.run!('git', 'merge', '--ff-only', "origin/#{@deploy_ref}").success?
+          abort "\e[1;31mxx\e[0m self-update: '#{@deploy_ref}' is not fast-forwardable to " \
+                "origin/#{@deploy_ref} (local commits or a dirty tree). Resolve it " \
+                "(or pass --no-pull) and retry."
         end
         @cmd.run('git', 'submodule', 'update', '--init', '--recursive')
+        sha, = @cmd.run!('git', 'rev-parse', '--short', 'HEAD')
+        log "self-update: deploying ref '#{@deploy_ref}' @ #{(sha || '').strip}"
       end
       after = file_digest(__FILE__)
 
@@ -676,6 +693,7 @@ module Carbide
           helm -n #{@control_ns} get values #{@release}
 
         Re-run this script any time to rebuild + redeploy. Flags:
+          --ref REF          meta branch/ref to deploy (default main; e.g. --ref dev)
           --no-pull          skip self-update (git pull + submodule update)
           --no-build         skip image build (just re-import + redeploy)
           --no-infra         skip cluster/infra bring-up
@@ -688,9 +706,10 @@ module Carbide
   end
 end
 
-opts = { no_build: false, no_infra: false, no_tls: false, no_pull: false, csr: false, import_cert: nil, key: nil, roll_scope: nil, public_host: nil }
+opts = { no_build: false, no_infra: false, no_tls: false, no_pull: false, csr: false, import_cert: nil, key: nil, roll_scope: nil, public_host: nil, ref: nil }
 OptionParser.new do |o|
-  o.banner = 'Usage: deploy.rb [--no-pull] [--no-build] [--no-infra] [--no-tls] [--roll-scope SCOPE] [--csr | --import-cert FILE]'
+  o.banner = 'Usage: deploy.rb [--ref REF] [--no-pull] [--no-build] [--no-infra] [--no-tls] [--roll-scope SCOPE] [--csr | --import-cert FILE]'
+  o.on('--ref REF', 'Meta-repo branch/ref to deploy (default: main; DEPLOY_REF env). Checked out + fast-forwarded before build') { |v| opts[:ref] = v }
   o.on('--no-pull',  'Skip self-update (git pull + submodule update before deploy)') { opts[:no_pull] = true }
   o.on('--no-build', 'Skip image build (just re-import + redeploy)') { opts[:no_build] = true }
   o.on('--no-infra', 'Skip cluster/infra bring-up')                  { opts[:no_infra] = true }
