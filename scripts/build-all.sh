@@ -34,11 +34,17 @@ docker buildx build --load \
 # The workspace shell pod (per-project terminal container) runs this image.
 # The operator defaults CARBIDE_SHELL_IMAGE to carbide2-shell:dev, so the
 # cluster expects this tag to exist or shell pods ImagePullBackOff.
-echo "==> [3/3] carbide2-shell:dev (per-project terminal container)"
-docker buildx build --load \
-  -t carbide2-shell:dev \
-  -f "$SERVER/Dockerfile.shell" \
-  "$SERVER"
+# SKIP_SHELL=1 skips this (slow) build — safe when carbide2-shell:dev already
+# exists and only client/server/control code changed.
+if [ -n "${SKIP_SHELL:-}" ]; then
+  echo "==> [3/3] carbide2-shell:dev — SKIPPED (SKIP_SHELL set)"
+else
+  echo "==> [3/3] carbide2-shell:dev (per-project terminal container)"
+  docker buildx build --load \
+    -t carbide2-shell:dev \
+    -f "$SERVER/Dockerfile.shell" \
+    "$SERVER"
+fi
 
 echo
 echo "Done. Images:"

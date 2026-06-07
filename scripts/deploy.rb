@@ -28,6 +28,7 @@
 # Usage:
 #   ./scripts/deploy.rb                 full build + deploy
 #   ./scripts/deploy.rb --no-build      skip image build (re-import + redeploy)
+#   ./scripts/deploy.rb --no-shell      build everything EXCEPT the carbide2-shell image
 #   ./scripts/deploy.rb --no-infra      skip cluster/infra bring-up
 #   ./scripts/deploy.rb --no-tls        skip mkcert TLS setup (Traefik default cert)
 #   ./scripts/deploy.rb --no-pull       skip the self-update (pull + submodules) step
@@ -150,6 +151,11 @@ module Carbide
     def initialize(opts)
       @opts       = opts
       @cmd        = TTY::Command.new(uuid: false, printer: :pretty)
+      # A second command instance that prints NOTHING — used for the long,
+      # noisy external builds whose raw docker/k3d output (much of it on stderr,
+      # which the pretty printer renders in alarming red) is just progress
+      # spew. quiet_run captures it and only surfaces it on failure.
+      @quiet      = TTY::Command.new(uuid: false, printer: :null)
       @root       = File.expand_path('..', __dir__)
       @server     = File.join(@root, 'carbide2-server')
       @control    = File.join(@root, 'carbide2-control')
@@ -202,6 +208,10 @@ module Carbide
       roll_deployments
       verify
       summary
+      # Trust instructions go dead last so they're the final thing on screen —
+      # they're the one manual step left and shouldn't scroll off behind build
+      # spew or the verify report.
+      trust_ca_instructions unless @opts[:no_tls]
     end
 
     private
@@ -254,6 +264,19 @@ module Carbide
 
     def log(msg) = puts("\e[1;34m==>\e[0m #{msg}")
     def warn_(msg) = warn("\e[1;33m!!\e[0m #{msg}")
+
+    # Run a long, noisy external command without streaming its (often red,
+    # alarming-looking) docker/k3d output. Print one friendly line up front and
+    # only dump the captured output if the command actually fails.
+    def quiet_run(msg, *cmd_args, env: {})
+      log msg
+      result = @quiet.run!(*cmd_args, env: env)
+      return result if result.success?
+
+      $stdout.write(result.out)
+      $stderr.write(result.err)
+      abort "\e[1;31mxx\e[0m failed (output above): #{msg}"
+    end
 
     # Pull the meta repo + refresh submodules BEFORE any deploy work, so a deploy
     # always runs the newest orchestrator and the submodule SHAs it expects.
@@ -325,16 +348,18 @@ module Carbide
     end
 
     def ensure_infra
-      log "ensuring cluster + infra via carbide2-server/scripts/dev-cluster.sh"
-      @cmd.run(File.join(@server, 'scripts', 'dev-cluster.sh'),
-               env: { 'CLUSTER_NAME' => @cluster,
-                      'HTTP_PORT' => @http_port,
-                      'HTTPS_PORT' => @https_port })
+      quiet_run('preparing the k3d cluster + infra (this may take a minute)',
+                File.join(@server, 'scripts', 'dev-cluster.sh'),
+                env: { 'CLUSTER_NAME' => @cluster,
+                       'HTTP_PORT' => @http_port,
+                       'HTTPS_PORT' => @https_port })
     end
 
     def build_images
-      log "building images via scripts/build-all.sh"
-      @cmd.run(File.join(@root, 'scripts', 'build-all.sh'))
+      env = @opts[:no_shell] ? { 'SKIP_SHELL' => '1' } : {}
+      quiet_run('building the container images — on a cold cache this builds ' \
+                'Ruby from source, so give it a few minutes (reticulating splines...)',
+                File.join(@root, 'scripts', 'build-all.sh'), env: env)
     end
 
     def import_images
@@ -345,13 +370,22 @@ module Carbide
         # and let the deploy finish — leaving the cluster in a broken state where
         # pods ImagePullBackOff against docker.io (the image is local-only and was
         # never pushed). Fail loudly instead so the operator builds it first.
-        unless @cmd.run!("docker image inspect #{img}").success?
+        # @quiet so `docker image inspect`'s multi-screen JSON dump never hits
+        # the console (we only care whether the image exists).
+        unless @quiet.run!("docker image inspect #{img}").success?
           abort "\e[1;31mxx\e[0m #{img} not present locally — build it first " \
                 "(scripts/build-all.sh) then re-run. Refusing to deploy a cluster " \
                 "that will ImagePullBackOff."
         end
         log "  import #{img}"
-        @cmd.run('k3d', 'image', 'import', img, '-c', @cluster)
+        # @quiet too — k3d's import progress is noise on success; surface it only
+        # if the import actually fails.
+        res = @quiet.run!('k3d', 'image', 'import', img, '-c', @cluster)
+        unless res.success?
+          $stdout.write(res.out)
+          $stderr.write(res.err)
+          abort "\e[1;31mxx\e[0m k3d image import failed for #{img} (output above)."
+        end
         # Verify the image actually landed in the node's containerd. `k3d image
         # import` has been observed to no-op/lose an image (e.g. shell image
         # missing from the node despite a clean host build), which is invisible
@@ -371,7 +405,7 @@ module Carbide
       repo, tag = img.split(':', 2)
       tag ||= 'latest'
       ref = "docker.io/library/#{repo}"
-      res = @cmd.run!("docker exec #{node} crictl images")
+      res = @quiet.run!("docker exec #{node} crictl images")
       return false unless res.success?
       res.out.each_line.any? do |line|
         cols = line.split
@@ -428,12 +462,49 @@ module Carbide
                  "--cert=#{crt}", "--key=#{key}")
       end
       ensure_tls_store(ns, secret)
+    end
 
+    # Tell the operator how to trust the signing CA on whatever machine runs the
+    # browser — the ONE manual step wss:// needs. We export the public root next
+    # to the repo as carbide-rootCA.pem (friendlier than mkcert's internal
+    # rootCA.pem) so it's easy to copy/import. The browser machine is NOT
+    # necessarily this host (someone on Windows/macOS/another Linux box may be
+    # reaching the deploy by hostname), so we print steps for every platform
+    # rather than guessing from the deploy host's OS. Called dead-last in run().
+    def trust_ca_instructions
       caroot, = @cmd.run!('mkcert', '-CAROOT')
       caroot = (caroot || '').strip
-      warn_ "Trust mkcert's root CA on the machine running your browser, or wss:// still fails:"
-      warn_ "  rootCA: #{caroot}/rootCA.pem"
-      warn_ "  (copy it to that machine and `mkcert -install`, or import it into the OS/browser trust store)"
+      src = File.join(caroot, 'rootCA.pem')
+      dest = File.expand_path('carbide-rootCA.pem', @root)
+      FileUtils.cp(src, dest) if File.exist?(src)
+
+      warn_ 'LAST STEP — trust the carbide root CA on the machine running your browser,'
+      warn_ 'or the IDE WebSocket (wss://) silently fails even though the page loads.'
+      warn_ "  root CA exported to: #{dest}"
+      warn_ '  copy it to the browser machine (e.g. scp), then import for that OS:'
+      warn_ ''
+      warn_ '  Windows (Chromium/Edge use the Windows store; no admin needed):'
+      warn_ '    certutil.exe -addstore -user -f Root carbide-rootCA.pem'
+      if wsl?
+        warn_ "    WSL: copy it across first — cp '#{dest}' /mnt/c/Users/Public/carbide-rootCA.pem"
+        warn_ '         then run the certutil line above on C:\\Users\\Public\\carbide-rootCA.pem'
+      end
+      warn_ '    Firefox keeps its own store: Settings > Privacy & Security > Certificates > Import.'
+      warn_ ''
+      warn_ '  Linux (system trust — curl/node/etc.):'
+      warn_ '    sudo cp carbide-rootCA.pem /usr/local/share/ca-certificates/carbide-rootCA.crt'
+      warn_ '    sudo update-ca-certificates'
+      warn_ '    Chrome/Chromium (NSS): certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n carbide -i carbide-rootCA.pem'
+      warn_ ''
+      warn_ '  macOS:'
+      warn_ '    sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain carbide-rootCA.pem'
+    end
+
+    # True when running under WSL — the browser then lives on the Windows host,
+    # so the CA must be trusted in Windows, not this Linux userland.
+    def wsl?
+      @wsl ||= File.exist?('/proc/version') &&
+               File.read('/proc/version').match?(/microsoft/i)
     end
 
     # The TLSStore named 'default' in Traefik's namespace is the cert Traefik
@@ -708,10 +779,11 @@ end
 
 opts = { no_build: false, no_infra: false, no_tls: false, no_pull: false, csr: false, import_cert: nil, key: nil, roll_scope: nil, public_host: nil, ref: nil }
 OptionParser.new do |o|
-  o.banner = 'Usage: deploy.rb [--ref REF] [--no-pull] [--no-build] [--no-infra] [--no-tls] [--roll-scope SCOPE] [--csr | --import-cert FILE]'
+  o.banner = 'Usage: deploy.rb [--ref REF] [--no-pull] [--no-build] [--no-shell] [--no-infra] [--no-tls] [--roll-scope SCOPE] [--csr | --import-cert FILE]'
   o.on('--ref REF', 'Meta-repo branch/ref to deploy (default: main; DEPLOY_REF env). Checked out + fast-forwarded before build') { |v| opts[:ref] = v }
   o.on('--no-pull',  'Skip self-update (git pull + submodule update before deploy)') { opts[:no_pull] = true }
   o.on('--no-build', 'Skip image build (just re-import + redeploy)') { opts[:no_build] = true }
+  o.on('--no-shell', 'Skip rebuilding the carbide2-shell image (reuse existing carbide2-shell:dev)') { opts[:no_shell] = true }
   o.on('--no-infra', 'Skip cluster/infra bring-up')                  { opts[:no_infra] = true }
   o.on('--no-tls',   'Skip mkcert TLS setup (Traefik default cert)')  { opts[:no_tls] = true }
   o.on('--public-host HOST', 'Browser-facing FQDN for ingress/cert/host-auth (default: hostname -f; localhost only for same-machine)') { |v| opts[:public_host] = v }
