@@ -28,6 +28,7 @@
 # Usage:
 #   ./scripts/deploy.rb                 full build + deploy
 #   ./scripts/deploy.rb --no-build      skip image build (re-import + redeploy)
+#   ./scripts/deploy.rb --no-shell      build everything EXCEPT the carbide2-shell image
 #   ./scripts/deploy.rb --no-infra      skip cluster/infra bring-up
 #   ./scripts/deploy.rb --no-tls        skip mkcert TLS setup (Traefik default cert)
 #   ./scripts/deploy.rb --no-pull       skip the self-update (pull + submodules) step
@@ -355,9 +356,10 @@ module Carbide
     end
 
     def build_images
-      quiet_run('building the three container images — on a cold cache this builds ' \
+      env = @opts[:no_shell] ? { 'SKIP_SHELL' => '1' } : {}
+      quiet_run('building the container images — on a cold cache this builds ' \
                 'Ruby from source, so give it a few minutes (reticulating splines...)',
-                File.join(@root, 'scripts', 'build-all.sh'))
+                File.join(@root, 'scripts', 'build-all.sh'), env: env)
     end
 
     def import_images
@@ -777,10 +779,11 @@ end
 
 opts = { no_build: false, no_infra: false, no_tls: false, no_pull: false, csr: false, import_cert: nil, key: nil, roll_scope: nil, public_host: nil, ref: nil }
 OptionParser.new do |o|
-  o.banner = 'Usage: deploy.rb [--ref REF] [--no-pull] [--no-build] [--no-infra] [--no-tls] [--roll-scope SCOPE] [--csr | --import-cert FILE]'
+  o.banner = 'Usage: deploy.rb [--ref REF] [--no-pull] [--no-build] [--no-shell] [--no-infra] [--no-tls] [--roll-scope SCOPE] [--csr | --import-cert FILE]'
   o.on('--ref REF', 'Meta-repo branch/ref to deploy (default: main; DEPLOY_REF env). Checked out + fast-forwarded before build') { |v| opts[:ref] = v }
   o.on('--no-pull',  'Skip self-update (git pull + submodule update before deploy)') { opts[:no_pull] = true }
   o.on('--no-build', 'Skip image build (just re-import + redeploy)') { opts[:no_build] = true }
+  o.on('--no-shell', 'Skip rebuilding the carbide2-shell image (reuse existing carbide2-shell:dev)') { opts[:no_shell] = true }
   o.on('--no-infra', 'Skip cluster/infra bring-up')                  { opts[:no_infra] = true }
   o.on('--no-tls',   'Skip mkcert TLS setup (Traefik default cert)')  { opts[:no_tls] = true }
   o.on('--public-host HOST', 'Browser-facing FQDN for ingress/cert/host-auth (default: hostname -f; localhost only for same-machine)') { |v| opts[:public_host] = v }
