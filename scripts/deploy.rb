@@ -150,6 +150,11 @@ module Carbide
     def initialize(opts)
       @opts       = opts
       @cmd        = TTY::Command.new(uuid: false, printer: :pretty)
+      # A second command instance that prints NOTHING — used for the long,
+      # noisy external builds whose raw docker/k3d output (much of it on stderr,
+      # which the pretty printer renders in alarming red) is just progress
+      # spew. quiet_run captures it and only surfaces it on failure.
+      @quiet      = TTY::Command.new(uuid: false, printer: :null)
       @root       = File.expand_path('..', __dir__)
       @server     = File.join(@root, 'carbide2-server')
       @control    = File.join(@root, 'carbide2-control')
@@ -202,6 +207,10 @@ module Carbide
       roll_deployments
       verify
       summary
+      # Trust instructions go dead last so they're the final thing on screen —
+      # they're the one manual step left and shouldn't scroll off behind build
+      # spew or the verify report.
+      trust_ca_instructions unless @opts[:no_tls]
     end
 
     private
@@ -254,6 +263,19 @@ module Carbide
 
     def log(msg) = puts("\e[1;34m==>\e[0m #{msg}")
     def warn_(msg) = warn("\e[1;33m!!\e[0m #{msg}")
+
+    # Run a long, noisy external command without streaming its (often red,
+    # alarming-looking) docker/k3d output. Print one friendly line up front and
+    # only dump the captured output if the command actually fails.
+    def quiet_run(msg, *cmd_args, env: {})
+      log msg
+      result = @quiet.run!(*cmd_args, env: env)
+      return result if result.success?
+
+      $stdout.write(result.out)
+      $stderr.write(result.err)
+      abort "\e[1;31mxx\e[0m failed (output above): #{msg}"
+    end
 
     # Pull the meta repo + refresh submodules BEFORE any deploy work, so a deploy
     # always runs the newest orchestrator and the submodule SHAs it expects.
@@ -325,16 +347,17 @@ module Carbide
     end
 
     def ensure_infra
-      log "ensuring cluster + infra via carbide2-server/scripts/dev-cluster.sh"
-      @cmd.run(File.join(@server, 'scripts', 'dev-cluster.sh'),
-               env: { 'CLUSTER_NAME' => @cluster,
-                      'HTTP_PORT' => @http_port,
-                      'HTTPS_PORT' => @https_port })
+      quiet_run('preparing the k3d cluster + infra (this may take a minute)',
+                File.join(@server, 'scripts', 'dev-cluster.sh'),
+                env: { 'CLUSTER_NAME' => @cluster,
+                       'HTTP_PORT' => @http_port,
+                       'HTTPS_PORT' => @https_port })
     end
 
     def build_images
-      log "building images via scripts/build-all.sh"
-      @cmd.run(File.join(@root, 'scripts', 'build-all.sh'))
+      quiet_run('building the three container images — on a cold cache this builds ' \
+                'Ruby from source, so give it a few minutes (reticulating splines...)',
+                File.join(@root, 'scripts', 'build-all.sh'))
     end
 
     def import_images
@@ -428,37 +451,42 @@ module Carbide
                  "--cert=#{crt}", "--key=#{key}")
       end
       ensure_tls_store(ns, secret)
-
-      announce_root_ca
     end
 
     # Tell the operator how to trust the signing CA on whatever machine runs the
-    # browser — that's the ONE manual step wss:// needs. We export the public
-    # root next to the repo as carbide-rootCA.pem (a friendlier name than
-    # mkcert's internal rootCA.pem) so it's easy to copy/import. When we're in
-    # WSL the browser lives on the Windows host, so we print the exact certutil
-    # one-liner that imports it into the Windows *user* Root store (no admin).
-    def announce_root_ca
+    # browser — the ONE manual step wss:// needs. We export the public root next
+    # to the repo as carbide-rootCA.pem (friendlier than mkcert's internal
+    # rootCA.pem) so it's easy to copy/import. The browser machine is NOT
+    # necessarily this host (someone on Windows/macOS/another Linux box may be
+    # reaching the deploy by hostname), so we print steps for every platform
+    # rather than guessing from the deploy host's OS. Called dead-last in run().
+    def trust_ca_instructions
       caroot, = @cmd.run!('mkcert', '-CAROOT')
       caroot = (caroot || '').strip
       src = File.join(caroot, 'rootCA.pem')
       dest = File.expand_path('carbide-rootCA.pem', @root)
       FileUtils.cp(src, dest) if File.exist?(src)
 
-      warn_ 'Trust the carbide root CA on the machine running your browser, or wss:// still fails:'
+      warn_ 'LAST STEP — trust the carbide root CA on the machine running your browser,'
+      warn_ 'or the IDE WebSocket (wss://) silently fails even though the page loads.'
       warn_ "  root CA exported to: #{dest}"
-
+      warn_ '  copy it to the browser machine (e.g. scp), then import for that OS:'
+      warn_ ''
+      warn_ '  Windows (Chromium/Edge use the Windows store; no admin needed):'
+      warn_ '    certutil.exe -addstore -user -f Root carbide-rootCA.pem'
       if wsl?
-        win_dest = 'C:\\Users\\Public\\carbide-rootCA.pem'
-        warn_ '  WSL detected — your browser runs on the Windows host. Import it there (no admin needed):'
-        warn_ "    cp '#{dest}' /mnt/c/Users/Public/carbide-rootCA.pem"
-        warn_ "    certutil.exe -addstore -user -f Root '#{win_dest}'"
-        warn_ '  then fully restart the browser. (Chromium/Edge use the Windows store; Firefox needs its own import.)'
-      else
-        warn_ '  Linux: sudo cp the file into /usr/local/share/ca-certificates/ (rename .crt) && sudo update-ca-certificates'
-        warn_ '  macOS: security add-trusted-cert -d -r trustRoot -k ~/Library/Keychains/login.keychain-db <file>'
-        warn_ '  or copy it to that machine and run `mkcert -install` there.'
+        warn_ "    WSL: copy it across first — cp '#{dest}' /mnt/c/Users/Public/carbide-rootCA.pem"
+        warn_ '         then run the certutil line above on C:\\Users\\Public\\carbide-rootCA.pem'
       end
+      warn_ '    Firefox keeps its own store: Settings > Privacy & Security > Certificates > Import.'
+      warn_ ''
+      warn_ '  Linux (system trust — curl/node/etc.):'
+      warn_ '    sudo cp carbide-rootCA.pem /usr/local/share/ca-certificates/carbide-rootCA.crt'
+      warn_ '    sudo update-ca-certificates'
+      warn_ '    Chrome/Chromium (NSS): certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n carbide -i carbide-rootCA.pem'
+      warn_ ''
+      warn_ '  macOS:'
+      warn_ '    sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain carbide-rootCA.pem'
     end
 
     # True when running under WSL — the browser then lives on the Windows host,
