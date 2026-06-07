@@ -56,6 +56,26 @@ take effect. Known-working versions (pinned in `setmeup.sh`, verified on Ubuntu
 > `scripts/deploy.rb` (below). For the simpler single-host docker-compose
 > stack instead, see `carbide2-server/INSTALL.md`.
 
+### Disk sizing (important)
+
+The component images are large (`carbide2-shell` alone is ~4 GB; the three dev
+images total ~12 GB) and they live on the k3d node's containerd, which sits on
+the **host root disk**. k3s' kubelet runs image garbage collection once the
+image filesystem passes `image-gc-high-threshold` (**85 %** by default) and will
+evict any image not currently in use — including the on-demand shell image
+between terminals. Because dev images are local-only (`k3d image import`, no
+registry yet), an evicted image can't be re-pulled and the next terminal hits
+`ImagePullBackOff`.
+
+- Give the box **≥ 80 GB** of root disk for a comfortable dev cluster.
+- If you see recurring `ImagePullBackOff` on `carbide2-shell`, the disk is
+  almost certainly over 85 %. Reclaim space and re-import:
+  ```sh
+  docker builder prune -f && docker image prune -f      # safe: cache + dangling only
+  k3d image import carbide2-shell:dev -c carbide-dev     # re-seed the node
+  ```
+- Durable fix (planned): a local registry so GC'd images simply re-pull.
+
 ## Clone
 
 ```bash

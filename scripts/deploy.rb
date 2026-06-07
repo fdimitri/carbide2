@@ -160,10 +160,11 @@ module Carbide
       @https_port = ENV.fetch('HTTPS_PORT', '8443')
       # The hostname the BROWSER uses to reach the ingress. Drives the TLS cert
       # SANs, the public URL the control-plane advertises, and the Rails host
-      # allowlist for workspace pods. Defaults to localhost for a purely-local
-      # cluster; set PUBLIC_HOST=dev1.frankd.local for a LAN-reachable dev box.
-      @public_host = ENV.fetch('PUBLIC_HOST', 'localhost')
-      @public_url  = ENV.fetch('PUBLIC_URL_BASE', "https://#{@public_host}:#{@https_port}")
+      # allowlist. We refuse to silently guess 'localhost': that bakes the wrong
+      # cert SANs and advertises an unreachable URL whenever the box is actually
+      # reached by its LAN name. resolve_public_endpoint detects a real FQDN via
+      # `hostname -f` and otherwise STOPS with instructions (see method).
+      @public_host, @public_url = resolve_public_endpoint
       # Which deployments roll_deployments restarts after a redeploy:
       #   all     — control-plane AND workspace deployments (+ orphaned shell
       #             pods). Version-coherent: the editor SPA (served by the
@@ -198,6 +199,52 @@ module Carbide
     end
 
     private
+
+    # Resolve the browser-facing hostname + URL base. Order of precedence:
+    #   1. PUBLIC_URL_BASE  (explicit full URL, wins outright)
+    #   2. PUBLIC_HOST env / --public-host flag
+    #   3. `hostname -f`    (only if it yields a real, dotted FQDN)
+    # If none of those produce a usable hostname we STOP rather than silently
+    # falling back to 'localhost'. A localhost guess bakes the wrong TLS cert
+    # SANs, advertises an unreachable dashboard URL, and (historically) produced
+    # confusing "Blocked hosts" 403s when the box was reached by its LAN name.
+    def resolve_public_endpoint
+      if (url = ENV['PUBLIC_URL_BASE']) && !url.strip.empty?
+        u    = url.strip
+        host = u.sub(%r{\A[a-zA-Z]+://}, '').sub(/:\d+\z/, '')
+        return [host, u]
+      end
+      host = (@opts[:public_host] || ENV['PUBLIC_HOST'])&.strip
+      fqdn = detect_fqdn
+      host = fqdn if host.nil? || host.empty?
+      unless host && !host.empty? && valid_public_host?(host)
+        abort <<~MSG
+          \e[1;31mxx\e[0m Could not determine the browser-facing hostname for this deploy.
+             `hostname -f` returned #{fqdn.inspect}, which is not a usable FQDN
+             (a bare short name like "dev1" won't resolve for remote browsers and
+             makes useless cert SANs). Set one explicitly and re-run, e.g.:
+               PUBLIC_HOST=dev1.frankd.local ./scripts/deploy.rb
+               ./scripts/deploy.rb --public-host dev1.frankd.local
+             or pin the full URL base:
+               PUBLIC_URL_BASE=https://dev1.frankd.local:#{@https_port} ./scripts/deploy.rb
+             (Use PUBLIC_HOST=localhost only for a purely-local, same-machine cluster.)
+        MSG
+      end
+      [host, "https://#{host}:#{@https_port}"]
+    end
+
+    def detect_fqdn
+      out, = @cmd.run!('hostname', '-f')
+      (out || '').strip
+    end
+
+    # A usable public host is a dotted FQDN, an explicit 'localhost', or an IPv4
+    # literal. A bare short name (no dot, e.g. "dev1") is rejected.
+    def valid_public_host?(host)
+      return true if host == 'localhost'
+      return true if host =~ /\A\d{1,3}(\.\d{1,3}){3}\z/
+      host.include?('.') && host !~ /\s/ && !host.start_with?('.') && !host.end_with?('.')
+    end
 
     def log(msg) = puts("\e[1;34m==>\e[0m #{msg}")
     def warn_(msg) = warn("\e[1;33m!!\e[0m #{msg}")
@@ -641,13 +688,14 @@ module Carbide
   end
 end
 
-opts = { no_build: false, no_infra: false, no_tls: false, no_pull: false, csr: false, import_cert: nil, key: nil, roll_scope: nil }
+opts = { no_build: false, no_infra: false, no_tls: false, no_pull: false, csr: false, import_cert: nil, key: nil, roll_scope: nil, public_host: nil }
 OptionParser.new do |o|
   o.banner = 'Usage: deploy.rb [--no-pull] [--no-build] [--no-infra] [--no-tls] [--roll-scope SCOPE] [--csr | --import-cert FILE]'
   o.on('--no-pull',  'Skip self-update (git pull + submodule update before deploy)') { opts[:no_pull] = true }
   o.on('--no-build', 'Skip image build (just re-import + redeploy)') { opts[:no_build] = true }
   o.on('--no-infra', 'Skip cluster/infra bring-up')                  { opts[:no_infra] = true }
   o.on('--no-tls',   'Skip mkcert TLS setup (Traefik default cert)')  { opts[:no_tls] = true }
+  o.on('--public-host HOST', 'Browser-facing FQDN for ingress/cert/host-auth (default: hostname -f; localhost only for same-machine)') { |v| opts[:public_host] = v }
   o.on('--roll-scope SCOPE', %w[all control none],
        'Which deployments to roll: all (default), control, none') { |v| opts[:roll_scope] = v }
   o.on('--csr', 'Generate a private key + CSR (TLS_HOSTS/PUBLIC_HOST) in TLS_OUT_DIR, then exit') { opts[:csr] = true }
