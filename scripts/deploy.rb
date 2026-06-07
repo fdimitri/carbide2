@@ -368,13 +368,22 @@ module Carbide
         # and let the deploy finish — leaving the cluster in a broken state where
         # pods ImagePullBackOff against docker.io (the image is local-only and was
         # never pushed). Fail loudly instead so the operator builds it first.
-        unless @cmd.run!("docker image inspect #{img}").success?
+        # @quiet so `docker image inspect`'s multi-screen JSON dump never hits
+        # the console (we only care whether the image exists).
+        unless @quiet.run!("docker image inspect #{img}").success?
           abort "\e[1;31mxx\e[0m #{img} not present locally — build it first " \
                 "(scripts/build-all.sh) then re-run. Refusing to deploy a cluster " \
                 "that will ImagePullBackOff."
         end
         log "  import #{img}"
-        @cmd.run('k3d', 'image', 'import', img, '-c', @cluster)
+        # @quiet too — k3d's import progress is noise on success; surface it only
+        # if the import actually fails.
+        res = @quiet.run!('k3d', 'image', 'import', img, '-c', @cluster)
+        unless res.success?
+          $stdout.write(res.out)
+          $stderr.write(res.err)
+          abort "\e[1;31mxx\e[0m k3d image import failed for #{img} (output above)."
+        end
         # Verify the image actually landed in the node's containerd. `k3d image
         # import` has been observed to no-op/lose an image (e.g. shell image
         # missing from the node despite a clean host build), which is invisible
@@ -394,7 +403,7 @@ module Carbide
       repo, tag = img.split(':', 2)
       tag ||= 'latest'
       ref = "docker.io/library/#{repo}"
-      res = @cmd.run!("docker exec #{node} crictl images")
+      res = @quiet.run!("docker exec #{node} crictl images")
       return false unless res.success?
       res.out.each_line.any? do |line|
         cols = line.split
