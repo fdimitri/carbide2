@@ -18,9 +18,25 @@ for d in "$CLIENT" "$SERVER" "$CONTROL" "$WORKER"; do
   [ -d "$d" ] || { echo "missing submodule: $d (run: git submodule update --init)" >&2; exit 1; }
 done
 
+short_sha() {
+  git -C "$1" rev-parse --short=12 HEAD
+}
+
+META_SHA="$(short_sha "$ROOT")"
+CLIENT_SHA="$(short_sha "$CLIENT")"
+SERVER_SHA="$(short_sha "$SERVER")"
+CONTROL_SHA="$(short_sha "$CONTROL")"
+WORKER_SHA="$(short_sha "$WORKER")"
+BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
 echo "==> [1/3] carbide2:dev (workspace pod)"
 docker buildx build --load \
   -t carbide2:dev \
+  --build-arg "META_SHA=$META_SHA" \
+  --build-arg "CLIENT_SHA=$CLIENT_SHA" \
+  --build-arg "SERVER_SHA=$SERVER_SHA" \
+  --build-arg "WORKER_SHA=$WORKER_SHA" \
+  --build-arg "BUILD_TIME=$BUILD_TIME" \
   --build-context "client=$CLIENT" \
   --build-context "worker=$WORKER" \
   "$SERVER"
@@ -28,6 +44,10 @@ docker buildx build --load \
 echo "==> [2/3] carbide2-control:dev (control plane + dashboard)"
 docker buildx build --load \
   -t carbide2-control:dev \
+  --build-arg "META_SHA=$META_SHA" \
+  --build-arg "CLIENT_SHA=$CLIENT_SHA" \
+  --build-arg "CONTROL_SHA=$CONTROL_SHA" \
+  --build-arg "BUILD_TIME=$BUILD_TIME" \
   --build-context "client=$CLIENT" \
   "$CONTROL"
 
