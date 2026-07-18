@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # setmeup.sh — provision a clean host with everything deploy.rb needs.
 #
-# Target: Ubuntu 24.04 LTS (Noble). Known-working there. Other Debian-family
-# releases will probably work but are UNTESTED — the script warns and continues
-# if --force is given.
+# Target: Ubuntu 24.04 LTS (Noble) and 26.04 — confirmed working without
+# intervention. Other Debian-family releases will probably work but are
+# UNTESTED — the script warns and continues if --force is given.
 #
 # What it installs:
 #   ESSENTIAL (always, unless already present):
@@ -12,11 +12,13 @@
 #     - kubectl, helm, k3d                    (pinned upstream releases)
 #     - rbenv + ruby-build + Ruby + bundler   (to run deploy.rb under a writable
 #                                              gem dir; deploy.rb re-execs here)
+#     - mkcert (+ libnss3-tools)              (locally-trusted TLS certs so wss://
+#                                              works; skip with --no-mkcert)
 #   OPTIONAL (behind flags):
-#     --node      Node.js 20 (Vite client build outside containers + Playwright)
-#     --socat     socat       (host LM Studio relay for local LLM agents)
-#     --mkcert    mkcert      (locally-trusted TLS certs; deploy.rb --no-tls skips)
-#     --all       all of the above optionals
+#     --node       Node.js 20 (Vite client build outside containers + Playwright)
+#     --socat      socat      (host LM Studio relay for local LLM agents)
+#     --no-mkcert  skip the default mkcert install (bring your own TLS / --no-tls)
+#     --all        all of the above optionals
 #
 # After this finishes (and you re-login for the docker group), the deploy is:
 #     git clone --recurse-submodules https://github.com/fdimitri/carbide2.git
@@ -24,6 +26,8 @@
 #
 # Idempotent: re-running skips anything already present at the pinned version.
 # Pinned versions are the ones verified on the reference box (Ubuntu 24.04.2).
+#
+# END-OF-HELP
 
 set -euo pipefail
 
@@ -37,17 +41,18 @@ NODE_MAJOR="20"
 # --- flags ------------------------------------------------------------------
 WANT_NODE=0
 WANT_SOCAT=0
-WANT_MKCERT=0
+WANT_MKCERT=1
 FORCE=0
 for arg in "$@"; do
   case "$arg" in
-    --node)   WANT_NODE=1 ;;
-    --socat)  WANT_SOCAT=1 ;;
-    --mkcert) WANT_MKCERT=1 ;;
-    --all)    WANT_NODE=1; WANT_SOCAT=1; WANT_MKCERT=1 ;;
-    --force)  FORCE=1 ;;
+    --node)      WANT_NODE=1 ;;
+    --socat)     WANT_SOCAT=1 ;;
+    --mkcert)    WANT_MKCERT=1 ;;
+    --no-mkcert) WANT_MKCERT=0 ;;
+    --all)       WANT_NODE=1; WANT_SOCAT=1; WANT_MKCERT=1 ;;
+    --force)     FORCE=1 ;;
     -h|--help)
-      sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,/END-OF-HELP/p' "$0" | sed -e '/END-OF-HELP/d' -e 's/^# \{0,1\}//'
       exit 0
       ;;
     *) echo "setmeup: unknown arg: $arg (try --help)" >&2; exit 1 ;;
@@ -63,13 +68,21 @@ have() { command -v "$1" >/dev/null 2>&1; }
 have sudo || die "sudo not found — install it or run the apt/install steps manually."
 
 # --- OS gate ----------------------------------------------------------------
+# Confirmed working without intervention: Ubuntu 24.04 and 26.04. Other
+# Debian-family releases likely work but are untested; --force overrides.
 OS_ID="$( . /etc/os-release 2>/dev/null && echo "${ID:-}" )"
 OS_VER="$( . /etc/os-release 2>/dev/null && echo "${VERSION_ID:-}" )"
-if [[ "$OS_ID" != "ubuntu" || "$OS_VER" != "24.04" ]]; then
+OS_OK=0
+if [[ "$OS_ID" == "ubuntu" ]]; then
+  case "$OS_VER" in
+    24.04|26.04) OS_OK=1 ;;
+  esac
+fi
+if [[ $OS_OK -ne 1 ]]; then
   if [[ $FORCE -eq 1 ]]; then
-    warn "OS is ${OS_ID:-unknown} ${OS_VER:-?}, not ubuntu 24.04 — continuing because --force was given (UNTESTED)."
+    warn "OS is ${OS_ID:-unknown} ${OS_VER:-?}, not a confirmed Ubuntu (24.04/26.04) — continuing because --force was given (UNTESTED)."
   else
-    die "this provisioner is verified only on Ubuntu 24.04 (found: ${OS_ID:-unknown} ${OS_VER:-?}). Re-run with --force to try anyway."
+    die "this provisioner is confirmed only on Ubuntu 24.04 and 26.04 (found: ${OS_ID:-unknown} ${OS_VER:-?}). Re-run with --force to try anyway."
   fi
 fi
 
@@ -201,16 +214,20 @@ if [[ $WANT_NODE -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 8. Optional: mkcert (locally-trusted TLS)
+# 8. mkcert (locally-trusted TLS — default; --no-mkcert skips)
 # ---------------------------------------------------------------------------
+# deploy.rb's setup_tls uses mkcert so wss:// works without a real CA; browser
+# trust needs libnss3-tools (certutil) alongside the mkcert binary.
 if [[ $WANT_MKCERT -eq 1 ]]; then
   if have mkcert; then
     log "mkcert already present: $(mkcert -version 2>/dev/null)"
   else
-    log "installing mkcert via apt"
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y mkcert || \
-      warn "apt mkcert install failed — install manually from github.com/FiloSottile/mkcert if you need local TLS."
+    log "installing mkcert (+ libnss3-tools for browser trust) via apt"
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y mkcert libnss3-tools || \
+      warn "apt mkcert install failed — install manually from github.com/FiloSottile/mkcert if you need local TLS (or deploy with --no-tls)."
   fi
+else
+  log "skipping mkcert (--no-mkcert) — deploy.rb needs --no-tls or your own certs for wss://"
 fi
 
 # ---------------------------------------------------------------------------
