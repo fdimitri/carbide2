@@ -115,8 +115,14 @@ trap cleanup EXIT
 git -C "$SRC" worktree add --detach --force "$WORKTREE" "$SHA" >/dev/null
 
 # Build in a container matching the Dockerfile's dashboard-build stage.
+# Run as the host user so everything the build writes (dist/, node_modules,
+# manifest.json below) is owned by us, not root — otherwise the host-side steps
+# that follow can't write into the container-created dist/. HOME=/app keeps
+# npm's cache inside the (host-owned, writable) worktree.
 log "npm ci + vite build (node container)"
 docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  -e HOME=/app \
   -v "$WORKTREE":/app -w /app \
   -e VITE_CARBIDE_MODE="$MODE" \
   -e VITE_APP_CLIENT_SHA="$SHORT" \
