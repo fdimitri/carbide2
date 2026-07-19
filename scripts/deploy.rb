@@ -10,10 +10,12 @@
 #   1. ensure the k3d cluster + infra exist  (carbide2-server/scripts/dev-cluster.sh)
 #   2. build images                          (scripts/build-all.sh)   [skip: --no-build]
 #   3. k3d image import the images into the cluster
-#   4. kubectl apply the Workspace CRD + wait for it to be established
-#   5. helm upgrade --install the control-plane chart
-#   6. roll the Deployments and wait for them to become Ready
-#   7. verify ingress + report cluster state (via kubeclient)
+#   4. build + upload the pinned SPA clients (workspace + control) to the
+#      MinIO static tier                      (scripts/build-client)   [skip: --no-client]
+#   5. kubectl apply the Workspace CRD + wait for it to be established
+#   6. helm upgrade --install the control-plane chart
+#   7. roll the Deployments and wait for them to become Ready
+#   8. verify ingress + report cluster state (via kubeclient)
 #
 # Why Ruby instead of bash: the verify/report step reads structured cluster
 # state (pod readiness, Workspace CR .status.phase) through kubeclient — the
@@ -29,6 +31,7 @@
 #   ./scripts/deploy.rb                 full build + deploy
 #   ./scripts/deploy.rb --no-build      skip image build (re-import + redeploy)
 #   ./scripts/deploy.rb --no-shell      build everything EXCEPT the carbide2-shell image
+#   ./scripts/deploy.rb --no-client     skip building + uploading the pinned SPA client
 #   ./scripts/deploy.rb --no-infra      skip cluster/infra bring-up
 #   ./scripts/deploy.rb --no-tls        skip mkcert TLS setup (Traefik default cert)
 #   ./scripts/deploy.rb --no-pull       skip the self-update (pull + submodules) step
@@ -202,6 +205,7 @@ module Carbide
       ensure_infra unless @opts[:no_infra]
       build_images unless @opts[:no_build]
       import_images
+      build_and_upload_client unless @opts[:no_client]
       apply_crd
       install_control_plane
       setup_tls unless @opts[:no_tls]
@@ -360,6 +364,23 @@ module Carbide
       quiet_run('building the container images — on a cold cache this builds ' \
                 'Ruby from source, so give it a few minutes (reticulating splines...)',
                 File.join(@root, 'scripts', 'build-all.sh'), env: env)
+    end
+
+    # Build the PINNED SPA clients (the carbide2-client submodule's checked-out
+    # SHA) and upload them to the MinIO static tier via scripts/build-client.
+    # Two families are published from the same source, differing only by build
+    # mode: 'workspace' (family carbide2-client, served by workspace pods) and
+    # 'control' (family carbide2-control, the dashboard served by the control
+    # pod). Neither is baked into any image — they live only in MinIO, served at
+    # /clients/<family>/<sha>/, and the pod loaders resolve them at request
+    # time. Runs after ensure_infra (which brings MinIO up) so the upload target
+    # exists. --no-client skips it (e.g. redeploys that don't touch the client).
+    def build_and_upload_client
+      %w[workspace control].each do |mode|
+        quiet_run("building + uploading the pinned '#{mode}' SPA client to the MinIO static tier",
+                  File.join(@root, 'scripts', 'build-client'), '--mode', mode,
+                  env: { 'CARBIDE_MINIO_NS' => @control_ns })
+      end
     end
 
     def import_images
@@ -767,6 +788,7 @@ module Carbide
           --ref REF          meta branch/ref to deploy (default main; e.g. --ref dev)
           --no-pull          skip self-update (git pull + submodule update)
           --no-build         skip image build (just re-import + redeploy)
+          --no-client        skip building + uploading the pinned SPA client
           --no-infra         skip cluster/infra bring-up
           --no-tls           skip mkcert TLS setup (leave Traefik default cert)
           --roll-scope all   roll everything (default; coherent but drops terminals)
@@ -779,11 +801,12 @@ end
 
 opts = { no_build: false, no_infra: false, no_tls: false, no_pull: false, csr: false, import_cert: nil, key: nil, roll_scope: nil, public_host: nil, ref: nil }
 OptionParser.new do |o|
-  o.banner = 'Usage: deploy.rb [--ref REF] [--no-pull] [--no-build] [--no-shell] [--no-infra] [--no-tls] [--roll-scope SCOPE] [--csr | --import-cert FILE]'
+  o.banner = 'Usage: deploy.rb [--ref REF] [--no-pull] [--no-build] [--no-shell] [--no-client] [--no-infra] [--no-tls] [--roll-scope SCOPE] [--csr | --import-cert FILE]'
   o.on('--ref REF', 'Meta-repo branch/ref to deploy (default: main; DEPLOY_REF env). Checked out + fast-forwarded before build') { |v| opts[:ref] = v }
   o.on('--no-pull',  'Skip self-update (git pull + submodule update before deploy)') { opts[:no_pull] = true }
   o.on('--no-build', 'Skip image build (just re-import + redeploy)') { opts[:no_build] = true }
   o.on('--no-shell', 'Skip rebuilding the carbide2-shell image (reuse existing carbide2-shell:dev)') { opts[:no_shell] = true }
+  o.on('--no-client', 'Skip building + uploading the pinned SPA client to the MinIO static tier') { opts[:no_client] = true }
   o.on('--no-infra', 'Skip cluster/infra bring-up')                  { opts[:no_infra] = true }
   o.on('--no-tls',   'Skip mkcert TLS setup (Traefik default cert)')  { opts[:no_tls] = true }
   o.on('--public-host HOST', 'Browser-facing FQDN for ingress/cert/host-auth (default: hostname -f; localhost only for same-machine)') { |v| opts[:public_host] = v }

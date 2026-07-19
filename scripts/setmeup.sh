@@ -14,10 +14,16 @@
 #                                              gem dir; deploy.rb re-execs here)
 #     - mkcert (+ libnss3-tools)              (locally-trusted TLS certs so wss://
 #                                              works; skip with --no-mkcert)
+#     - MinIO client as 'mcli'                 (build-client uploads SPA builds to
+#                                              the MinIO static tier; installed as
+#                                              'mcli' because Debian's 'mc' package
+#                                              is Midnight Commander. --no-minio-client
+#                                              skips)
 #   OPTIONAL (behind flags):
 #     --node       Node.js 20 (Vite client build outside containers + Playwright)
 #     --socat      socat      (host LM Studio relay for local LLM agents)
 #     --no-mkcert  skip the default mkcert install (bring your own TLS / --no-tls)
+#     --no-minio-client  skip the default MinIO client (mcli) install
 #     --all        all of the above optionals
 #
 # After this finishes (and you re-login for the docker group), the deploy is:
@@ -37,11 +43,14 @@ HELM_GET_URL="https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-
 K3D_VERSION="v5.8.3"
 RUBY_VERSION="3.4.2"
 NODE_MAJOR="20"
+# MinIO client, installed as 'mcli' (Debian's 'mc' package is Midnight Commander).
+MINIO_MC_RELEASE="RELEASE.2025-08-13T08-35-41Z"
 
 # --- flags ------------------------------------------------------------------
 WANT_NODE=0
 WANT_SOCAT=0
 WANT_MKCERT=1
+WANT_MINIO_CLIENT=1
 FORCE=0
 for arg in "$@"; do
   case "$arg" in
@@ -49,7 +58,9 @@ for arg in "$@"; do
     --socat)     WANT_SOCAT=1 ;;
     --mkcert)    WANT_MKCERT=1 ;;
     --no-mkcert) WANT_MKCERT=0 ;;
-    --all)       WANT_NODE=1; WANT_SOCAT=1; WANT_MKCERT=1 ;;
+    --minio-client)    WANT_MINIO_CLIENT=1 ;;
+    --no-minio-client) WANT_MINIO_CLIENT=0 ;;
+    --all)       WANT_NODE=1; WANT_SOCAT=1; WANT_MKCERT=1; WANT_MINIO_CLIENT=1 ;;
     --force)     FORCE=1 ;;
     -h|--help)
       sed -n '2,/END-OF-HELP/p' "$0" | sed -e '/END-OF-HELP/d' -e 's/^# \{0,1\}//'
@@ -231,8 +242,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 9. Summary
+# 8b. MinIO client as 'mcli' (default; --no-minio-client skips)
 # ---------------------------------------------------------------------------
+# scripts/build-client uploads compiled SPA builds to the MinIO static tier with
+# this client. It is installed as 'mcli' on purpose: Debian/Ubuntu's 'mc' package
+# is GNU Midnight Commander (a file manager), which would otherwise shadow it.
+if [[ $WANT_MINIO_CLIENT -eq 1 ]]; then
+  if have mcli && mcli --version 2>&1 | grep -qi minio; then
+    log "MinIO client already present: $(mcli --version 2>/dev/null | head -1)"
+  else
+    log "installing MinIO client ${MINIO_MC_RELEASE} as /usr/local/bin/mcli"
+    if curl -fsSLo /tmp/mcli "https://dl.min.io/client/mc/release/linux-${ARCH}/archive/mc.${MINIO_MC_RELEASE}"; then
+      sudo install -m 0755 /tmp/mcli /usr/local/bin/mcli
+      rm -f /tmp/mcli
+    else
+      warn "MinIO client download failed — install manually from dl.min.io (as 'mcli') if you plan to run scripts/build-client."
+    fi
+  fi
+else
+  log "skipping MinIO client (--no-minio-client) — scripts/build-client needs 'mcli' (or CARBIDE_MC) to upload builds"
+fi
 echo
 log "provisioning complete. Versions:"
 for t in docker kubectl helm k3d ruby bundle; do
@@ -249,6 +278,9 @@ for t in docker kubectl helm k3d ruby bundle; do
     printf '  %-9s (MISSING)\n' "$t"
   fi
 done
+if have mcli && mcli --version 2>&1 | grep -qi minio; then
+  printf '  %-9s %s\n' mcli "$(mcli --version 2>/dev/null | head -1)"
+fi
 
 cat <<EOF
 

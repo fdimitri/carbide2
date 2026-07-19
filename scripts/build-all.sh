@@ -30,6 +30,9 @@ WORKER_SHA="$(short_sha "$WORKER")"
 BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 echo "==> [1/3] carbide2:dev (workspace pod)"
+# No client build-context here: the workspace image does NOT bake the SPA
+# client. Clients live only in the MinIO static tier (see scripts/build-client);
+# this image ships just the Rails loader + worker.
 docker buildx build --load \
   -t carbide2:dev \
   --build-arg "META_SHA=$META_SHA" \
@@ -37,18 +40,19 @@ docker buildx build --load \
   --build-arg "SERVER_SHA=$SERVER_SHA" \
   --build-arg "WORKER_SHA=$WORKER_SHA" \
   --build-arg "BUILD_TIME=$BUILD_TIME" \
-  --build-context "client=$CLIENT" \
   --build-context "worker=$WORKER" \
   "$SERVER"
 
 echo "==> [2/3] carbide2-control:dev (control plane + dashboard)"
+# No client build-context here either: the control image does NOT bake the
+# dashboard SPA. It is published to the MinIO static tier as the
+# 'carbide2-control' family (scripts/build-client --mode control).
 docker buildx build --load \
   -t carbide2-control:dev \
   --build-arg "META_SHA=$META_SHA" \
   --build-arg "CLIENT_SHA=$CLIENT_SHA" \
   --build-arg "CONTROL_SHA=$CONTROL_SHA" \
   --build-arg "BUILD_TIME=$BUILD_TIME" \
-  --build-context "client=$CLIENT" \
   "$CONTROL"
 
 # The workspace shell pod (per-project terminal container) runs this image.
