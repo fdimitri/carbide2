@@ -71,6 +71,7 @@ require 'tmpdir'
 require 'tempfile'
 require 'fileutils'
 require 'digest'
+require_relative 'lib/carbide_images'
 
 # Bundler/inline installs the two helper gems at runtime, which needs a ruby
 # whose gem dir is writable. A bare system ruby (e.g. /usr/bin/ruby on Debian)
@@ -210,6 +211,13 @@ module Carbide
       @registry_ca       = (@opts[:registry_ca] || ENV['REGISTRY_CA'])&.strip
       @registry_ca       = nil if @registry_ca && @registry_ca.empty?
       validate_registry_modes!
+      # All image build/tag/registry logic lives in the shared Images library
+      # (also used by scripts/build.rb) so the two never drift.
+      @images = Carbide::Images.new(
+        cmd: @cmd, quiet: @quiet, root: @root,
+        registry_host: @registry_host, registry_port: @registry_port,
+        registry_ca: @registry_ca
+      )
       # Which meta-repo branch/ref this deploy builds from. self_update checks it
       # out and fast-forwards it before doing anything, so the deployed images
       # always match a known ref instead of "whatever happened to be checked
@@ -276,7 +284,7 @@ module Carbide
     def publish_only_run
       ensure_registry
       build_images unless @opts[:no_build] || skip_build?
-      push_images
+      @images.push
       log "publish-only complete \u2014 images are in the registry at " \
           "#{@registry_host}:#{@registry_port}"
       log "next: on each k3s node run deploy.rb --external-registry " \
@@ -454,18 +462,17 @@ module Carbide
       if @registry
         env['REGISTRY_HOST'] = @registry_host
         env['REGISTRY_PORT'] = @registry_port
-        env['REGISTRY_CA']   = mkcert_ca_pem.to_s
+        env['REGISTRY_CA']   = @images.mkcert_ca_pem.to_s
       end
       quiet_run("preparing the #{@backend} cluster + infra (this may take a minute)",
                 File.join(@server, 'scripts', script), env: env)
     end
 
     def build_images
-      env = @opts[:no_shell] ? { 'SKIP_SHELL' => '1' } : {}
-      env['REGISTRY'] = @registry if @registry
-      quiet_run('building the container images — on a cold cache this builds ' \
-                'Ruby from source, so give it a few minutes (reticulating splines...)',
-                File.join(@root, 'scripts', 'build-all.sh'), env: env)
+      components = @opts[:no_shell] ? %i[workspace control] : Carbide::Images::ALL
+      log 'building the container images — on a cold cache this builds Ruby from ' \
+          'source, so give it a few minutes (reticulating splines...)'
+      @images.build(components: components, quiet: true)
     end
 
     # Build the PINNED SPA clients (the carbide2-client submodule's checked-out
@@ -485,154 +492,28 @@ module Carbide
       end
     end
 
-    # 12-char short SHA of the checkout in `dir` (matches build-all.sh).
-    def git_short_sha(dir)
-      out, = @cmd.run!('git', '-C', dir, 'rev-parse', '--short=12', 'HEAD')
-      (out || '').strip
-    end
-
-    # Immutable per-component tags. Workspace ships server+worker, so its tag is
-    # composite; control and shell each track a single component.
-    def image_tags
-      @image_tags ||= {
-        workspace: "#{git_short_sha(@server)}-#{git_short_sha(File.join(@root, 'carbide2-worker'))}",
-        control:   git_short_sha(@control),
-        shell:     git_short_sha(@server)
-      }
-    end
-
-    def workspace_image = "#{@registry}carbide2:#{image_tags[:workspace]}"
-    def control_image   = "#{@registry}carbide2-control:#{image_tags[:control]}"
-    def shell_image     = "#{@registry}carbide2-shell:#{image_tags[:shell]}"
+    # Image tagging, building, and registry lifecycle all live in the shared
+    # Carbide::Images library (also used by scripts/build.rb). These delegators
+    # keep the rest of deploy.rb reading the same.
+    def image_tags  = @images.image_tags
+    def shell_image = @images.image_ref(:shell)
 
     # Publish the freshly-built images so the cluster can pull them. Registry
     # mode pushes SHA tags to the standalone registry (works across every node);
     # legacy mode imports :dev into the single node's containerd.
     def publish_images
-      @registry ? push_images : import_images
+      @registry ? @images.push : import_images
     end
 
-    # When every SHA tag is already in the registry there's nothing to build \u2014
+    # When every SHA tag is already in the registry there's nothing to build —
     # immutable tags mean identical content, so skip the (slow) build entirely.
     def skip_build?
-      return false unless @registry
-
-      all = [workspace_image, control_image, shell_image].all? { |i| registry_has?(i) }
-      log "all image tags already in registry #{@registry_host}:#{@registry_port} \u2014 skipping build" if all
-      all
+      skip = @images.all_present?
+      log "all image tags already in registry #{@registry_host}:#{@registry_port} — skipping build" if skip
+      skip
     end
 
-    def push_images
-      log "pushing images to registry #{@registry_host}:#{@registry_port}"
-      { workspace: workspace_image, control: control_image, shell: shell_image }.each_value do |img|
-        if registry_has?(img)
-          log "  skip #{img} (already in registry)"
-          next
-        end
-        unless @quiet.run!("docker image inspect #{img}").success?
-          abort "\e[1;31mxx\e[0m #{img} not present locally \u2014 build it first " \
-                "(scripts/build-all.sh) then re-run. Refusing to deploy against a " \
-                "tag the cluster will ImagePullBackOff on."
-        end
-        log "  push #{img}"
-        res = @quiet.run!('docker', 'push', img)
-        next if res.success?
-
-        $stdout.write(res.out)
-        $stderr.write(res.err)
-        abort "\e[1;31mxx\e[0m docker push failed for #{img} (output above)."
-      end
-    end
-
-    # True if <name>:<tag> already exists in the registry (HEAD-equivalent GET of
-    # the manifest). --cacert trusts the mkcert-signed registry cert.
-    def registry_has?(img)
-      name, tag = img.sub(@registry, '').split(':', 2)
-      url = "https://#{@registry_host}:#{@registry_port}/v2/#{name}/manifests/#{tag}"
-      registry_curl('-sf', '-o', '/dev/null',
-                    '-H', 'Accept: application/vnd.docker.distribution.manifest.v2+json',
-                    url).success?
-    end
-
-    def registry_curl(*args)
-      cmd = ['curl']
-      cmd += ['--cacert', mkcert_ca_pem] if mkcert_ca_pem
-      @quiet.run!(*cmd, *args)
-    end
-
-    def mkcert_ca_pem
-      return @mkcert_ca if defined?(@mkcert_ca)
-
-      # An externally-run registry supplies its CA explicitly (this node may not
-      # even have mkcert); prefer it over probing the local mkcert CAROOT.
-      return @mkcert_ca = @registry_ca if @registry_ca && File.exist?(@registry_ca)
-
-      out, = @cmd.run!('mkcert', '-CAROOT')
-      pem  = File.join((out || '').strip, 'rootCA.pem')
-      @mkcert_ca = File.exist?(pem) ? pem : nil
-    end
-
-    # Bring up (or reuse) a standalone registry:2 on this host over TLS. The cert
-    # reuses the carbide mkcert root CA, so nodes that already trust that CA (via
-    # scripts/setmeup.sh --registry-host) can pull without extra config.
-    def ensure_registry
-      log "ensuring standalone registry at #{@registry_host}:#{@registry_port}"
-      dir = File.expand_path('~/.carbide/registry')
-      crt = File.join(dir, 'registry.crt')
-      key = File.join(dir, 'registry.key')
-      ensure_registry_cert(dir, crt, key)
-      ensure_registry_container(dir)
-      verify_registry
-    end
-
-    def ensure_registry_cert(dir, crt, key)
-      return if File.exist?(crt) && File.exist?(key)
-
-      unless system('command -v mkcert >/dev/null 2>&1')
-        abort "\e[1;31mxx mkcert not found.\e[0m It mints the registry's TLS cert " \
-              "(and the CA nodes trust to pull). Install mkcert (see --no-tls help) and retry."
-      end
-      FileUtils.mkdir_p(dir)
-      hosts = registry_tls_hosts
-      log "minting registry TLS cert via mkcert for: #{hosts.join(' ')}"
-      @cmd.run('mkcert', '-cert-file', crt, '-key-file', key, *hosts)
-    end
-
-    def registry_tls_hosts
-      hosts = [@registry_host, 'localhost', '127.0.0.1']
-      ips, = @cmd.run!('hostname', '-I')
-      hosts.concat((ips || '').strip.split)
-      hosts.uniq
-    end
-
-    def ensure_registry_container(dir)
-      name = ENV.fetch('REGISTRY_CONTAINER', 'carbide-registry')
-      running, = @cmd.run!('docker', 'ps', '-q', '-f', "name=^#{name}$")
-      unless (running || '').strip.empty?
-        log "registry container '#{name}' already running \u2014 reusing"
-        return
-      end
-
-      @quiet.run!('docker', 'rm', '-f', name)
-      log "starting registry:2 container '#{name}' on :#{@registry_port}"
-      @cmd.run('docker', 'run', '-d', '--restart=always', '--name', name,
-               '-p', "#{@registry_port}:5000",
-               '-v', "#{dir}:/certs:ro",
-               '-e', 'REGISTRY_HTTP_TLS_CERTIFICATE=/certs/registry.crt',
-               '-e', 'REGISTRY_HTTP_TLS_KEY=/certs/registry.key',
-               'registry:2')
-    end
-
-    def verify_registry
-      url = "https://#{@registry_host}:#{@registry_port}/v2/"
-      15.times do
-        return if registry_curl('-sf', '-o', '/dev/null', url).success?
-
-        sleep 1
-      end
-      abort "\e[1;31mxx\e[0m registry did not become reachable at #{url}. Check " \
-            "`docker logs carbide-registry` and that the mkcert CA is trusted on this host."
-    end
+    def ensure_registry = @images.ensure_registry
 
     def import_images
       log "importing images into #{@backend} cluster '#{@cluster}'"
