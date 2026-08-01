@@ -34,6 +34,14 @@
 #   ./scripts/deploy.rb --registry-host HOST  push SHA-tagged images to a self-hosted
 #                                       registry at HOST (multi-node: every node pulls
 #                                       from it instead of a per-node containerd import)
+#   ./scripts/deploy.rb --publish-only --registry-host HOST
+#                                       build + push images to the registry, then STOP.
+#                                       For a dedicated build/registry host that runs no
+#                                       k3s (pair with --external-registry on the nodes).
+#   ./scripts/deploy.rb --external-registry --registry-host HOST --registry-ca FILE
+#                                       deploy to a k3s node that pulls from a registry
+#                                       run ELSEWHERE: skip the local registry + build,
+#                                       just pull the already-pushed tags.
 #   ./scripts/deploy.rb --no-build      skip image build (re-import + redeploy)
 #   ./scripts/deploy.rb --no-shell      build everything EXCEPT the carbide2-shell image
 #   ./scripts/deploy.rb --no-client     skip building + uploading the pinned SPA client
@@ -191,6 +199,17 @@ module Carbide
       @registry_host = nil if @registry_host && @registry_host.empty?
       @registry_port = (@opts[:registry_port] || ENV.fetch('REGISTRY_PORT', '5000')).to_s
       @registry      = @registry_host ? "#{@registry_host}:#{@registry_port}/" : nil
+      # Split-host modes so a multi-node cluster needn't co-locate build+registry
+      # on a k3s node. --publish-only: THIS host only builds + pushes images to
+      # its registry (no k3s/helm). --external-registry: THIS host is a k3s node
+      # that pulls from a registry someone ELSE runs, so skip standing up a local
+      # one and skip building (images are already pushed). --registry-ca points at
+      # that external registry's CA so containerd + our reachability check trust it.
+      @publish_only      = @opts[:publish_only]
+      @external_registry = @opts[:external_registry]
+      @registry_ca       = (@opts[:registry_ca] || ENV['REGISTRY_CA'])&.strip
+      @registry_ca       = nil if @registry_ca && @registry_ca.empty?
+      validate_registry_modes!
       # Which meta-repo branch/ref this deploy builds from. self_update checks it
       # out and fast-forwards it before doing anything, so the deployed images
       # always match a known ref instead of "whatever happened to be checked
@@ -203,7 +222,9 @@ module Carbide
       # cert SANs and advertises an unreachable URL whenever the box is actually
       # reached by its LAN name. resolve_public_endpoint detects a real FQDN via
       # `hostname -f` and otherwise STOPS with instructions (see method).
-      @public_host, @public_url = resolve_public_endpoint
+      # The dedicated build/registry host (--publish-only) serves no ingress, so
+      # don't demand a browser FQDN there.
+      @public_host, @public_url = @publish_only ? ['', ''] : resolve_public_endpoint
       # Which deployments roll_deployments restarts after a redeploy:
       #   all     — control-plane AND workspace deployments (+ orphaned shell
       #             pods). Version-coherent: the editor SPA (served by the
@@ -226,10 +247,12 @@ module Carbide
       return import_cert if @opts[:import_cert]
 
       require_tools
-      ensure_registry if @registry
+      return publish_only_run if @publish_only
+
+      ensure_registry if @registry && !@external_registry
       ensure_infra unless @opts[:no_infra]
-      build_images unless @opts[:no_build] || skip_build?
-      publish_images
+      build_images unless @opts[:no_build] || @external_registry || skip_build?
+      publish_images unless @external_registry
       build_and_upload_client unless @opts[:no_client]
       apply_crd
       install_control_plane
@@ -244,6 +267,39 @@ module Carbide
     end
 
     private
+
+    # --publish-only: build the SHA-tagged images and push them to the self-hosted
+    # registry, then stop. Runs on the dedicated build/registry host (no k3s, no
+    # helm, no cluster) so the k3s nodes can pull the images over HTTPS. Pair it
+    # with --external-registry on each k3s node, which consumes this registry
+    # instead of standing up its own.
+    def publish_only_run
+      ensure_registry
+      build_images unless @opts[:no_build] || skip_build?
+      push_images
+      log "publish-only complete \u2014 images are in the registry at " \
+          "#{@registry_host}:#{@registry_port}"
+      log "next: on each k3s node run deploy.rb --external-registry " \
+          "--registry-host #{@registry_host} --registry-ca <rootCA.pem> " \
+          "(copy this host's mkcert rootCA.pem over first)"
+    end
+
+    # Guard the split-host registry flags: they only make sense with a registry,
+    # are mutually exclusive, and --external-registry needs the registry's CA.
+    def validate_registry_modes!
+      if @publish_only && @external_registry
+        abort "\e[1;31mxx\e[0m --publish-only and --external-registry are mutually " \
+              "exclusive: one builds+pushes images, the other consumes them."
+      end
+      if (@publish_only || @external_registry) && !@registry
+        abort "\e[1;31mxx\e[0m #{@publish_only ? '--publish-only' : '--external-registry'} " \
+              "needs --registry-host (the self-hosted registry to push to / pull from)."
+      end
+      if @external_registry && !@registry_ca
+        abort "\e[1;31mxx\e[0m --external-registry needs --registry-ca FILE (the registry's " \
+              "mkcert rootCA.pem, copied from the build host) so this node trusts it."
+      end
+    end
 
     # Resolve the browser-facing hostname + URL base. Order of precedence:
     #   1. PUBLIC_URL_BASE  (explicit full URL, wins outright)
@@ -355,8 +411,9 @@ module Carbide
       # k3s installs itself from dev-cluster-k3s.sh, so it isn't a prereq tool;
       # docker stays required for BOTH backends (image build + the k3s
       # `docker save | k3s ctr images import` path).
-      tools = %w[docker kubectl helm]
-      tools << 'k3d' if @backend == 'k3d'
+      # --publish-only only builds + pushes images: docker is enough, no k8s CLI.
+      tools = @publish_only ? %w[docker] : %w[docker kubectl helm]
+      tools << 'k3d' if @backend == 'k3d' && !@publish_only
       tools.each do |tool|
         next if system("command -v #{tool} >/dev/null 2>&1")
 
@@ -383,7 +440,7 @@ module Carbide
       # The k3s backend installs k3s and imports images into its host containerd,
       # both of which need root. Prime sudo now (visible prompt) so the later
       # quiet, output-captured steps don't hang on a hidden password prompt.
-      if @backend == 'k3s' && !system('sudo', '-v')
+      if @backend == 'k3s' && !@publish_only && !system('sudo', '-v')
         abort "\e[1;31mxx\e[0m the k3s backend needs sudo (k3s install + containerd " \
               "image import). Grant sudo, or use the default --kube-backend=k3d."
       end
@@ -505,6 +562,10 @@ module Carbide
 
     def mkcert_ca_pem
       return @mkcert_ca if defined?(@mkcert_ca)
+
+      # An externally-run registry supplies its CA explicitly (this node may not
+      # even have mkcert); prefer it over probing the local mkcert CAROOT.
+      return @mkcert_ca = @registry_ca if @registry_ca && File.exist?(@registry_ca)
 
       out, = @cmd.run!('mkcert', '-CAROOT')
       pem  = File.join((out || '').strip, 'rootCA.pem')
@@ -1031,12 +1092,15 @@ module Carbide
   end
 end
 
-opts = { no_build: false, no_infra: false, no_tls: false, no_pull: false, csr: false, import_cert: nil, key: nil, roll_scope: nil, public_host: nil, ref: nil, kube_backend: nil, registry_host: nil, registry_port: nil }
+opts = { no_build: false, no_infra: false, no_tls: false, no_pull: false, csr: false, import_cert: nil, key: nil, roll_scope: nil, public_host: nil, ref: nil, kube_backend: nil, registry_host: nil, registry_port: nil, registry_ca: nil, publish_only: false, external_registry: false }
 OptionParser.new do |o|
-  o.banner = 'Usage: deploy.rb [--ref REF] [--kube-backend k3d|k3s] [--registry-host HOST] [--no-pull] [--no-build] [--no-shell] [--no-client] [--no-infra] [--no-tls] [--roll-scope SCOPE] [--csr | --import-cert FILE]'
+  o.banner = 'Usage: deploy.rb [--ref REF] [--kube-backend k3d|k3s] [--registry-host HOST] [--publish-only | --external-registry] [--no-pull] [--no-build] [--no-shell] [--no-client] [--no-infra] [--no-tls] [--roll-scope SCOPE] [--csr | --import-cert FILE]'
   o.on('--ref REF', 'Meta-repo branch/ref to deploy (default: main; DEPLOY_REF env). Checked out + fast-forwarded before build') { |v| opts[:ref] = v }
   o.on('--registry-host HOST', 'Enable registry mode: push SHA-tagged images to a self-hosted registry at HOST (REGISTRY_HOST env). Nodes pull from it — required for multi-node') { |v| opts[:registry_host] = v }
   o.on('--registry-port PORT', 'Registry port (default 5000; REGISTRY_PORT env)') { |v| opts[:registry_port] = v }
+  o.on('--registry-ca FILE', 'CA (mkcert rootCA.pem) of an externally-run registry, so this node trusts it (REGISTRY_CA env). Required with --external-registry') { |v| opts[:registry_ca] = v }
+  o.on('--publish-only', 'Build + push SHA-tagged images to the self-hosted registry, then exit. For the dedicated build/registry host (no k3s/helm). Needs --registry-host') { opts[:publish_only] = true }
+  o.on('--external-registry', 'This k3s node pulls from a registry run elsewhere: skip the local registry + build. Needs --registry-host + --registry-ca') { opts[:external_registry] = true }
   o.on('--no-pull',  'Skip self-update (git pull + submodule update before deploy)') { opts[:no_pull] = true }
   o.on('--no-build', 'Skip image build (just re-import + redeploy)') { opts[:no_build] = true }
   o.on('--no-shell', 'Skip rebuilding the carbide2-shell image (reuse existing carbide2-shell:dev)') { opts[:no_shell] = true }
