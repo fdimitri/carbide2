@@ -73,6 +73,10 @@ module Carbide
     # The always-built local tag (the k3d/k3s containerd-import path uses these).
     def local_ref(component) = "#{NAMES.fetch(component)}:dev"
 
+    # Registry-prefixed repository (no tag), for callers like helm that take
+    # image.repository and image.tag as separate values. Nil registry => bare name.
+    def repository(component) = "#{@registry}#{NAMES.fetch(component)}"
+
     # Build the requested components (default all) and, when push: true and a
     # registry is configured, push each to it. Build and push happen inside the
     # same with_refs block so the tags pushed are exactly the tags built even

@@ -73,6 +73,8 @@ require 'fileutils'
 require 'digest'
 require_relative 'lib/carbide_images'
 require_relative 'lib/carbide_tls'
+require_relative 'lib/carbide_cluster'
+require_relative 'lib/carbide_control_plane'
 
 # Bundler/inline installs the two helper gems at runtime, which needs a ruby
 # whose gem dir is writable. A bare system ruby (e.g. /usr/bin/ruby on Debian)
@@ -162,10 +164,6 @@ module Carbide
   end
 
   class Deploy
-    # No registry exists in dev, so every one of these must be `k3d image import`ed
-    # or the pods ImagePullBackOff.
-    IMAGES = %w[carbide2:dev carbide2-control:dev carbide2-shell:dev].freeze
-
     def initialize(opts)
       @opts       = opts
       @cmd        = TTY::Command.new(uuid: false, printer: :pretty)
@@ -180,17 +178,16 @@ module Carbide
       @cluster    = ENV.fetch('CLUSTER_NAME', 'carbide-dev')
       @control_ns = ENV.fetch('CONTROL_NS', 'carbide-system')
       @release    = ENV.fetch('RELEASE', 'carbide-control')
-      # Which local Kubernetes backend to target. k3d (default) is k3s-in-Docker
-      # and publishes container ports, so dev maps host 8080/8443 -> Traefik
-      # 80/443. k3s runs host-native; klipper ServiceLB binds the host's real
-      # 80/443, so those become the defaults. Both stay env/flag overridable.
-      @backend    = (@opts[:kube_backend] || ENV.fetch('KUBE_BACKEND', 'k3d')).to_s.downcase
-      unless %w[k3d k3s].include?(@backend)
-        abort "\e[1;31mxx\e[0m unknown --kube-backend '#{@backend}' (expected k3d or k3s)"
-      end
-      default_http, default_https = @backend == 'k3s' ? %w[80 443] : %w[8080 8443]
-      @http_port  = ENV.fetch('HTTP_PORT', default_http)
-      @https_port = ENV.fetch('HTTPS_PORT', default_https)
+      # The local single-node backend (k3d default / k3s host-native) — its
+      # ports, infra bring-up, and containerd image-import path all live in the
+      # shared Carbide::Cluster helper (validates the backend on construction).
+      @cluster_iface = Carbide::Cluster.new(
+        cmd: @cmd, quiet: @quiet,
+        backend: @opts[:kube_backend] || ENV.fetch('KUBE_BACKEND', 'k3d'),
+        name: @cluster, server_root: @server
+      )
+      @http_port  = @cluster_iface.http_port
+      @https_port = @cluster_iface.https_port
       # Optional self-hosted registry. When --registry-host/REGISTRY_HOST is set,
       # deploy switches from the single-node containerd-import path to building
       # immutable SHA-tagged images, pushing them to a standalone registry:2 on
@@ -251,6 +248,13 @@ module Carbide
       # Ingress TLS/cert flows (mkcert default cert, CSR/import, CA trust hints)
       # live in the shared Carbide::Tls helper.
       @tls = Carbide::Tls.new(cmd: @cmd, root: @root, public_host: @public_host)
+      # The CRD + helm release + Deployment rollouts live in Carbide::ControlPlane;
+      # it reads image tags straight from @images so the chart pins what we built.
+      @control_plane = Carbide::ControlPlane.new(
+        cmd: @cmd, control_root: @control, namespace: @control_ns, release: @release,
+        images: @images, http_port: @http_port, https_port: @https_port,
+        public_url: @public_url, roll_scope: @roll_scope
+      )
     end
 
     def run
@@ -266,10 +270,10 @@ module Carbide
       build_images unless @opts[:no_build] || @external_registry || skip_build?
       publish_images unless @external_registry
       build_and_upload_client unless @opts[:no_client]
-      apply_crd
-      install_control_plane
+      @control_plane.apply_crd
+      @control_plane.install
       @tls.setup_tls unless @opts[:no_tls]
-      roll_deployments
+      @control_plane.roll_deployments
       verify
       summary
       # Trust instructions go dead last so they're the final thing on screen —
@@ -424,7 +428,7 @@ module Carbide
       # `docker save | k3s ctr images import` path).
       # --publish-only only builds + pushes images: docker is enough, no k8s CLI.
       tools = @publish_only ? %w[docker] : %w[docker kubectl helm]
-      tools << 'k3d' if @backend == 'k3d' && !@publish_only
+      tools.concat(@cluster_iface.extra_tools) unless @publish_only
       tools.each do |tool|
         next if system("command -v #{tool} >/dev/null 2>&1")
 
@@ -451,24 +455,20 @@ module Carbide
       # The k3s backend installs k3s and imports images into its host containerd,
       # both of which need root. Prime sudo now (visible prompt) so the later
       # quiet, output-captured steps don't hang on a hidden password prompt.
-      if @backend == 'k3s' && !@publish_only && !system('sudo', '-v')
+      if @cluster_iface.needs_sudo? && !@publish_only && !system('sudo', '-v')
         abort "\e[1;31mxx\e[0m the k3s backend needs sudo (k3s install + containerd " \
               "image import). Grant sudo, or use the default --kube-backend=k3d."
       end
     end
 
     def ensure_infra
-      script = @backend == 'k3s' ? 'dev-cluster-k3s.sh' : 'dev-cluster-k3d.sh'
-      env = { 'CLUSTER_NAME' => @cluster,
-              'HTTP_PORT' => @http_port,
-              'HTTPS_PORT' => @https_port }
+      env = {}
       if @registry
         env['REGISTRY_HOST'] = @registry_host
         env['REGISTRY_PORT'] = @registry_port
         env['REGISTRY_CA']   = @images.mkcert_ca_pem.to_s
       end
-      quiet_run("preparing the #{@backend} cluster + infra (this may take a minute)",
-                File.join(@server, 'scripts', script), env: env)
+      @cluster_iface.ensure_infra(env: env)
     end
 
     def build_images
@@ -496,16 +496,13 @@ module Carbide
     end
 
     # Image tagging, building, and registry lifecycle all live in the shared
-    # Carbide::Images library (also used by scripts/build.rb). These delegators
-    # keep the rest of deploy.rb reading the same.
-    def image_tags  = @images.image_tags
-    def shell_image = @images.image_ref(:shell)
+    # Carbide::Images library (also used by scripts/build.rb).
 
     # Publish the freshly-built images so the cluster can pull them. Registry
     # mode pushes SHA tags to the standalone registry (works across every node);
     # legacy mode imports :dev into the single node's containerd.
     def publish_images
-      @registry ? @images.push : import_images
+      @registry ? @images.push : @cluster_iface.import_images
     end
 
     # When every SHA tag is already in the registry there's nothing to build —
@@ -517,163 +514,6 @@ module Carbide
     end
 
     def ensure_registry = @images.ensure_registry
-
-    def import_images
-      log "importing images into #{@backend} cluster '#{@cluster}'"
-      IMAGES.each do |img|
-        # Every image here is required. A missing local image used to only warn
-        # and let the deploy finish — leaving the cluster in a broken state where
-        # pods ImagePullBackOff against docker.io (the image is local-only and was
-        # never pushed). Fail loudly instead so the operator builds it first.
-        # @quiet so `docker image inspect`'s multi-screen JSON dump never hits
-        # the console (we only care whether the image exists).
-        unless @quiet.run!("docker image inspect #{img}").success?
-          abort "\e[1;31mxx\e[0m #{img} not present locally — build it first " \
-                "(scripts/build-all.sh) then re-run. Refusing to deploy a cluster " \
-                "that will ImagePullBackOff."
-        end
-        log "  import #{img}"
-        @backend == 'k3s' ? import_image_k3s(img) : import_image_k3d(img)
-      end
-    end
-
-    # k3d: `k3d image import` copies the local docker image into the node
-    # container's containerd. @quiet — its progress is noise on success; surface
-    # it only on failure, then verify it truly landed (the import has been
-    # observed to silently no-op/lose an image, invisible until the first pod
-    # ImagePullBackOffs against docker.io).
-    def import_image_k3d(img)
-      node = "k3d-#{@cluster}-server-0"
-      res  = @quiet.run!('k3d', 'image', 'import', img, '-c', @cluster)
-      unless res.success?
-        $stdout.write(res.out)
-        $stderr.write(res.err)
-        abort "\e[1;31mxx\e[0m k3d image import failed for #{img} (output above)."
-      end
-      unless crictl_has_image?("docker exec #{node} crictl images", img)
-        abort "\e[1;31mxx\e[0m #{img} did not land in node '#{node}' containerd " \
-              "after import — pods would ImagePullBackOff. Aborting."
-      end
-    end
-
-    # k3s: no `k3d image import` equivalent — stream the local docker image
-    # straight into k3s's host containerd (the k8s.io namespace pods pull from).
-    # Verify it landed for the same reason as the k3d path.
-    def import_image_k3s(img)
-      res = @quiet.run!("docker save #{img} | sudo k3s ctr -n k8s.io images import -")
-      unless res.success?
-        $stdout.write(res.out)
-        $stderr.write(res.err)
-        abort "\e[1;31mxx\e[0m k3s containerd import failed for #{img} (output above)."
-      end
-      unless crictl_has_image?('sudo k3s crictl images', img)
-        abort "\e[1;31mxx\e[0m #{img} did not land in k3s containerd after import — " \
-              "pods would ImagePullBackOff. Aborting."
-      end
-    end
-
-    # True if `<crictl_cmd>` lists containerd image <repo>:<tag>. crictl's
-    # positional and -q reference filters are unreliable across versions (they
-    # ignore the filter and list everything), so match repo+tag as exact columns
-    # instead. Local-only images usually normalize to the docker.io/library/
-    # prefix, but `k3s ctr images import` can keep the bare name — accept both.
-    def crictl_has_image?(crictl_cmd, img)
-      repo, tag = img.split(':', 2)
-      tag ||= 'latest'
-      refs = ["docker.io/library/#{repo}", repo]
-      res = @quiet.run!(crictl_cmd)
-      return false unless res.success?
-      res.out.each_line.any? do |line|
-        cols = line.split
-        refs.include?(cols[0]) && cols[1] == tag
-      end
-    end
-
-    def apply_crd
-      log "applying Workspace CRD"
-      @cmd.run('kubectl', 'apply', '-f', File.join(@control, 'deploy', 'crd-workspace.yaml'))
-      @cmd.run('kubectl', 'wait', '--for=condition=established',
-               'crd/workspaces.carbide.dev', '--timeout=60s')
-    end
-
-    def install_control_plane
-      log "installing/upgrading control-plane release '#{@release}' in ns '#{@control_ns}'"
-      args = ['helm', 'upgrade', '--install', @release,
-              File.join(@control, 'charts', 'control-plane'),
-              '--namespace', @control_ns, '--create-namespace',
-              '--set', "ingress.publicPort=#{@http_port}",
-              '--set', "ingress.publicHttpsPort=#{@https_port}",
-              '--set', "publicUrlBase=#{@public_url}",
-              '--set-json', 'ingress.entryPoints=["web","websecure"]',
-              '--set-json', 'ingress.tls={}']
-      if @registry
-        # --set-string so an all-digit SHA tag is never coerced to a number.
-        args.push('--set-string', "image.repository=#{@registry}carbide2-control",
-                  '--set-string', "image.tag=#{image_tags[:control]}",
-                  '--set-string', "workspace.image=#{@registry}carbide2",
-                  '--set-string', "workspace.imageTag=#{image_tags[:workspace]}",
-                  '--set-string', "workspace.shellImage=#{shell_image}")
-      end
-      args.push('--wait', '--timeout', '5m')
-      @cmd.run(*args)
-    end
-
-    def roll_deployments
-      if @roll_scope == 'none'
-        log "roll-scope=none — skipping deployment rollouts"
-        return
-      end
-
-      # Registry mode pins a new immutable tag on every code change, so the helm
-      # upgrade above already changed the pod spec and Kubernetes rolled the
-      # affected Deployments. A forced restart would only churn pods pointlessly
-      # (and re-pull is a no-op on IfNotPresent), so skip it.
-      if @registry
-        log "registry mode — helm rolled changed deployments via new image tags; skipping forced restart"
-        return
-      end
-
-      # helm upgrade is a no-op for the pod spec when only image *contents* change
-      # (same tag), so force a rollout to pull the freshly-imported images.
-      log "rolling control-plane Deployments to pick up new images"
-      %w[control-plane-rails control-plane-operator].each do |dep|
-        @cmd.run('kubectl', '-n', @control_ns, 'rollout', 'restart', "deploy/#{dep}")
-        @cmd.run('kubectl', '-n', @control_ns, 'rollout', 'status', "deploy/#{dep}", '--timeout=5m')
-      end
-
-      if @roll_scope == 'control'
-        log "roll-scope=control — leaving workspace deployments (and live terminals) untouched"
-        return
-      end
-
-      # Roll any existing workspace deployments so re-deploys refresh them too.
-      workspace_namespaces.each do |ns|
-        next unless @cmd.run!('kubectl', '-n', ns, 'get', "deploy/#{ns}").success?
-
-        log "rolling workspace deployment #{ns}"
-        @cmd.run('kubectl', '-n', ns, 'rollout', 'restart', "deploy/#{ns}")
-
-        # Delete orphaned per-project shell pods. The worker spawns these as
-        # bare pods (restartPolicy: Never, no controller), so the deployment
-        # rollout above does NOT recreate them. After a same-tag image
-        # re-import they keep running stale code, and any that were stuck in
-        # ImagePullBackOff (e.g. spawned before the image was imported) stay
-        # wedged in an exponential back-off forever — which makes terminal
-        # creation hang until the client times out. Restarting the worker
-        # wipes its in-memory pod map, so these are already orphaned; delete
-        # them here and the restarted worker respawns each one fresh against
-        # the freshly-imported image on the next terminal create.
-        @cmd.run('kubectl', '-n', ns, 'delete', 'pod',
-                 '-l', 'app.kubernetes.io/name=carbide2-shell',
-                 '--ignore-not-found')
-      end
-    end
-
-    def workspace_namespaces
-      out, = @cmd.run!('kubectl', 'get', 'ns', '-o', 'name')
-      (out || '').lines.map { |l| l.strip.sub('namespace/', '') }
-                 .select { |n| n.match?(/\Aws-\d+\z/) }
-    end
 
     def verify
       log "verifying ingress (self-signed cert -> curl -k)"
