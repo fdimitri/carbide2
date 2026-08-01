@@ -9,7 +9,11 @@
 #   ESSENTIAL (always, unless already present):
 #     - apt build/runtime deps (build-essential, libpq-dev, libssl-dev, …)
 #     - Docker engine + buildx + compose v2  (Ubuntu's docker.io + plugin pkgs)
-#     - kubectl, helm, k3d                    (pinned upstream releases)
+#     - kubectl, helm                         (pinned upstream releases)
+#     - k3d                                    (default backend; k3s-in-Docker.
+#                                              Skipped with --kube-backend=k3s,
+#                                              where dev-cluster-k3s.sh installs
+#                                              host-native k3s at deploy time)
 #     - rbenv + ruby-build + Ruby + bundler   (to run deploy.rb under a writable
 #                                              gem dir; deploy.rb re-execs here)
 #     - mkcert (+ libnss3-tools)              (locally-trusted TLS certs so wss://
@@ -24,6 +28,8 @@
 #     --socat      socat      (host LM Studio relay for local LLM agents)
 #     --no-mkcert  skip the default mkcert install (bring your own TLS / --no-tls)
 #     --no-minio-client  skip the default MinIO client (mcli) install
+#     --kube-backend=k3s  provision for host-native k3s instead of k3d (skips the
+#                  k3d install; k3s itself is installed by deploy.rb at run time)
 #     --all        all of the above optionals
 #
 # After this finishes (and you re-login for the docker group), the deploy is:
@@ -52,6 +58,11 @@ WANT_SOCAT=0
 WANT_MKCERT=1
 WANT_MINIO_CLIENT=1
 FORCE=0
+# Which local Kubernetes backend to provision for. k3d (default) is k3s-in-Docker
+# and is installed here. k3s is host-native and is installed at deploy time by
+# carbide2-server/scripts/dev-cluster-k3s.sh (with the right --disable flags), so
+# for k3s we just skip the k3d binary and leave docker/kubectl/helm in place.
+KUBE_BACKEND=k3d
 for arg in "$@"; do
   case "$arg" in
     --node)      WANT_NODE=1 ;;
@@ -60,6 +71,9 @@ for arg in "$@"; do
     --no-mkcert) WANT_MKCERT=0 ;;
     --minio-client)    WANT_MINIO_CLIENT=1 ;;
     --no-minio-client) WANT_MINIO_CLIENT=0 ;;
+    --kube-backend=*)  KUBE_BACKEND="${arg#*=}" ;;
+    --k3d)       KUBE_BACKEND=k3d ;;
+    --k3s)       KUBE_BACKEND=k3s ;;
     --all)       WANT_NODE=1; WANT_SOCAT=1; WANT_MKCERT=1; WANT_MINIO_CLIENT=1 ;;
     --force)     FORCE=1 ;;
     -h|--help)
@@ -69,6 +83,11 @@ for arg in "$@"; do
     *) echo "setmeup: unknown arg: $arg (try --help)" >&2; exit 1 ;;
   esac
 done
+
+case "$KUBE_BACKEND" in
+  k3d|k3s) ;;
+  *) echo "setmeup: unknown --kube-backend '$KUBE_BACKEND' (expected k3d or k3s)" >&2; exit 1 ;;
+esac
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
@@ -158,11 +177,18 @@ fi
 # ---------------------------------------------------------------------------
 # 5. k3d (pinned)
 # ---------------------------------------------------------------------------
-if have k3d; then
-  log "k3d already present: $(k3d version 2>/dev/null | head -1)"
+# Only for the k3d backend. For k3s, dev-cluster-k3s.sh installs k3s host-native
+# at deploy time (with the traefik/local-storage disables), so there's nothing
+# to pre-install here beyond the docker/kubectl/helm already handled above.
+if [[ "$KUBE_BACKEND" == "k3d" ]]; then
+  if have k3d; then
+    log "k3d already present: $(k3d version 2>/dev/null | head -1)"
+  else
+    log "installing k3d ${K3D_VERSION}"
+    curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG="${K3D_VERSION}" bash
+  fi
 else
-  log "installing k3d ${K3D_VERSION}"
-  curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG="${K3D_VERSION}" bash
+  log "kube-backend=k3s — skipping k3d; deploy.rb's dev-cluster-k3s.sh installs k3s (host-native) at deploy time"
 fi
 
 # ---------------------------------------------------------------------------
@@ -264,7 +290,9 @@ else
 fi
 echo
 log "provisioning complete. Versions:"
-for t in docker kubectl helm k3d ruby bundle; do
+SUMMARY_TOOLS=(docker kubectl helm ruby bundle)
+[[ "$KUBE_BACKEND" == "k3d" ]] && SUMMARY_TOOLS+=(k3d)
+for t in "${SUMMARY_TOOLS[@]}"; do
   if have "$t"; then
     case "$t" in
       docker)  printf '  %-9s %s\n' docker  "$(docker --version 2>/dev/null)";;

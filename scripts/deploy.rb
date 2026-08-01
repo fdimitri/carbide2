@@ -7,9 +7,9 @@
 # https://<host>:8443/". Idempotent; doubles as the update/rebuild path.
 #
 # Pipeline:
-#   1. ensure the k3d cluster + infra exist  (carbide2-server/scripts/dev-cluster.sh)
+#   1. ensure the cluster + infra exist      (carbide2-server/scripts/dev-cluster-<backend>.sh)
 #   2. build images                          (scripts/build-all.sh)   [skip: --no-build]
-#   3. k3d image import the images into the cluster
+#   3. import the images into the cluster    (k3d image import, or k3s containerd import)
 #   4. build + upload the pinned SPA clients (workspace + control) to the
 #      MinIO static tier                      (scripts/build-client)   [skip: --no-client]
 #   5. kubectl apply the Workspace CRD + wait for it to be established
@@ -24,11 +24,13 @@
 # shell out, because those tools have no useful Ruby binding.
 #
 # Requires on the host running this: ruby (>= 3.0), bundler, docker (BuildKit),
-# k3d, kubectl, helm. Gems (tty-command, kubeclient) are installed on first run
-# via bundler/inline.
+# kubectl, helm, and k3d (only for the default --kube-backend=k3d; the k3s
+# backend installs k3s itself). Gems (tty-command, kubeclient) are installed on
+# first run via bundler/inline.
 #
 # Usage:
 #   ./scripts/deploy.rb                 full build + deploy
+#   ./scripts/deploy.rb --kube-backend k3s   deploy to host-native k3s (default: k3d)
 #   ./scripts/deploy.rb --no-build      skip image build (re-import + redeploy)
 #   ./scripts/deploy.rb --no-shell      build everything EXCEPT the carbide2-shell image
 #   ./scripts/deploy.rb --no-client     skip building + uploading the pinned SPA client
@@ -165,8 +167,17 @@ module Carbide
       @cluster    = ENV.fetch('CLUSTER_NAME', 'carbide-dev')
       @control_ns = ENV.fetch('CONTROL_NS', 'carbide-system')
       @release    = ENV.fetch('RELEASE', 'carbide-control')
-      @http_port  = ENV.fetch('HTTP_PORT', '8080')
-      @https_port = ENV.fetch('HTTPS_PORT', '8443')
+      # Which local Kubernetes backend to target. k3d (default) is k3s-in-Docker
+      # and publishes container ports, so dev maps host 8080/8443 -> Traefik
+      # 80/443. k3s runs host-native; klipper ServiceLB binds the host's real
+      # 80/443, so those become the defaults. Both stay env/flag overridable.
+      @backend    = (@opts[:kube_backend] || ENV.fetch('KUBE_BACKEND', 'k3d')).to_s.downcase
+      unless %w[k3d k3s].include?(@backend)
+        abort "\e[1;31mxx\e[0m unknown --kube-backend '#{@backend}' (expected k3d or k3s)"
+      end
+      default_http, default_https = @backend == 'k3s' ? %w[80 443] : %w[8080 8443]
+      @http_port  = ENV.fetch('HTTP_PORT', default_http)
+      @https_port = ENV.fetch('HTTPS_PORT', default_https)
       # Which meta-repo branch/ref this deploy builds from. self_update checks it
       # out and fast-forwards it before doing anything, so the deployed images
       # always match a known ref instead of "whatever happened to be checked
@@ -327,7 +338,12 @@ module Carbide
     end
 
     def require_tools
-      %w[docker k3d kubectl helm].each do |tool|
+      # k3s installs itself from dev-cluster-k3s.sh, so it isn't a prereq tool;
+      # docker stays required for BOTH backends (image build + the k3s
+      # `docker save | k3s ctr images import` path).
+      tools = %w[docker kubectl helm]
+      tools << 'k3d' if @backend == 'k3d'
+      tools.each do |tool|
         next if system("command -v #{tool} >/dev/null 2>&1")
 
         abort "\e[1;31mxx\e[0m missing required tool: #{tool} " \
@@ -349,11 +365,20 @@ module Carbide
         abort "\e[1;31mxx\e[0m 'docker buildx' is unavailable but image build needs it. " \
               "Install the buildx plugin (apt: docker-buildx) or pass --no-build."
       end
+
+      # The k3s backend installs k3s and imports images into its host containerd,
+      # both of which need root. Prime sudo now (visible prompt) so the later
+      # quiet, output-captured steps don't hang on a hidden password prompt.
+      if @backend == 'k3s' && !system('sudo', '-v')
+        abort "\e[1;31mxx\e[0m the k3s backend needs sudo (k3s install + containerd " \
+              "image import). Grant sudo, or use the default --kube-backend=k3d."
+      end
     end
 
     def ensure_infra
-      quiet_run('preparing the k3d cluster + infra (this may take a minute)',
-                File.join(@server, 'scripts', 'dev-cluster.sh'),
+      script = @backend == 'k3s' ? 'dev-cluster-k3s.sh' : 'dev-cluster-k3d.sh'
+      quiet_run("preparing the #{@backend} cluster + infra (this may take a minute)",
+                File.join(@server, 'scripts', script),
                 env: { 'CLUSTER_NAME' => @cluster,
                        'HTTP_PORT' => @http_port,
                        'HTTPS_PORT' => @https_port })
@@ -384,8 +409,7 @@ module Carbide
     end
 
     def import_images
-      log "importing images into k3d cluster '#{@cluster}'"
-      node = "k3d-#{@cluster}-server-0"
+      log "importing images into #{@backend} cluster '#{@cluster}'"
       IMAGES.each do |img|
         # Every image here is required. A missing local image used to only warn
         # and let the deploy finish — leaving the cluster in a broken state where
@@ -399,38 +423,59 @@ module Carbide
                 "that will ImagePullBackOff."
         end
         log "  import #{img}"
-        # @quiet too — k3d's import progress is noise on success; surface it only
-        # if the import actually fails.
-        res = @quiet.run!('k3d', 'image', 'import', img, '-c', @cluster)
-        unless res.success?
-          $stdout.write(res.out)
-          $stderr.write(res.err)
-          abort "\e[1;31mxx\e[0m k3d image import failed for #{img} (output above)."
-        end
-        # Verify the image actually landed in the node's containerd. `k3d image
-        # import` has been observed to no-op/lose an image (e.g. shell image
-        # missing from the node despite a clean host build), which is invisible
-        # until the first pod tries to pull and falls back to docker.io.
-        unless node_has_image?(node, img)
-          abort "\e[1;31mxx\e[0m #{img} did not land in node '#{node}' containerd " \
-                "after import — pods would ImagePullBackOff. Aborting."
-        end
+        @backend == 'k3s' ? import_image_k3s(img) : import_image_k3d(img)
       end
     end
 
-    # True if the node's containerd holds <repo>:<tag>. crictl's positional and
-    # -q reference filters are unreliable across versions (they ignore the
-    # filter and list everything), so match repo+tag as exact columns instead.
-    # Local-only images normalize to the docker.io/library/ prefix in containerd.
-    def node_has_image?(node, img)
+    # k3d: `k3d image import` copies the local docker image into the node
+    # container's containerd. @quiet — its progress is noise on success; surface
+    # it only on failure, then verify it truly landed (the import has been
+    # observed to silently no-op/lose an image, invisible until the first pod
+    # ImagePullBackOffs against docker.io).
+    def import_image_k3d(img)
+      node = "k3d-#{@cluster}-server-0"
+      res  = @quiet.run!('k3d', 'image', 'import', img, '-c', @cluster)
+      unless res.success?
+        $stdout.write(res.out)
+        $stderr.write(res.err)
+        abort "\e[1;31mxx\e[0m k3d image import failed for #{img} (output above)."
+      end
+      unless crictl_has_image?("docker exec #{node} crictl images", img)
+        abort "\e[1;31mxx\e[0m #{img} did not land in node '#{node}' containerd " \
+              "after import — pods would ImagePullBackOff. Aborting."
+      end
+    end
+
+    # k3s: no `k3d image import` equivalent — stream the local docker image
+    # straight into k3s's host containerd (the k8s.io namespace pods pull from).
+    # Verify it landed for the same reason as the k3d path.
+    def import_image_k3s(img)
+      res = @quiet.run!("docker save #{img} | sudo k3s ctr -n k8s.io images import -")
+      unless res.success?
+        $stdout.write(res.out)
+        $stderr.write(res.err)
+        abort "\e[1;31mxx\e[0m k3s containerd import failed for #{img} (output above)."
+      end
+      unless crictl_has_image?('sudo k3s crictl images', img)
+        abort "\e[1;31mxx\e[0m #{img} did not land in k3s containerd after import — " \
+              "pods would ImagePullBackOff. Aborting."
+      end
+    end
+
+    # True if `<crictl_cmd>` lists containerd image <repo>:<tag>. crictl's
+    # positional and -q reference filters are unreliable across versions (they
+    # ignore the filter and list everything), so match repo+tag as exact columns
+    # instead. Local-only images usually normalize to the docker.io/library/
+    # prefix, but `k3s ctr images import` can keep the bare name — accept both.
+    def crictl_has_image?(crictl_cmd, img)
       repo, tag = img.split(':', 2)
       tag ||= 'latest'
-      ref = "docker.io/library/#{repo}"
-      res = @quiet.run!("docker exec #{node} crictl images")
+      refs = ["docker.io/library/#{repo}", repo]
+      res = @quiet.run!(crictl_cmd)
       return false unless res.success?
       res.out.each_line.any? do |line|
         cols = line.split
-        cols[0] == ref && cols[1] == tag
+        refs.include?(cols[0]) && cols[1] == tag
       end
     end
 
@@ -786,6 +831,7 @@ module Carbide
 
         Re-run this script any time to rebuild + redeploy. Flags:
           --ref REF          meta branch/ref to deploy (default main; e.g. --ref dev)
+          --kube-backend k3s local k8s backend: k3d (default) or k3s (host-native)
           --no-pull          skip self-update (git pull + submodule update)
           --no-build         skip image build (just re-import + redeploy)
           --no-client        skip building + uploading the pinned SPA client
@@ -799,15 +845,17 @@ module Carbide
   end
 end
 
-opts = { no_build: false, no_infra: false, no_tls: false, no_pull: false, csr: false, import_cert: nil, key: nil, roll_scope: nil, public_host: nil, ref: nil }
+opts = { no_build: false, no_infra: false, no_tls: false, no_pull: false, csr: false, import_cert: nil, key: nil, roll_scope: nil, public_host: nil, ref: nil, kube_backend: nil }
 OptionParser.new do |o|
-  o.banner = 'Usage: deploy.rb [--ref REF] [--no-pull] [--no-build] [--no-shell] [--no-client] [--no-infra] [--no-tls] [--roll-scope SCOPE] [--csr | --import-cert FILE]'
+  o.banner = 'Usage: deploy.rb [--ref REF] [--kube-backend k3d|k3s] [--no-pull] [--no-build] [--no-shell] [--no-client] [--no-infra] [--no-tls] [--roll-scope SCOPE] [--csr | --import-cert FILE]'
   o.on('--ref REF', 'Meta-repo branch/ref to deploy (default: main; DEPLOY_REF env). Checked out + fast-forwarded before build') { |v| opts[:ref] = v }
   o.on('--no-pull',  'Skip self-update (git pull + submodule update before deploy)') { opts[:no_pull] = true }
   o.on('--no-build', 'Skip image build (just re-import + redeploy)') { opts[:no_build] = true }
   o.on('--no-shell', 'Skip rebuilding the carbide2-shell image (reuse existing carbide2-shell:dev)') { opts[:no_shell] = true }
   o.on('--no-client', 'Skip building + uploading the pinned SPA client to the MinIO static tier') { opts[:no_client] = true }
   o.on('--no-infra', 'Skip cluster/infra bring-up')                  { opts[:no_infra] = true }
+  o.on('--kube-backend BACKEND', %w[k3d k3s],
+       'Local Kubernetes backend: k3d (default, k3s-in-Docker) or k3s (host-native)') { |v| opts[:kube_backend] = v }
   o.on('--no-tls',   'Skip mkcert TLS setup (Traefik default cert)')  { opts[:no_tls] = true }
   o.on('--public-host HOST', 'Browser-facing FQDN for ingress/cert/host-auth (default: hostname -f; localhost only for same-machine)') { |v| opts[:public_host] = v }
   o.on('--roll-scope SCOPE', %w[all control none],
