@@ -30,6 +30,12 @@
 #     --no-minio-client  skip the default MinIO client (mcli) install
 #     --kube-backend=k3s  provision for host-native k3s instead of k3d (skips the
 #                  k3d install; k3s itself is installed by deploy.rb at run time)
+#     --registry-host=HOST  trust a self-hosted registry on THIS node so it can
+#                  pull SHA-tagged images: installs the registry CA into the OS
+#                  trust store and writes /etc/rancher/k3s/registries.yaml. Run
+#                  on every k3s node (server + agents). Pair with --registry-ca=PATH
+#                  (default ./carbide-rootCA.pem, exported by deploy.rb) and
+#                  optionally --registry-port=PORT (default 5000).
 #     --all        all of the above optionals
 #
 # After this finishes (and you re-login for the docker group), the deploy is:
@@ -63,6 +69,11 @@ FORCE=0
 # carbide2-server/scripts/dev-cluster-k3s.sh (with the right --disable flags), so
 # for k3s we just skip the k3d binary and leave docker/kubectl/helm in place.
 KUBE_BACKEND=k3d
+# Optional self-hosted registry trust (see configure_registry_trust). Read from
+# env here so REGISTRY_HOST=... setmeup.sh works; flags below override.
+REGISTRY_HOST="${REGISTRY_HOST:-}"
+REGISTRY_PORT="${REGISTRY_PORT:-5000}"
+REGISTRY_CA="${REGISTRY_CA:-carbide-rootCA.pem}"
 for arg in "$@"; do
   case "$arg" in
     --node)      WANT_NODE=1 ;;
@@ -74,6 +85,9 @@ for arg in "$@"; do
     --kube-backend=*)  KUBE_BACKEND="${arg#*=}" ;;
     --k3d)       KUBE_BACKEND=k3d ;;
     --k3s)       KUBE_BACKEND=k3s ;;
+    --registry-host=*) REGISTRY_HOST="${arg#*=}" ;;
+    --registry-port=*) REGISTRY_PORT="${arg#*=}" ;;
+    --registry-ca=*)   REGISTRY_CA="${arg#*=}" ;;
     --all)       WANT_NODE=1; WANT_SOCAT=1; WANT_MKCERT=1; WANT_MINIO_CLIENT=1 ;;
     --force)     FORCE=1 ;;
     -h|--help)
@@ -93,6 +107,42 @@ log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Trust a self-hosted registry on THIS node: install its CA into the OS trust
+# store (curl/docker) and, for k3s, pin the CA in registries.yaml so containerd
+# can pull over TLS. One-time per node; run on the server and every agent.
+configure_registry_trust() {
+  local host="$1" port="$2" ca="$3"
+  local endpoint="$host"
+  [[ "$host" == *:* ]] || endpoint="$host:$port"
+
+  [[ -f "$ca" ]] || die "registry CA not found: $ca (copy the deploy host's carbide-rootCA.pem here, or pass --registry-ca=PATH)"
+
+  log "trusting registry CA for $endpoint (OS trust store + k3s registries.yaml)"
+  sudo install -m 0644 "$ca" /usr/local/share/ca-certificates/carbide-registry-ca.crt
+  sudo update-ca-certificates >/dev/null
+
+  local ca_dest="/etc/rancher/k3s/carbide-registry-ca.pem"
+  sudo mkdir -p /etc/rancher/k3s
+  sudo install -m 0644 "$ca" "$ca_dest"
+  # NOTE: this replaces any existing registries.yaml.
+  sudo tee /etc/rancher/k3s/registries.yaml >/dev/null <<YAML
+configs:
+  "$endpoint":
+    tls:
+      ca_file: "$ca_dest"
+YAML
+
+  if systemctl is-active --quiet k3s 2>/dev/null; then
+    log "restarting k3s to pick up registries.yaml"
+    sudo systemctl restart k3s
+  elif systemctl is-active --quiet k3s-agent 2>/dev/null; then
+    log "restarting k3s-agent to pick up registries.yaml"
+    sudo systemctl restart k3s-agent
+  else
+    log "k3s not running yet — registries.yaml takes effect when it starts"
+  fi
+}
 
 [[ $EUID -eq 0 ]] && die "do not run as root — run as your normal user; the script uses sudo where needed."
 have sudo || die "sudo not found — install it or run the apt/install steps manually."
@@ -287,6 +337,13 @@ if [[ $WANT_MINIO_CLIENT -eq 1 ]]; then
   fi
 else
   log "skipping MinIO client (--no-minio-client) — scripts/build-client needs 'mcli' (or CARBIDE_MC) to upload builds"
+fi
+
+# ---------------------------------------------------------------------------
+# 9. Optional: trust a self-hosted registry on this node (--registry-host)
+# ---------------------------------------------------------------------------
+if [[ -n "$REGISTRY_HOST" ]]; then
+  configure_registry_trust "$REGISTRY_HOST" "$REGISTRY_PORT" "$REGISTRY_CA"
 fi
 echo
 log "provisioning complete. Versions:"

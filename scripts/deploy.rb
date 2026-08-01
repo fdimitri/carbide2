@@ -31,6 +31,9 @@
 # Usage:
 #   ./scripts/deploy.rb                 full build + deploy
 #   ./scripts/deploy.rb --kube-backend k3s   deploy to host-native k3s (default: k3d)
+#   ./scripts/deploy.rb --registry-host HOST  push SHA-tagged images to a self-hosted
+#                                       registry at HOST (multi-node: every node pulls
+#                                       from it instead of a per-node containerd import)
 #   ./scripts/deploy.rb --no-build      skip image build (re-import + redeploy)
 #   ./scripts/deploy.rb --no-shell      build everything EXCEPT the carbide2-shell image
 #   ./scripts/deploy.rb --no-client     skip building + uploading the pinned SPA client
@@ -178,6 +181,16 @@ module Carbide
       default_http, default_https = @backend == 'k3s' ? %w[80 443] : %w[8080 8443]
       @http_port  = ENV.fetch('HTTP_PORT', default_http)
       @https_port = ENV.fetch('HTTPS_PORT', default_https)
+      # Optional self-hosted registry. When --registry-host/REGISTRY_HOST is set,
+      # deploy switches from the single-node containerd-import path to building
+      # immutable SHA-tagged images, pushing them to a standalone registry:2 on
+      # this host, and pinning those tags into the control-plane chart — so every
+      # node in a multi-node cluster pulls the same image over HTTPS. Unset =
+      # legacy behavior (k3d/k3s `ctr images import`, :dev tags).
+      @registry_host = (@opts[:registry_host] || ENV['REGISTRY_HOST'])&.strip
+      @registry_host = nil if @registry_host && @registry_host.empty?
+      @registry_port = (@opts[:registry_port] || ENV.fetch('REGISTRY_PORT', '5000')).to_s
+      @registry      = @registry_host ? "#{@registry_host}:#{@registry_port}/" : nil
       # Which meta-repo branch/ref this deploy builds from. self_update checks it
       # out and fast-forwards it before doing anything, so the deployed images
       # always match a known ref instead of "whatever happened to be checked
@@ -213,9 +226,10 @@ module Carbide
       return import_cert if @opts[:import_cert]
 
       require_tools
+      ensure_registry if @registry
       ensure_infra unless @opts[:no_infra]
-      build_images unless @opts[:no_build]
-      import_images
+      build_images unless @opts[:no_build] || skip_build?
+      publish_images
       build_and_upload_client unless @opts[:no_client]
       apply_crd
       install_control_plane
@@ -377,15 +391,21 @@ module Carbide
 
     def ensure_infra
       script = @backend == 'k3s' ? 'dev-cluster-k3s.sh' : 'dev-cluster-k3d.sh'
+      env = { 'CLUSTER_NAME' => @cluster,
+              'HTTP_PORT' => @http_port,
+              'HTTPS_PORT' => @https_port }
+      if @registry
+        env['REGISTRY_HOST'] = @registry_host
+        env['REGISTRY_PORT'] = @registry_port
+        env['REGISTRY_CA']   = mkcert_ca_pem.to_s
+      end
       quiet_run("preparing the #{@backend} cluster + infra (this may take a minute)",
-                File.join(@server, 'scripts', script),
-                env: { 'CLUSTER_NAME' => @cluster,
-                       'HTTP_PORT' => @http_port,
-                       'HTTPS_PORT' => @https_port })
+                File.join(@server, 'scripts', script), env: env)
     end
 
     def build_images
       env = @opts[:no_shell] ? { 'SKIP_SHELL' => '1' } : {}
+      env['REGISTRY'] = @registry if @registry
       quiet_run('building the container images — on a cold cache this builds ' \
                 'Ruby from source, so give it a few minutes (reticulating splines...)',
                 File.join(@root, 'scripts', 'build-all.sh'), env: env)
@@ -406,6 +426,151 @@ module Carbide
                   File.join(@root, 'scripts', 'build-client'), '--mode', mode,
                   env: { 'CARBIDE_MINIO_NS' => @control_ns })
       end
+    end
+
+    # 12-char short SHA of the checkout in `dir` (matches build-all.sh).
+    def git_short_sha(dir)
+      out, = @cmd.run!('git', '-C', dir, 'rev-parse', '--short=12', 'HEAD')
+      (out || '').strip
+    end
+
+    # Immutable per-component tags. Workspace ships server+worker, so its tag is
+    # composite; control and shell each track a single component.
+    def image_tags
+      @image_tags ||= {
+        workspace: "#{git_short_sha(@server)}-#{git_short_sha(File.join(@root, 'carbide2-worker'))}",
+        control:   git_short_sha(@control),
+        shell:     git_short_sha(@server)
+      }
+    end
+
+    def workspace_image = "#{@registry}carbide2:#{image_tags[:workspace]}"
+    def control_image   = "#{@registry}carbide2-control:#{image_tags[:control]}"
+    def shell_image     = "#{@registry}carbide2-shell:#{image_tags[:shell]}"
+
+    # Publish the freshly-built images so the cluster can pull them. Registry
+    # mode pushes SHA tags to the standalone registry (works across every node);
+    # legacy mode imports :dev into the single node's containerd.
+    def publish_images
+      @registry ? push_images : import_images
+    end
+
+    # When every SHA tag is already in the registry there's nothing to build \u2014
+    # immutable tags mean identical content, so skip the (slow) build entirely.
+    def skip_build?
+      return false unless @registry
+
+      all = [workspace_image, control_image, shell_image].all? { |i| registry_has?(i) }
+      log "all image tags already in registry #{@registry_host}:#{@registry_port} \u2014 skipping build" if all
+      all
+    end
+
+    def push_images
+      log "pushing images to registry #{@registry_host}:#{@registry_port}"
+      { workspace: workspace_image, control: control_image, shell: shell_image }.each_value do |img|
+        if registry_has?(img)
+          log "  skip #{img} (already in registry)"
+          next
+        end
+        unless @quiet.run!("docker image inspect #{img}").success?
+          abort "\e[1;31mxx\e[0m #{img} not present locally \u2014 build it first " \
+                "(scripts/build-all.sh) then re-run. Refusing to deploy against a " \
+                "tag the cluster will ImagePullBackOff on."
+        end
+        log "  push #{img}"
+        res = @quiet.run!('docker', 'push', img)
+        next if res.success?
+
+        $stdout.write(res.out)
+        $stderr.write(res.err)
+        abort "\e[1;31mxx\e[0m docker push failed for #{img} (output above)."
+      end
+    end
+
+    # True if <name>:<tag> already exists in the registry (HEAD-equivalent GET of
+    # the manifest). --cacert trusts the mkcert-signed registry cert.
+    def registry_has?(img)
+      name, tag = img.sub(@registry, '').split(':', 2)
+      url = "https://#{@registry_host}:#{@registry_port}/v2/#{name}/manifests/#{tag}"
+      registry_curl('-sf', '-o', '/dev/null',
+                    '-H', 'Accept: application/vnd.docker.distribution.manifest.v2+json',
+                    url).success?
+    end
+
+    def registry_curl(*args)
+      cmd = ['curl']
+      cmd += ['--cacert', mkcert_ca_pem] if mkcert_ca_pem
+      @quiet.run!(*cmd, *args)
+    end
+
+    def mkcert_ca_pem
+      return @mkcert_ca if defined?(@mkcert_ca)
+
+      out, = @cmd.run!('mkcert', '-CAROOT')
+      pem  = File.join((out || '').strip, 'rootCA.pem')
+      @mkcert_ca = File.exist?(pem) ? pem : nil
+    end
+
+    # Bring up (or reuse) a standalone registry:2 on this host over TLS. The cert
+    # reuses the carbide mkcert root CA, so nodes that already trust that CA (via
+    # scripts/setmeup.sh --registry-host) can pull without extra config.
+    def ensure_registry
+      log "ensuring standalone registry at #{@registry_host}:#{@registry_port}"
+      dir = File.expand_path('~/.carbide/registry')
+      crt = File.join(dir, 'registry.crt')
+      key = File.join(dir, 'registry.key')
+      ensure_registry_cert(dir, crt, key)
+      ensure_registry_container(dir)
+      verify_registry
+    end
+
+    def ensure_registry_cert(dir, crt, key)
+      return if File.exist?(crt) && File.exist?(key)
+
+      unless system('command -v mkcert >/dev/null 2>&1')
+        abort "\e[1;31mxx mkcert not found.\e[0m It mints the registry's TLS cert " \
+              "(and the CA nodes trust to pull). Install mkcert (see --no-tls help) and retry."
+      end
+      FileUtils.mkdir_p(dir)
+      hosts = registry_tls_hosts
+      log "minting registry TLS cert via mkcert for: #{hosts.join(' ')}"
+      @cmd.run('mkcert', '-cert-file', crt, '-key-file', key, *hosts)
+    end
+
+    def registry_tls_hosts
+      hosts = [@registry_host, 'localhost', '127.0.0.1']
+      ips, = @cmd.run!('hostname', '-I')
+      hosts.concat((ips || '').strip.split)
+      hosts.uniq
+    end
+
+    def ensure_registry_container(dir)
+      name = ENV.fetch('REGISTRY_CONTAINER', 'carbide-registry')
+      running, = @cmd.run!('docker', 'ps', '-q', '-f', "name=^#{name}$")
+      unless (running || '').strip.empty?
+        log "registry container '#{name}' already running \u2014 reusing"
+        return
+      end
+
+      @quiet.run!('docker', 'rm', '-f', name)
+      log "starting registry:2 container '#{name}' on :#{@registry_port}"
+      @cmd.run('docker', 'run', '-d', '--restart=always', '--name', name,
+               '-p', "#{@registry_port}:5000",
+               '-v', "#{dir}:/certs:ro",
+               '-e', 'REGISTRY_HTTP_TLS_CERTIFICATE=/certs/registry.crt',
+               '-e', 'REGISTRY_HTTP_TLS_KEY=/certs/registry.key',
+               'registry:2')
+    end
+
+    def verify_registry
+      url = "https://#{@registry_host}:#{@registry_port}/v2/"
+      15.times do
+        return if registry_curl('-sf', '-o', '/dev/null', url).success?
+
+        sleep 1
+      end
+      abort "\e[1;31mxx\e[0m registry did not become reachable at #{url}. Check " \
+            "`docker logs carbide-registry` and that the mkcert CA is trusted on this host."
     end
 
     def import_images
@@ -729,20 +894,38 @@ module Carbide
 
     def install_control_plane
       log "installing/upgrading control-plane release '#{@release}' in ns '#{@control_ns}'"
-      @cmd.run('helm', 'upgrade', '--install', @release,
-               File.join(@control, 'charts', 'control-plane'),
-               '--namespace', @control_ns, '--create-namespace',
-               '--set', "ingress.publicPort=#{@http_port}",
-               '--set', "ingress.publicHttpsPort=#{@https_port}",
-               '--set', "publicUrlBase=#{@public_url}",
-               '--set-json', 'ingress.entryPoints=["web","websecure"]',
-               '--set-json', 'ingress.tls={}',
-               '--wait', '--timeout', '5m')
+      args = ['helm', 'upgrade', '--install', @release,
+              File.join(@control, 'charts', 'control-plane'),
+              '--namespace', @control_ns, '--create-namespace',
+              '--set', "ingress.publicPort=#{@http_port}",
+              '--set', "ingress.publicHttpsPort=#{@https_port}",
+              '--set', "publicUrlBase=#{@public_url}",
+              '--set-json', 'ingress.entryPoints=["web","websecure"]',
+              '--set-json', 'ingress.tls={}']
+      if @registry
+        # --set-string so an all-digit SHA tag is never coerced to a number.
+        args.push('--set-string', "image.repository=#{@registry}carbide2-control",
+                  '--set-string', "image.tag=#{image_tags[:control]}",
+                  '--set-string', "workspace.image=#{@registry}carbide2",
+                  '--set-string', "workspace.imageTag=#{image_tags[:workspace]}",
+                  '--set-string', "workspace.shellImage=#{shell_image}")
+      end
+      args.push('--wait', '--timeout', '5m')
+      @cmd.run(*args)
     end
 
     def roll_deployments
       if @roll_scope == 'none'
         log "roll-scope=none — skipping deployment rollouts"
+        return
+      end
+
+      # Registry mode pins a new immutable tag on every code change, so the helm
+      # upgrade above already changed the pod spec and Kubernetes rolled the
+      # affected Deployments. A forced restart would only churn pods pointlessly
+      # (and re-pull is a no-op on IfNotPresent), so skip it.
+      if @registry
+        log "registry mode — helm rolled changed deployments via new image tags; skipping forced restart"
         return
       end
 
@@ -832,6 +1015,9 @@ module Carbide
         Re-run this script any time to rebuild + redeploy. Flags:
           --ref REF          meta branch/ref to deploy (default main; e.g. --ref dev)
           --kube-backend k3s local k8s backend: k3d (default) or k3s (host-native)
+          --registry-host H  push SHA-tagged images to a self-hosted registry at H
+                             (multi-node: nodes pull from it; needs the CA trusted
+                             per node via scripts/setmeup.sh --registry-host)
           --no-pull          skip self-update (git pull + submodule update)
           --no-build         skip image build (just re-import + redeploy)
           --no-client        skip building + uploading the pinned SPA client
@@ -845,10 +1031,12 @@ module Carbide
   end
 end
 
-opts = { no_build: false, no_infra: false, no_tls: false, no_pull: false, csr: false, import_cert: nil, key: nil, roll_scope: nil, public_host: nil, ref: nil, kube_backend: nil }
+opts = { no_build: false, no_infra: false, no_tls: false, no_pull: false, csr: false, import_cert: nil, key: nil, roll_scope: nil, public_host: nil, ref: nil, kube_backend: nil, registry_host: nil, registry_port: nil }
 OptionParser.new do |o|
-  o.banner = 'Usage: deploy.rb [--ref REF] [--kube-backend k3d|k3s] [--no-pull] [--no-build] [--no-shell] [--no-client] [--no-infra] [--no-tls] [--roll-scope SCOPE] [--csr | --import-cert FILE]'
+  o.banner = 'Usage: deploy.rb [--ref REF] [--kube-backend k3d|k3s] [--registry-host HOST] [--no-pull] [--no-build] [--no-shell] [--no-client] [--no-infra] [--no-tls] [--roll-scope SCOPE] [--csr | --import-cert FILE]'
   o.on('--ref REF', 'Meta-repo branch/ref to deploy (default: main; DEPLOY_REF env). Checked out + fast-forwarded before build') { |v| opts[:ref] = v }
+  o.on('--registry-host HOST', 'Enable registry mode: push SHA-tagged images to a self-hosted registry at HOST (REGISTRY_HOST env). Nodes pull from it — required for multi-node') { |v| opts[:registry_host] = v }
+  o.on('--registry-port PORT', 'Registry port (default 5000; REGISTRY_PORT env)') { |v| opts[:registry_port] = v }
   o.on('--no-pull',  'Skip self-update (git pull + submodule update before deploy)') { opts[:no_pull] = true }
   o.on('--no-build', 'Skip image build (just re-import + redeploy)') { opts[:no_build] = true }
   o.on('--no-shell', 'Skip rebuilding the carbide2-shell image (reuse existing carbide2-shell:dev)') { opts[:no_shell] = true }
