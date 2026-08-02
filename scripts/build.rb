@@ -20,6 +20,7 @@
 #   ./scripts/build.rb --no-push --registry-host HOST   build the SHA tags, don't push
 #   ./scripts/build.rb --server-ref feat/x   build the workspace/shell from another ref
 #   ./scripts/build.rb --no-shell            skip the (slow) carbide2-shell image
+#   ./scripts/build.rb --force-rebuild       rebuild even tags already in the registry
 #   ./scripts/build.rb --help
 #
 # Components: workspace (carbide2), control (carbide2-control), shell
@@ -45,7 +46,7 @@ require_relative 'lib/carbide_images'
 COMPONENTS = { 'workspace' => :workspace, 'control' => :control, 'shell' => :shell }.freeze
 
 opts = { registry_host: nil, registry_port: nil, registry_ca: nil,
-         no_push: false, no_shell: false,
+         no_push: false, no_shell: false, force_rebuild: false,
          server_ref: nil, worker_ref: nil, control_ref: nil, client_ref: nil }
 OptionParser.new do |o|
   o.banner = 'Usage: build.rb [components...] [--registry-host HOST] [--no-push] ' \
@@ -54,6 +55,7 @@ OptionParser.new do |o|
   o.on('--registry-port PORT', 'Registry port (default 5000; REGISTRY_PORT env)') { |v| opts[:registry_port] = v }
   o.on('--registry-ca FILE', 'CA pem of an externally-run registry, so this host trusts it (REGISTRY_CA env)') { |v| opts[:registry_ca] = v }
   o.on('--no-push', 'Build the registry SHA tags but do not push them') { opts[:no_push] = true }
+  o.on('--force-rebuild', 'Rebuild even components whose SHA tag already exists in the registry') { opts[:force_rebuild] = true }
   o.on('--no-shell', 'Skip the (slow) carbide2-shell image (SKIP_SHELL env)') { opts[:no_shell] = true }
   o.on('--server-ref REF', 'Build workspace/shell from this carbide2-server ref') { |v| opts[:server_ref] = v }
   o.on('--worker-ref REF', 'Build the workspace from this carbide2-worker ref') { |v| opts[:worker_ref] = v }
@@ -95,7 +97,7 @@ refs = { server: opts[:server_ref], worker: opts[:worker_ref],
          control: opts[:control_ref], client: opts[:client_ref] }
 push = !images.registry.nil? && !opts[:no_push]
 
-built = images.build(components: components, refs: refs, push: push, quiet: false)
+built = images.build(components: components, refs: refs, push: push, force: opts[:force_rebuild], quiet: false)
 
 puts
 puts "\e[1;32mDone.\e[0m Built:"

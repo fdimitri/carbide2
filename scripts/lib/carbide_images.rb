@@ -73,14 +73,24 @@ module Carbide
       (out || '').strip
     end
 
+    # 12-char git blob hash of a single file's contents. Used to tag an image
+    # whose only build input is that file, so unrelated repo commits (docs, app
+    # code) don't churn its tag and force a needless rebuild.
+    def blob_sha(path)
+      out, = @cmd.run!('git', 'hash-object', path)
+      (out || '').strip[0, 12]
+    end
+
     # Immutable per-component tags. Workspace ships server+worker, so its tag is
-    # composite; control and shell each track a single component. Recomputed
-    # whenever the underlying checkouts change (with_refs resets the memo).
+    # composite; control tracks its own repo. The shell image is built purely
+    # from Dockerfile.shell (it COPYs nothing from the repo and takes no build
+    # args), so it's tagged by that file's content — not the server repo SHA —
+    # so a docs/app commit doesn't rebuild it. with_refs resets the memo.
     def image_tags
       @image_tags ||= {
         workspace: "#{short_sha(@server)}-#{short_sha(@worker)}",
         control:   short_sha(@control),
-        shell:     short_sha(@server)
+        shell:     blob_sha(File.join(@server, 'Dockerfile.shell'))
       }
     end
 
@@ -105,13 +115,22 @@ module Carbide
     # when refs: overrides temporarily check out other SHAs. Returns a map of
     # component => the ref that was produced (registry ref when pushing/registry
     # mode, else the local :dev ref), for the caller to print.
-    def build(components: ALL, refs: {}, push: false, quiet: true)
+    #
+    # force: false skips any component whose registry ref already exists (tags
+    # are immutable, so an existing tag is identical content) — this check is
+    # inside with_refs so it uses the same SHAs that would be built.
+    def build(components: ALL, refs: {}, push: false, force: false, quiet: true)
       built = {}
       with_refs(refs) do
         ensure_registry if push && @registry
         components.each do |component|
-          build_component(component, quiet: quiet)
           ref = image_ref(component)
+          if !force && @registry && in_registry?(ref)
+            log "skipping #{component}: #{ref} already in registry (use --force-rebuild)"
+            built[component] = ref
+            next
+          end
+          build_component(component, quiet: quiet)
           built[component] = ref
           push_one(ref) if push && @registry
         end
