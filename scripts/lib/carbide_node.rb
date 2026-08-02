@@ -63,7 +63,7 @@ module Carbide
       @http_port     = http_port
       @https_port    = https_port
       @role          = role.to_s.downcase
-      @server_url    = server_url
+      @server_url    = normalize_server_url(server_url)
       @token         = token
       @storage_class = (storage_class.nil? || storage_class.to_s.strip.empty?) ? 'local-path' : storage_class
       @registry_host = registry_host
@@ -185,6 +185,20 @@ module Carbide
       return nil if blank?(@server_url)
 
       @server_url.to_s.sub(%r{\Ahttps?://}, '').split(':', 2).first
+    end
+
+    # k3s's K3S_URL must be https://host:6443. Accept a bare host or host:port
+    # from config and coerce it — forcing https and the default API port — so a
+    # hostname-only cluster.server-url doesn't fail the installer.
+    def normalize_server_url(raw)
+      s = raw.to_s.strip
+      return nil if s.empty?
+
+      s = s.sub(%r{\Ahttp://}i, 'https://')
+      s = "https://#{s}" unless s.match?(%r{\Ahttps://}i)
+      authority = s.sub(%r{\Ahttps://}i, '')
+      s = "#{s}:6443" unless authority.include?(':')
+      s
     end
 
     # k3s writes its kubeconfig (server 127.0.0.1:6443) root-owned; copy it to
