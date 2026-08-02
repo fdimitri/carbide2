@@ -78,9 +78,16 @@ module Carbide
     # Bring THIS node up as the first/only member and install the shared infra.
     # k3d is single-node only; k3s inits a new server (HA-capable etcd).
     def ensure!
+      ensure_cluster!
+      install_infra
+    end
+
+    # Bring up JUST the k3d/k3s node — no in-cluster infra. Split from install_infra
+    # so the storage backend (Longhorn's StorageClass) can be installed in between:
+    # install_infra pins MinIO's PVC to that class, so the class must exist first.
+    def ensure_cluster!
       abort "\e[1;31mxx\e[0m --role join requires the k3s backend (k3d is single-node)" if @role == 'join' && k3d?
       k3d? ? ensure_k3d : ensure_k3s_server(init: true)
-      install_infra
     end
 
     # Join THIS node to an existing cluster as an additional control-plane
@@ -234,7 +241,9 @@ module Carbide
     end
 
     # --- shared in-cluster infra (k3d + k3s init) -----------------------------
-    def install_infra
+    # Public: deploy.rb calls this AFTER the storage backend is ensured, so
+    # apply_minio's PVC binds to an already-existing StorageClass (e.g. longhorn).
+    public def install_infra
       add_helm_repos
       install_local_path
       install_traefik

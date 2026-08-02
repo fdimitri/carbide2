@@ -1,17 +1,26 @@
 # examples/k3s-multinode-longhorn.yaml — PRIMARY (server) node of a multi-node
 # host-native k3s cluster with replicated Longhorn storage.
 #
-# Run this on the first node (the k3s server) with the default cluster.role=init.
-# It brings up the k3s server (--cluster-init, HA-capable etcd), the control
-# plane, Longhorn, a self-hosted image registry, and pushes the SHA-tagged images
-# that every other node will pull. Every OTHER node runs the SAME emitted config
-# with --cluster.role join (consuming the minted cluster.token + cluster.server-url)
-# to join as an additional control-plane server:
+# cluster.token is minted the first time it is blank, so a multi-node cluster is
+# a TWO-STEP flow: FREEZE the resolved config once (minting the shared token and
+# recording the first node's server-url), then DEPLOY every node from that one
+# frozen file. Deploying straight from this template would mint a DIFFERENT token
+# on each node and they would never form a single cluster.
 #
-#   # on the first node:
+#   # 1. FREEZE, on the first node: mint the token + server-url into cluster.yaml.
+#   #    --yaml-out writes the resolved config (real secrets) and EXITS — it does
+#   #    NOT deploy. Use --yaml-out, never --yaml-safeout: joiners need the real
+#   #    token, and --yaml-safeout redacts it.
 #   ./scripts/deploy.rb --config examples/k3s-multinode-longhorn.yaml \
-#       --cluster.server-url https://<this-node>:6443 --yaml-safeout cluster.yaml
-#   # hand cluster.yaml (with the real token) to each other node, then there:
+#       --cluster.server-url https://<this-node>:6443 --yaml-out cluster.yaml
+#
+#   # 2. DEPLOY the first node FROM the frozen file. cluster.token is now present,
+#   #    so it is reused, not re-minted. This brings up the k3s server
+#   #    (--cluster-init, HA-capable etcd), the control plane, Longhorn, a
+#   #    self-hosted image registry, and pushes the SHA-tagged images.
+#   ./scripts/deploy.rb --config cluster.yaml
+#
+#   # 3. hand cluster.yaml to each OTHER node and JOIN it as another server:
 #   ./scripts/deploy.rb --config cluster.yaml --cluster.role join
 #
 # Why each override matters on multi-node:

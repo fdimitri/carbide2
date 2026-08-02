@@ -56,8 +56,10 @@
 #   2. --config input.yaml     the emit/consume handoff file (a k3s server emits
 #                              it, agents consume it)
 #   3. CLI flags               every --a.b.c flag sets the a.b.c key and wins
-# Emit the fully-resolved config with --yaml-out FILE (secrets included) or
-# --yaml-safeout FILE (secrets redacted). See scripts/lib/carbide_config.rb.
+# Freeze the fully-resolved config to a file with --yaml-out FILE (secrets
+# included) or --yaml-safeout FILE (secrets redacted). Freezing EXITS without
+# deploying — mint the shared cluster.token once, then deploy every node from the
+# frozen file with --config FILE. See scripts/lib/carbide_config.rb.
 #
 # Self-update: by default the very first thing deploy.rb does is `git pull
 # --ff-only` the meta repo and `git submodule update --init --recursive`, so a
@@ -334,8 +336,11 @@ module Carbide
       return publish_only_run if @publish_only
 
       ensure_registry if @registry && !@external_registry
-      @node.ensure! unless @no_infra
+      # Cluster first, THEN the storage backend (creates its StorageClass), THEN
+      # infra — MinIO's PVC is pinned to that class, so it must exist beforehand.
+      @node.ensure_cluster! unless @no_infra
       @storage.ensure!
+      @node.install_infra unless @no_infra
       build_images unless @no_build || @external_registry || skip_build?
       publish_images unless @external_registry
       build_and_upload_client unless @no_client
@@ -629,8 +634,8 @@ module Carbide
           --roll-scope control     roll control-plane only (keeps project terminals alive)
           --roll-scope none        skip rollouts (helm/CRD changes only)
           --config FILE            merge a YAML config over the defaults (before CLI flags)
-          --yaml-out FILE          write the fully-resolved config (secrets included) + exit
-          --yaml-safeout FILE      like --yaml-out but redact secrets, then exit
+          --yaml-out FILE          FREEZE: write the fully-resolved config (secrets included) + exit; does NOT deploy. Deploy from it with --config FILE
+          --yaml-safeout FILE      like --yaml-out but redact secrets (not usable by joiners); then exit
       MSG
     end
   end

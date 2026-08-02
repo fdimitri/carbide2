@@ -112,8 +112,8 @@ module Carbide
         o.separator ''
         o.separator 'Config file:'
         o.on('--config PATH', 'Merge a YAML config over the defaults (before CLI flags)') { |v| @input_path = v }
-        o.on('--yaml-out PATH', 'Write the fully-resolved config (secrets included) to PATH and exit') { |v| @emit = [:full, v] }
-        o.on('--yaml-safeout PATH', 'Like --yaml-out but with secrets redacted; then exit') { |v| @emit = [:safe, v] }
+        o.on('--yaml-out PATH', 'FREEZE the fully-resolved config (secrets included) to PATH and exit; does NOT deploy — deploy from it with --config PATH') { |v| @emit = [:full, v] }
+        o.on('--yaml-safeout PATH', 'Like --yaml-out but redact secrets (not usable by joiners); then exit') { |v| @emit = [:safe, v] }
         o.on('-h', '--help', 'Show this help') { puts o; exit 0 }
       end
     end
