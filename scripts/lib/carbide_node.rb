@@ -206,6 +206,13 @@ module Carbide
         log "registry CA empty — skipping registry trust (pods may ImagePullBackOff)"
         return
       end
+      # A PEM pasted into a plain YAML scalar comes back with its newlines folded to
+      # spaces, which containerd can't parse. Canonicalize before trusting it.
+      ca = normalize_pem(@registry_ca)
+      unless ca.include?('-----BEGIN CERTIFICATE-----')
+        abort "\e[1;31mxx\e[0m registry CA is not a PEM certificate (got #{@registry_ca.to_s.strip[0, 40].inspect}). " \
+              'Pass it with --registry.ca-file PATH, or as a YAML block scalar (ca: |).'
+      end
       endpoint = @registry_host.include?(':') ? @registry_host : "#{@registry_host}:#{@registry_port}"
       ca_dest  = '/etc/rancher/k3s/carbide-registry-ca.pem'
       desired  = <<~YAML
@@ -216,13 +223,13 @@ module Carbide
       YAML
       cur_yaml, = @quiet.run!('sudo', 'cat', '/etc/rancher/k3s/registries.yaml')
       cur_ca,   = @quiet.run!('sudo', 'cat', ca_dest)
-      if cur_yaml.to_s == desired && cur_ca.to_s == @registry_ca.to_s
+      if cur_yaml.to_s == desired && cur_ca.to_s == ca
         log "registry #{endpoint} already trusted on this node"
         return
       end
       log "trusting registry #{endpoint} on this node (registries.yaml)"
       @quiet.run!('sudo', 'mkdir', '-p', '/etc/rancher/k3s')
-      write_root_file(ca_dest, @registry_ca.to_s)
+      write_root_file(ca_dest, ca)
       write_root_file('/etc/rancher/k3s/registries.yaml', desired)
       return unless @quiet.run!('systemctl', 'is-active', '--quiet', 'k3s').success?
 
@@ -238,6 +245,20 @@ module Carbide
         f.flush
         @quiet.run!('sudo', 'install', '-m', '0644', f.path, dest)
       end
+    end
+
+    # Rebuild canonical PEM from a value whose newlines may have been folded to
+    # spaces (the classic plain-YAML-scalar footgun): keep each BEGIN/END block's
+    # label, strip whitespace from the base64 body, and re-wrap it at 64 columns.
+    def normalize_pem(raw)
+      s = raw.to_s
+      return s unless s.include?('-----BEGIN')
+
+      s.gsub(/-----BEGIN ([^-]+)-----(.*?)-----END \1-----/m) do
+        label = Regexp.last_match(1)
+        body  = Regexp.last_match(2).gsub(/\s+/, '')
+        "-----BEGIN #{label}-----\n#{body.scan(/.{1,64}/).join("\n")}\n-----END #{label}-----"
+      end.strip + "\n"
     end
 
     # --- shared in-cluster infra (k3d + k3s init) -----------------------------

@@ -370,7 +370,7 @@ module Carbide
       log "publish-only complete \u2014 images are in the registry at " \
           "#{@registry_host}:#{@registry_port}"
       log "next: on each k3s node run deploy.rb --external-registry " \
-          "--registry-host #{@registry_host} --registry-ca <rootCA.pem> " \
+          "--registry.host #{@registry_host} --registry.ca-file <rootCA.pem> " \
           "(copy this host's mkcert rootCA.pem over first)"
     end
 
@@ -383,10 +383,10 @@ module Carbide
       end
       if (@publish_only || @external_registry) && !@registry
         abort "\e[1;31mxx\e[0m #{@publish_only ? '--publish-only' : '--external-registry'} " \
-              "needs --registry-host (the self-hosted registry to push to / pull from)."
+              "needs --registry.host (the self-hosted registry to push to / pull from)."
       end
       if @external_registry && !@registry_ca
-        abort "\e[1;31mxx\e[0m --external-registry needs --registry-ca FILE (the registry's " \
+        abort "\e[1;31mxx\e[0m --external-registry needs --registry.ca-file FILE (the registry's " \
               "mkcert rootCA.pem, copied from the build host) so this node trusts it."
       end
     end
@@ -471,7 +471,7 @@ module Carbide
       return unless before && after && before != after
 
       log 'self-update: deploy.rb changed — re-running the updated orchestrator'
-      exec(RbConfig.ruby, __FILE__, *ARGV)
+      exec(RbConfig.ruby, __FILE__, *ORIGINAL_ARGV)
     end
 
     def file_digest(path)
@@ -653,6 +653,10 @@ specs = [
   Carbide::Images,
   Carbide::ControlPlane
 ].flat_map(&:options)
+
+# OptionParser#parse! mutates (empties) ARGV, so snapshot the original args now —
+# self_update re-execs with them when a pull changes deploy.rb.
+ORIGINAL_ARGV = ARGV.dup
 
 config = Carbide::Config.new(
   defaults_path: File.expand_path('defaults.yaml', __dir__),
