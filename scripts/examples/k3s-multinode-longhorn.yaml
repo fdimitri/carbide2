@@ -1,0 +1,40 @@
+# examples/k3s-multinode-longhorn.yaml — PRIMARY (server) node of a multi-node
+# host-native k3s cluster with replicated Longhorn storage.
+#
+# Run this on the first node (the k3s server) with the default cluster.role=init.
+# It brings up the k3s server (--cluster-init, HA-capable etcd), the control
+# plane, Longhorn, a self-hosted image registry, and pushes the SHA-tagged images
+# that every other node will pull. Every OTHER node runs the SAME emitted config
+# with --cluster.role join (consuming the minted cluster.token + cluster.server-url)
+# to join as an additional control-plane server:
+#
+#   # on the first node:
+#   ./scripts/deploy.rb --config examples/k3s-multinode-longhorn.yaml \
+#       --cluster.server-url https://<this-node>:6443 --yaml-safeout cluster.yaml
+#   # hand cluster.yaml (with the real token) to each other node, then there:
+#   ./scripts/deploy.rb --config cluster.yaml --cluster.role join
+#
+# Why each override matters on multi-node:
+#   registry.host  A pod can land on ANY node, so images must come from a shared
+#                  registry (SHA tags over HTTPS), not per-node containerd import.
+#                  Set this to the FQDN/IP agents can reach the server on.
+#   storage.backend=longhorn  Binary file bytes live only on the workspace PVC;
+#                  Longhorn replicates the RWO volume so it re-attaches wherever
+#                  the pod reschedules. local-path can't follow a pod across nodes.
+#   longhorn.replicas  Set to your node count on small clusters (Longhorn's
+#                  default is 3; a 2-node cluster should use 2).
+
+cluster:
+  backend: k3s
+
+storage:
+  backend: longhorn
+  longhorn:
+    replicas: '3'   # match your node count on small clusters
+
+registry:
+  host: ''          # REQUIRED: FQDN/IP agents reach the server on, e.g. dev1.example.lan
+  port: '5000'
+
+public:
+  host: ''          # browser-facing FQDN, e.g. carbide.example.lan  ("" => hostname -f)

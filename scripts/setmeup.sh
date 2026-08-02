@@ -12,8 +12,9 @@
 #     - kubectl, helm                         (pinned upstream releases)
 #     - k3d                                    (default backend; k3s-in-Docker.
 #                                              Skipped with --kube-backend=k3s,
-#                                              where dev-cluster-k3s.sh installs
-#                                              host-native k3s at deploy time)
+#                                              where deploy.rb (Carbide::Node)
+#                                              installs host-native k3s at deploy
+#                                              time)
 #     - rbenv + ruby-build + Ruby + bundler   (to run deploy.rb under a writable
 #                                              gem dir; deploy.rb re-execs here)
 #     - mkcert (+ libnss3-tools)              (locally-trusted TLS certs so wss://
@@ -30,10 +31,11 @@
 #     --no-minio-client  skip the default MinIO client (mcli) install
 #     --kube-backend=k3s  provision for host-native k3s instead of k3d (skips the
 #                  k3d install; k3s itself is installed by deploy.rb at run time)
-#     --registry-host=HOST  trust a self-hosted registry on THIS node so it can
-#                  pull SHA-tagged images: installs the registry CA into the OS
-#                  trust store and writes /etc/rancher/k3s/registries.yaml. Run
-#                  on every k3s node (server + agents). Pair with --registry-ca=PATH
+#     --registry-host=HOST  trust a self-hosted registry on THIS node so docker
+#                  (build/push) and curl reach it over TLS: installs the registry
+#                  CA into the OS trust store. The k3s CONTAINERD trust is done at
+#                  deploy time by Carbide::Node from the CA inlined in the emitted
+#                  config. Pair with --registry-ca=PATH
 #                  (default ./carbide-rootCA.pem, exported by deploy.rb) and
 #                  optionally --registry-port=PORT (default 5000).
 #     --all        all of the above optionals
@@ -66,8 +68,8 @@ WANT_MINIO_CLIENT=1
 FORCE=0
 # Which local Kubernetes backend to provision for. k3d (default) is k3s-in-Docker
 # and is installed here. k3s is host-native and is installed at deploy time by
-# carbide2-server/scripts/dev-cluster-k3s.sh (with the right --disable flags), so
-# for k3s we just skip the k3d binary and leave docker/kubectl/helm in place.
+# deploy.rb (Carbide::Node, with the right --disable flags), so for k3s we just
+# skip the k3d binary and leave docker/kubectl/helm in place.
 KUBE_BACKEND=k3d
 # Optional self-hosted registry trust (see configure_registry_trust). Read from
 # env here so REGISTRY_HOST=... setmeup.sh works; flags below override.
@@ -108,9 +110,11 @@ warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# Trust a self-hosted registry on THIS node: install its CA into the OS trust
-# store (curl/docker) and, for k3s, pin the CA in registries.yaml so containerd
-# can pull over TLS. One-time per node; run on the server and every agent.
+# Trust a self-hosted registry's CA in THIS host's OS trust store so docker
+# (build/push) and curl reach it over TLS. The k3s CONTAINERD trust
+# (/etc/rancher/k3s/registries.yaml) is handled at deploy time by deploy.rb's
+# Carbide::Node (trust_registry!), from the CA inlined in the emitted config —
+# no PEM copying between machines. One-time per node.
 configure_registry_trust() {
   local host="$1" port="$2" ca="$3"
   local endpoint="$host"
@@ -118,30 +122,9 @@ configure_registry_trust() {
 
   [[ -f "$ca" ]] || die "registry CA not found: $ca (copy the deploy host's carbide-rootCA.pem here, or pass --registry-ca=PATH)"
 
-  log "trusting registry CA for $endpoint (OS trust store + k3s registries.yaml)"
+  log "trusting registry CA for $endpoint (OS trust store)"
   sudo install -m 0644 "$ca" /usr/local/share/ca-certificates/carbide-registry-ca.crt
   sudo update-ca-certificates >/dev/null
-
-  local ca_dest="/etc/rancher/k3s/carbide-registry-ca.pem"
-  sudo mkdir -p /etc/rancher/k3s
-  sudo install -m 0644 "$ca" "$ca_dest"
-  # NOTE: this replaces any existing registries.yaml.
-  sudo tee /etc/rancher/k3s/registries.yaml >/dev/null <<YAML
-configs:
-  "$endpoint":
-    tls:
-      ca_file: "$ca_dest"
-YAML
-
-  if systemctl is-active --quiet k3s 2>/dev/null; then
-    log "restarting k3s to pick up registries.yaml"
-    sudo systemctl restart k3s
-  elif systemctl is-active --quiet k3s-agent 2>/dev/null; then
-    log "restarting k3s-agent to pick up registries.yaml"
-    sudo systemctl restart k3s-agent
-  else
-    log "k3s not running yet — registries.yaml takes effect when it starts"
-  fi
 }
 
 [[ $EUID -eq 0 ]] && die "do not run as root — run as your normal user; the script uses sudo where needed."
@@ -227,9 +210,10 @@ fi
 # ---------------------------------------------------------------------------
 # 5. k3d (pinned)
 # ---------------------------------------------------------------------------
-# Only for the k3d backend. For k3s, dev-cluster-k3s.sh installs k3s host-native
-# at deploy time (with the traefik/local-storage disables), so there's nothing
-# to pre-install here beyond the docker/kubectl/helm already handled above.
+# Only for the k3d backend. For k3s, deploy.rb (Carbide::Node) installs k3s
+# host-native at deploy time (with the traefik/local-storage disables), so
+# there's nothing to pre-install here beyond the docker/kubectl/helm already
+# handled above.
 if [[ "$KUBE_BACKEND" == "k3d" ]]; then
   if have k3d; then
     log "k3d already present: $(k3d version 2>/dev/null | head -1)"
@@ -238,7 +222,7 @@ if [[ "$KUBE_BACKEND" == "k3d" ]]; then
     curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG="${K3D_VERSION}" bash
   fi
 else
-  log "kube-backend=k3s — skipping k3d; deploy.rb's dev-cluster-k3s.sh installs k3s (host-native) at deploy time"
+  log "kube-backend=k3s — skipping k3d; deploy.rb (Carbide::Node) installs k3s (host-native) at deploy time"
 fi
 
 # ---------------------------------------------------------------------------

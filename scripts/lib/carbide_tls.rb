@@ -3,6 +3,7 @@
 require 'tmpdir'
 require 'tempfile'
 require 'fileutils'
+require_relative 'carbide_command'
 
 module Carbide
   # TLS/cert setup for the ingress, extracted from deploy.rb. Covers three
@@ -15,13 +16,35 @@ module Carbide
   # runner; it knows nothing about images, helm, or the cluster beyond the two
   # secrets it manages.
   class Tls
+    include Carbide::CommandRunner
+
     # cmd         : a TTY::Command instance (pretty printer).
     # root        : meta-repo root (where carbide-rootCA.pem is exported).
     # public_host : browser-facing FQDN, added as a cert SAN / CSR CN.
-    def initialize(cmd:, root:, public_host:)
+    # traefik_ns  : namespace holding the TLS secret / TLSStore.
+    # secret      : the TLS secret name Traefik serves as its default cert.
+    # hosts       : explicit SAN list (blank => auto-detect).
+    # out_dir     : where --csr writes the key/CSR and --import-cert reads the key.
+    def initialize(cmd:, root:, public_host:, traefik_ns: 'traefik', secret: 'carbide-tls',
+                   hosts: nil, out_dir: 'tls')
       @cmd = cmd
       @root = root
       @public_host = public_host.to_s
+      @traefik_ns  = blank?(traefik_ns) ? 'traefik' : traefik_ns.to_s.strip
+      @secret      = blank?(secret) ? 'carbide-tls' : secret.to_s.strip
+      @hosts       = hosts.to_s.strip
+      @out_dir     = blank?(out_dir) ? 'tls' : out_dir.to_s.strip
+    end
+
+    # Config option specs owned by the TLS layer (aggregated by deploy.rb). The
+    # --no-tls toggle itself lives in Deploy.options (it gates run() flow).
+    def self.options
+      [
+        { key: 'tls-opts.traefik-ns', arg: 'NS', desc: 'Traefik namespace holding the TLS secret (default: traefik)' },
+        { key: 'tls-opts.secret', arg: 'NAME', desc: 'TLS secret name Traefik serves as default cert (default: carbide-tls)' },
+        { key: 'tls-opts.hosts', arg: 'HOSTS', desc: 'Space-separated cert SAN list (blank => auto-detect FQDN/short/IPs)' },
+        { key: 'tls-opts.out-dir', arg: 'DIR', desc: 'Where --csr writes the key/CSR and --import-cert reads the key (default: tls)' }
+      ]
     end
 
     # Generate a locally-trusted TLS cert with mkcert and install it as the
@@ -32,8 +55,8 @@ module Carbide
     # which browsers let you click through for page loads but NOT for wss://
     # WebSocket handshakes — so the IDE socket fails with no response headers.
     def setup_tls
-      ns     = ENV.fetch('TRAEFIK_NS', 'traefik')
-      secret = ENV.fetch('TLS_SECRET', 'carbide-tls')
+      ns     = @traefik_ns
+      secret = @secret
 
       if @cmd.run!('kubectl', '-n', ns, 'get', "secret/#{secret}").success?
         log "TLS secret #{ns}/#{secret} already present — reusing (delete it to regenerate)"
@@ -57,7 +80,7 @@ module Carbide
           Alternatives:
             - bring a real CA-signed cert: ./scripts/deploy.rb --csr  then
               ./scripts/deploy.rb --import-cert <signed.crt>, or
-            - set TLS_SECRET to an existing kubernetes TLS secret in the
+            - set tls-opts.secret to an existing kubernetes TLS secret in the
               '#{ns}' namespace to skip mkcert, or
             - re-run with --no-tls to leave Traefik on its (untrusted) default cert.
         ERR
@@ -151,8 +174,8 @@ module Carbide
         abort "\e[1;31mxx\e[0m kubectl not found — required to import the cert."
       end
 
-      ns     = ENV.fetch('TRAEFIK_NS', 'traefik')
-      secret = ENV.fetch('TLS_SECRET', 'carbide-tls')
+      ns     = @traefik_ns
+      secret = @secret
       crt    = File.expand_path(cert_path)
       abort "\e[1;31mxx\e[0m cert not found: #{crt}" unless File.file?(crt)
 
@@ -173,7 +196,7 @@ module Carbide
       puts <<~MSG
 
         \e[1;32mCert imported.\e[0m Traefik now serves #{ns}/#{secret} as its default cert.
-        Run ./scripts/deploy.rb (it reuses an existing TLS_SECRET) or, if the
+        Run ./scripts/deploy.rb (it reuses an existing tls-opts.secret) or, if the
         stack is already up, the new cert is live immediately.
       MSG
     end
@@ -207,10 +230,10 @@ module Carbide
       end
     end
 
-    # Hostnames/IPs the cert is valid for. Override with TLS_HOSTS="a b c";
+    # Hostnames/IPs the cert is valid for. Set tls-opts.hosts="a b c" to override;
     # otherwise auto-detect this host's FQDN, short name, and IPs plus loopback.
     def tls_hosts
-      return ENV['TLS_HOSTS'].split if ENV['TLS_HOSTS'] && !ENV['TLS_HOSTS'].strip.empty?
+      return @hosts.split unless @hosts.empty?
 
       hosts = %w[localhost 127.0.0.1 ::1]
       hosts << @public_host unless @public_host.empty?
@@ -225,7 +248,7 @@ module Carbide
     end
 
     # Where --csr writes the key/CSR and where --import-cert looks for the key.
-    def csr_dir = File.expand_path(ENV.fetch('TLS_OUT_DIR', 'tls'))
+    def csr_dir = File.expand_path(@out_dir)
 
     # Pick the cert CN: prefer an explicit FQDN (PUBLIC_HOST or a dotted SAN),
     # falling back to the first host so the file naming stays predictable.
@@ -258,13 +281,12 @@ module Carbide
       CNF
     end
 
-    # The single .key left in TLS_OUT_DIR by --csr, when --key isn't given.
+    # The single .key left in the out-dir by --csr, when --key isn't given.
     def default_csr_key
       keys = Dir.glob(File.join(csr_dir, '*.key'))
       keys.first if keys.size == 1
     end
 
-    def log(msg)  = puts("\e[1;34m==>\e[0m #{msg}")
     def warn_(msg) = warn("\e[1;33m!!\e[0m #{msg}")
   end
 end

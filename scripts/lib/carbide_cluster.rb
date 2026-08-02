@@ -1,40 +1,57 @@
 # frozen_string_literal: true
 
+require_relative 'carbide_command'
+
 module Carbide
-  # The local single-node Kubernetes backend: k3d (k3s-in-Docker) or k3s
-  # (host-native). Owns the backend-specific facts and actions that used to be
-  # smeared across deploy.rb as `@backend == 'k3s' ? ...` conditionals:
+  # The local single-node Kubernetes backend facts: k3d (k3s-in-Docker) or k3s
+  # (host-native). Owns the backend-specific facts that used to be smeared
+  # across deploy.rb as `@backend == 'k3s' ? ...` conditionals:
   #   - the default ingress ports (k3d publishes host 8080/8443 -> Traefik
   #     80/443; k3s' klipper ServiceLB binds the host's real 80/443)
-  #   - bringing the cluster + infra up via the matching dev-cluster-<backend>.sh
   #   - the single-node image-import path (no registry): copy local :dev images
   #     straight into the node's containerd, then verify they actually landed.
   #
-  # Registry mode bypasses import_images entirely (every node pulls SHA tags over
-  # HTTPS), so this class is only the *local* backend seam.
+  # Cluster/infra bring-up + join now lives in Carbide::Node (the Ruby port of
+  # the dev-cluster-*.sh scripts). Registry mode bypasses import_images entirely
+  # (every node pulls SHA tags over HTTPS), so this class is only the *local*
+  # backend-facts + image-import seam.
   class Cluster
+    include Carbide::CommandRunner
+
     BACKENDS = %w[k3d k3s].freeze
     # The local images the single-node path imports into the node's containerd.
     IMPORT_IMAGES = %w[carbide2:dev carbide2-control:dev carbide2-shell:dev].freeze
 
     # cmd/quiet   : TTY::Command instances (streaming / capturing).
     # backend     : 'k3d' or 'k3s'.
-    # name        : the cluster name (k3d node naming, CLUSTER_NAME env).
+    # name        : the cluster name (k3d node naming).
     # server_root : carbide2-server checkout (holds scripts/dev-cluster-*.sh).
-    def initialize(cmd:, quiet:, backend:, name:, server_root:)
+    # http_port/https_port : ingress ports; blank => the backend's default.
+    def initialize(cmd:, quiet:, backend:, name:, server_root:, http_port: nil, https_port: nil)
       @cmd     = cmd
       @quiet   = quiet
       @backend = backend.to_s.downcase
       unless BACKENDS.include?(@backend)
-        abort "\e[1;31mxx\e[0m unknown --kube-backend '#{@backend}' (expected k3d or k3s)"
+        abort "\e[1;31mxx\e[0m unknown cluster.backend '#{@backend}' (expected k3d or k3s)"
       end
       @name        = name
       @server_root = server_root
       # k3d publishes container ports (host 8080/8443 -> Traefik 80/443); k3s'
-      # klipper ServiceLB binds the host's real 80/443. Both env-overridable.
+      # klipper ServiceLB binds the host's real 80/443. Blank in config => default.
       default_http, default_https = k3s? ? %w[80 443] : %w[8080 8443]
-      @http_port  = ENV.fetch('HTTP_PORT', default_http)
-      @https_port = ENV.fetch('HTTPS_PORT', default_https)
+      @http_port  = blank?(http_port) ? default_http : http_port.to_s.strip
+      @https_port = blank?(https_port) ? default_https : https_port.to_s.strip
+    end
+
+    # Config option specs owned by the cluster backend (aggregated by deploy.rb).
+    def self.options
+      [
+        { key: 'cluster.backend', arg: 'BACKEND', values: %w[k3d k3s],
+          desc: 'Local Kubernetes backend: k3d (default, k3s-in-Docker) or k3s (host-native)' },
+        { key: 'cluster.name', arg: 'NAME', desc: 'Cluster name (default: carbide-dev)' },
+        { key: 'cluster.http-port', arg: 'PORT', desc: 'Ingress HTTP port (blank => backend default: k3d 8080 / k3s 80)' },
+        { key: 'cluster.https-port', arg: 'PORT', desc: 'Ingress HTTPS port (blank => backend default: k3d 8443 / k3s 443)' }
+      ]
     end
 
     attr_reader :backend, :name, :http_port, :https_port
@@ -47,15 +64,6 @@ module Carbide
 
     # k3s installs itself and imports into host containerd — both need root.
     def needs_sudo? = k3s?
-
-    # Bring the cluster + supporting infra up via the backend's dev-cluster
-    # script. `env` carries optional registry coordinates the caller supplies.
-    def ensure_infra(env: {})
-      script = k3s? ? 'dev-cluster-k3s.sh' : 'dev-cluster-k3d.sh'
-      full = { 'CLUSTER_NAME' => @name, 'HTTP_PORT' => @http_port, 'HTTPS_PORT' => @https_port }.merge(env)
-      quiet_run("preparing the #{@backend} cluster + infra (this may take a minute)",
-                File.join(@server_root, 'scripts', script), env: full)
-    end
 
     # Single-node path (no registry): import the local :dev images straight into
     # the backend's containerd, failing loudly if an image is missing or the
@@ -133,19 +141,5 @@ module Carbide
       end
     end
 
-    # Run a long, noisy external command without streaming its (often red,
-    # alarming-looking) output. Print one friendly line up front and only dump
-    # the captured output if the command actually fails.
-    def quiet_run(msg, *cmd_args, env: {})
-      log msg
-      result = @quiet.run!(*cmd_args, env: env)
-      return result if result.success?
-
-      $stdout.write(result.out)
-      $stderr.write(result.err)
-      abort "\e[1;31mxx\e[0m failed (output above): #{msg}"
-    end
-
-    def log(msg) = puts("\e[1;34m==>\e[0m #{msg}")
   end
 end

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'fileutils'
+require_relative 'carbide_command'
 
 module Carbide
   # Shared image/registry logic for build.rb and deploy.rb.
@@ -17,6 +18,8 @@ module Carbide
   # gems or parses CLI itself. It knows nothing about kubernetes, helm, TLS, or
   # the client SPA; those stay in deploy.rb.
   class Images
+    include Carbide::CommandRunner
+
     # Logical component -> image repository name. The workspace pod image is
     # historically just "carbide2".
     NAMES = { workspace: 'carbide2', control: 'carbide2-control', shell: 'carbide2-shell' }.freeze
@@ -26,7 +29,9 @@ module Carbide
     # root        : the meta-repo root (holds the submodule checkouts).
     # registry_*  : self-hosted registry coordinates; host nil => local-only :dev.
     # registry_ca : an externally-run registry's CA pem (preferred over mkcert).
-    def initialize(cmd:, quiet:, root:, registry_host: nil, registry_port: '5000', registry_ca: nil)
+    # registry_container : docker container name for the local registry:2.
+    def initialize(cmd:, quiet:, root:, registry_host: nil, registry_port: '5000',
+                   registry_ca: nil, registry_container: 'carbide-registry')
       @cmd  = cmd
       @quiet = quiet
       @root  = root
@@ -41,6 +46,23 @@ module Carbide
       @registry      = host ? "#{host}:#{@registry_port}/" : nil
       ca = registry_ca&.strip
       @registry_ca = (ca && !ca.empty?) ? ca : nil
+      container = registry_container.to_s.strip
+      @registry_container = container.empty? ? 'carbide-registry' : container
+    end
+
+    # Config option specs owned by the image/registry layer (aggregated by deploy.rb).
+    def self.options
+      [
+        { key: 'registry.host', arg: 'HOST',
+          desc: 'Registry mode: push SHA-tagged images to a self-hosted registry at HOST (blank => single-node containerd import). Required for multi-node' },
+        { key: 'registry.port', arg: 'PORT', desc: 'Registry port (default: 5000)' },
+        { key: 'registry.ca', arg: 'PEM', desc: 'Inline CA PEM of an externally-run registry, so this node trusts it' },
+        { key: 'registry.ca', long: 'registry.ca-file', arg: 'FILE', file: true,
+          desc: 'Load registry.ca from a PEM file (mkcert rootCA.pem of the build host)' },
+        { key: 'registry.container', arg: 'NAME', desc: 'Local registry:2 container name (default: carbide-registry)' },
+        { key: 'registry.publish-only', long: 'publish-only', desc: 'Build + push SHA-tagged images to the registry, then exit (dedicated build/registry host). Needs registry.host' },
+        { key: 'registry.external', long: 'external-registry', desc: 'This node pulls from a registry run elsewhere: skip the local registry + build. Needs registry.host + registry.ca' }
+      ]
     end
 
     attr_reader :registry, :registry_host, :registry_port
@@ -266,7 +288,7 @@ module Carbide
     end
 
     def ensure_registry_container(dir)
-      name = ENV.fetch('REGISTRY_CONTAINER', 'carbide-registry')
+      name = @registry_container
       running, = @cmd.run!('docker', 'ps', '-q', '-f', "name=^#{name}$")
       unless (running || '').strip.empty?
         log "registry container '#{name}' already running \u2014 reusing"
@@ -293,7 +315,5 @@ module Carbide
       abort "\e[1;31mxx\e[0m registry did not become reachable at #{url}. Check " \
             "`docker logs carbide-registry` and that the mkcert CA is trusted on this host."
     end
-
-    def log(msg) = puts("\e[1;34m==>\e[0m #{msg}")
   end
 end

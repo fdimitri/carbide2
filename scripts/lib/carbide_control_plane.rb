@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative 'carbide_command'
+
 module Carbide
   # The control-plane half of the deploy: the Workspace CRD, the helm release,
   # and the post-deploy Deployment rollouts (including the roll-scope policy and
@@ -9,6 +11,8 @@ module Carbide
   # It reads image coordinates from the shared Carbide::Images instance so the
   # tags it pins into the chart are exactly the ones that were built/pushed.
   class ControlPlane
+    include Carbide::CommandRunner
+
     # cmd          : TTY::Command (streaming).
     # control_root : carbide2-control checkout (crd + chart).
     # namespace    : the control-plane namespace.
@@ -16,8 +20,12 @@ module Carbide
     # images       : Carbide::Images (registry prefix + per-component tags).
     # http_port/https_port/public_url : ingress values for the chart.
     # roll_scope   : 'all' | 'control' | 'none'.
+    # workspace_storage_class : StorageClass the operator stamps into each
+    #                workspace PVC (chart value workspace.storageClassName ->
+    #                WORKSPACE_STORAGE_CLASS env); blank => chart default.
     def initialize(cmd:, control_root:, namespace:, release:, images:,
-                   http_port:, https_port:, public_url:, roll_scope:)
+                   http_port:, https_port:, public_url:, roll_scope:,
+                   workspace_storage_class: nil)
       @cmd        = cmd
       @control    = control_root
       @namespace  = namespace
@@ -27,6 +35,15 @@ module Carbide
       @https_port = https_port
       @public_url = public_url
       @roll_scope = roll_scope
+      @workspace_storage_class = workspace_storage_class.to_s.strip
+    end
+
+    # Config option specs owned by the control plane (aggregated by deploy.rb).
+    def self.options
+      [
+        { key: 'control.namespace', arg: 'NS', desc: 'Control-plane namespace (default: carbide-system)' },
+        { key: 'control.release', arg: 'NAME', desc: 'Control-plane helm release name (default: carbide-control)' }
+      ]
     end
 
     def apply_crd
@@ -46,6 +63,10 @@ module Carbide
               '--set', "publicUrlBase=#{@public_url}",
               '--set-json', 'ingress.entryPoints=["web","websecure"]',
               '--set-json', 'ingress.tls={}']
+      # Stamp the resolved StorageClass so the operator provisions workspace PVCs
+      # on it (the multi-node binary-bytes durability fix). --set-string so a
+      # class name is never coerced.
+      args.push('--set-string', "workspace.storageClassName=#{@workspace_storage_class}") unless @workspace_storage_class.empty?
       if @images.registry
         tags = @images.image_tags
         # --set-string so an all-digit SHA tag is never coerced to a number.
@@ -117,7 +138,5 @@ module Carbide
       (out || '').lines.map { |l| l.strip.sub('namespace/', '') }
                  .select { |n| n.match?(/\Aws-\d+\z/) }
     end
-
-    def log(msg) = puts("\e[1;34m==>\e[0m #{msg}")
   end
 end
