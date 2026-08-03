@@ -97,6 +97,10 @@ fi
 SHORT="$(git -C "$SRC" rev-parse --short=12 "$SHA")"
 BASE="/clients/$FAMILY/$SHORT/"
 BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# Git commit time (UTC Zulu) is the ONLY reliable "newness" key: build_time is
+# just when this script ran, so building an OLD commit today makes it look newer
+# than the tip. Loaders sort on commit_time to pick the real newest build.
+COMMIT_TIME="$(TZ=UTC git -C "$SRC" show -s --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd "$SHA")"
 LABEL="${CARBIDE_CLIENT_LABEL:-$SHORT}"
 
 log "building $FAMILY @ $SHORT (mode=$MODE, base=$BASE)"
@@ -151,6 +155,7 @@ cat > "$DIST/manifest.json" <<JSON
   "full_sha": "$SHA",
   "label": "$LABEL",
   "build_time": "$BUILD_TIME",
+  "commit_time": "$COMMIT_TIME",
   "base": "$BASE",
   "floors": $(floors_json)
 }
@@ -187,7 +192,8 @@ manifest_keys="$(mc_run --json ls --recursive "carbide-tier/clients/" \
 
 registry_tmp="$WORKTREE/registry.json"
 if [ -n "$manifest_keys" ]; then
-  # Cat each manifest, then group by family and sort newest-first by build_time.
+  # Cat each manifest, then group by family and sort newest-first by commit_time
+  # (git commit date), falling back to build_time for pre-commit_time manifests.
   # shellcheck disable=SC2086
   while IFS= read -r key; do
     [ -n "$key" ] || continue
@@ -197,7 +203,7 @@ if [ -n "$manifest_keys" ]; then
         generated: (now | todateiso8601),
         families: (
           group_by(.family)
-          | map({ (.[0].family): (sort_by(.build_time) | reverse) })
+          | map({ (.[0].family): (sort_by(.commit_time // .build_time) | reverse) })
           | add
         )
       }' > "$registry_tmp"

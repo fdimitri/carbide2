@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# c2r-lsclient — list the client SPA builds present in the cluster's MinIO
+# `clients` bucket (the static tier the in-app build picker serves from).
+#
+# It talks to whatever cluster your kubectl currently points at — so make sure
+# `kubectl config current-context` is the cluster you mean before running.
+#
+# Usage:
+#   c2r-lsclient            # pretty table: families -> builds (from registry.json)
+#   c2r-lsclient --raw      # every object under clients/ in the bucket
+#   c2r-lsclient --json     # dump clients/registry.json verbatim
+#
+# Env:
+#   CARBIDE_MINIO_NS     (default carbide-system)   namespace of the MinIO svc
+#   CARBIDE_MINIO_SVC    (default minio)            MinIO service name
+#   CARBIDE_MINIO_SECRET (default minio-credentials) secret with root creds
+#   CARBIDE_MC           path to the MinIO client (Debian's `mc` is Midnight
+#                        Commander, NOT this — install `mcli` or set CARBIDE_MC)
+set -euo pipefail
+
+NS="${CARBIDE_MINIO_NS:-carbide-system}"
+SVC="${CARBIDE_MINIO_SVC:-minio}"
+SECRET="${CARBIDE_MINIO_SECRET:-minio-credentials}"
+MODE="pretty"
+
+die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  sed -n '2,/^set -euo/p' "$0" | sed -e '/^set -euo/d' -e 's/^# \{0,1\}//'
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --raw)  MODE=raw;  shift ;;
+    --json) MODE=json; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown arg: $1 (see --help)" ;;
+  esac
+done
+
+command -v kubectl >/dev/null || die "kubectl not found"
+command -v jq      >/dev/null || die "jq not found"
+
+# Resolve the MinIO client, verifying each candidate really is it (its --version
+# mentions "minio") so we never mistake GNU Midnight Commander's `mc` for it.
+is_minio_mc() { command -v "$1" >/dev/null 2>&1 && "$1" --version 2>&1 | grep -qi minio; }
+MC=""
+for cand in "${CARBIDE_MC:-}" mcli mc "$HOME/.local/bin/mcli"; do
+  [ -n "$cand" ] || continue
+  if is_minio_mc "$cand"; then MC="$cand"; break; fi
+done
+[ -n "$MC" ] || die "MinIO client not found (tried mcli, mc). Install it or set CARBIDE_MC."
+
+U="$(kubectl -n "$NS" get secret "$SECRET" -o jsonpath='{.data.root-user}'     | base64 -d)"
+P="$(kubectl -n "$NS" get secret "$SECRET" -o jsonpath='{.data.root-password}' | base64 -d)"
+[ -n "$U" ] && [ -n "$P" ] || die "could not read $SECRET in ns/$NS"
+
+WORK="$(mktemp -d /tmp/c2r-lsclient.XXXXXX)"
+PF_PID=""
+cleanup() {
+  [ -n "$PF_PID" ] && kill "$PF_PID" >/dev/null 2>&1 || true
+  rm -rf "$WORK" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# Let kubectl pick a free local port (":9000"), then read it back from the log —
+# avoids colliding with a build-client port-forward that may already hold :9000.
+PFLOG="$WORK/pf.log"
+kubectl -n "$NS" port-forward "svc/$SVC" :9000 >"$PFLOG" 2>&1 &
+PF_PID=$!
+
+LPORT=""
+for _ in $(seq 1 50); do
+  LPORT="$(sed -n 's/.*Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 9000.*/\1/p' "$PFLOG" | head -1)"
+  [ -n "$LPORT" ] && break
+  kill -0 "$PF_PID" 2>/dev/null || die "port-forward died: $(cat "$PFLOG")"
+  sleep 0.2
+done
+[ -n "$LPORT" ] || die "port-forward never became ready: $(cat "$PFLOG")"
+
+MC_CFG="$WORK/.mc"
+mc_run() { "$MC" --config-dir "$MC_CFG" "$@"; }
+mc_run alias set t "http://127.0.0.1:$LPORT" "$U" "$P" >/dev/null || die "mc alias set failed"
+
+case "$MODE" in
+  raw)
+    mc_run ls --recursive t/clients/
+    ;;
+  json)
+    mc_run cat t/clients/registry.json 2>/dev/null || die "no clients/registry.json in bucket"
+    ;;
+  pretty)
+    idx="$(mc_run cat t/clients/registry.json 2>/dev/null || true)"
+    if [ -z "$idx" ]; then
+      echo "(no clients/registry.json — bucket empty or nothing built against this cluster)"
+      echo "raw objects under clients/:"
+      mc_run ls --recursive t/clients/ || true
+      exit 0
+    fi
+    printf '%s\n' "$idx" | jq -r '
+      "generated: \(.generated)",
+      (.families | to_entries[] |
+        "\n\(.key)  (\(.value | length) builds):",
+        (.value[] | "  \(.sha)  \(.label // "-")  \(.build_time)  mode=\(.mode)"))'
+    ;;
+esac
