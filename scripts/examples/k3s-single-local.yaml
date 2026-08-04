@@ -1,0 +1,19 @@
+# examples/k3s-single-local.yaml — single-node host-native k3s, local storage.
+#
+# Host-native k3s instead of k3d-in-Docker: the ingress binds the host's real
+# 80/443 (klipper ServiceLB), so the box is reachable at its own FQDN with no
+# port mapping. Still one node, so local-path storage is fine.
+#
+#   ./scripts/deploy.rb --config examples/k3s-single-local.yaml
+#
+# Set public.host if `hostname -f` doesn't return the name you actually browse
+# to (it drives the ingress host rule, the mkcert SAN, and host-based auth).
+
+cluster:
+  backend: k3s
+
+storage:
+  backend: local-path
+
+public:
+  host: ''   # e.g. dev1.example.lan  ("" => hostname -f)

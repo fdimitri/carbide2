@@ -1,0 +1,49 @@
+# examples/k3s-multinode-longhorn.yaml — PRIMARY (server) node of a multi-node
+# host-native k3s cluster with replicated Longhorn storage.
+#
+# cluster.token is minted the first time it is blank, so a multi-node cluster is
+# a TWO-STEP flow: FREEZE the resolved config once (minting the shared token and
+# recording the first node's server-url), then DEPLOY every node from that one
+# frozen file. Deploying straight from this template would mint a DIFFERENT token
+# on each node and they would never form a single cluster.
+#
+#   # 1. FREEZE, on the first node: mint the token + server-url into cluster.yaml.
+#   #    --yaml-out writes the resolved config (real secrets) and EXITS — it does
+#   #    NOT deploy. Use --yaml-out, never --yaml-safeout: joiners need the real
+#   #    token, and --yaml-safeout redacts it.
+#   ./scripts/deploy.rb --config examples/k3s-multinode-longhorn.yaml \
+#       --cluster.server-url https://<this-node>:6443 --yaml-out cluster.yaml
+#
+#   # 2. DEPLOY the first node FROM the frozen file. cluster.token is now present,
+#   #    so it is reused, not re-minted. This brings up the k3s server
+#   #    (--cluster-init, HA-capable etcd), the control plane, Longhorn, a
+#   #    self-hosted image registry, and pushes the SHA-tagged images.
+#   ./scripts/deploy.rb --config cluster.yaml
+#
+#   # 3. hand cluster.yaml to each OTHER node and JOIN it as another server:
+#   ./scripts/deploy.rb --config cluster.yaml --cluster.role join
+#
+# Why each override matters on multi-node:
+#   registry.host  A pod can land on ANY node, so images must come from a shared
+#                  registry (SHA tags over HTTPS), not per-node containerd import.
+#                  Set this to the FQDN/IP agents can reach the server on.
+#   storage.backend=longhorn  Binary file bytes live only on the workspace PVC;
+#                  Longhorn replicates the RWO volume so it re-attaches wherever
+#                  the pod reschedules. local-path can't follow a pod across nodes.
+#   longhorn.replicas  Set to your node count on small clusters (Longhorn's
+#                  default is 3; a 2-node cluster should use 2).
+
+cluster:
+  backend: k3s
+
+storage:
+  backend: longhorn
+  longhorn:
+    replicas: '3'   # match your node count on small clusters
+
+registry:
+  host: ''          # REQUIRED: FQDN/IP agents reach the server on, e.g. dev1.example.lan
+  port: '5000'
+
+public:
+  host: ''          # browser-facing FQDN, e.g. carbide.example.lan  ("" => hostname -f)

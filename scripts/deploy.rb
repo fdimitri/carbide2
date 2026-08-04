@@ -7,13 +7,15 @@
 # https://<host>:8443/". Idempotent; doubles as the update/rebuild path.
 #
 # Pipeline:
-#   1. ensure the k3d cluster + infra exist  (carbide2-server/scripts/dev-cluster.sh)
+#   1. ensure the cluster + infra exist      (carbide2-server/scripts/dev-cluster-<backend>.sh)
 #   2. build images                          (scripts/build-all.sh)   [skip: --no-build]
-#   3. k3d image import the images into the cluster
-#   4. kubectl apply the Workspace CRD + wait for it to be established
-#   5. helm upgrade --install the control-plane chart
-#   6. roll the Deployments and wait for them to become Ready
-#   7. verify ingress + report cluster state (via kubeclient)
+#   3. import the images into the cluster    (k3d image import, or k3s containerd import)
+#   4. build + upload the pinned SPA clients (workspace + control) to the
+#      MinIO static tier                      (scripts/build-client)   [skip: --no-client]
+#   5. kubectl apply the Workspace CRD + wait for it to be established
+#   6. helm upgrade --install the control-plane chart
+#   7. roll the Deployments and wait for them to become Ready
+#   8. verify ingress + report cluster state (via kubeclient)
 #
 # Why Ruby instead of bash: the verify/report step reads structured cluster
 # state (pod readiness, Workspace CR .status.phase) through kubeclient — the
@@ -22,17 +24,42 @@
 # shell out, because those tools have no useful Ruby binding.
 #
 # Requires on the host running this: ruby (>= 3.0), bundler, docker (BuildKit),
-# k3d, kubectl, helm. Gems (tty-command, kubeclient) are installed on first run
-# via bundler/inline.
+# kubectl, helm, and k3d (only for the default --kube-backend=k3d; the k3s
+# backend installs k3s itself). Gems (tty-command, kubeclient) are installed on
+# first run via bundler/inline.
 #
 # Usage:
 #   ./scripts/deploy.rb                 full build + deploy
+#   ./scripts/deploy.rb --cluster.backend k3s   deploy to host-native k3s (default: k3d)
+#   ./scripts/deploy.rb --storage.backend longhorn   replicated RWO storage (multi-node)
+#   ./scripts/deploy.rb --registry.host HOST  push SHA-tagged images to a self-hosted
+#                                       registry at HOST (multi-node: every node pulls
+#                                       from it instead of a per-node containerd import)
+#   ./scripts/deploy.rb --publish-only --registry.host HOST
+#                                       build + push images to the registry, then STOP.
+#                                       For a dedicated build/registry host that runs no
+#                                       k3s (pair with --external-registry on the nodes).
+#   ./scripts/deploy.rb --external-registry --registry.host HOST --registry.ca-file FILE
+#                                       deploy to a k3s node that pulls from a registry
+#                                       run ELSEWHERE: skip the local registry + build,
+#                                       just pull the already-pushed tags.
 #   ./scripts/deploy.rb --no-build      skip image build (re-import + redeploy)
 #   ./scripts/deploy.rb --no-shell      build everything EXCEPT the carbide2-shell image
+#   ./scripts/deploy.rb --no-client     skip building + uploading the pinned SPA client
 #   ./scripts/deploy.rb --no-infra      skip cluster/infra bring-up
 #   ./scripts/deploy.rb --no-tls        skip mkcert TLS setup (Traefik default cert)
 #   ./scripts/deploy.rb --no-pull       skip the self-update (pull + submodules) step
 #   ./scripts/deploy.rb --help
+#
+# Configuration (no ENV knobs): three layers merged last-wins —
+#   1. scripts/defaults.yaml   every default lives here
+#   2. --config input.yaml     the emit/consume handoff file (a k3s server emits
+#                              it, agents consume it)
+#   3. CLI flags               every --a.b.c flag sets the a.b.c key and wins
+# Freeze the fully-resolved config to a file with --yaml-out FILE (secrets
+# included) or --yaml-safeout FILE (secrets redacted). Freezing EXITS without
+# deploying — mint the shared cluster.token once, then deploy every node from the
+# frozen file with --config FILE. See scripts/lib/carbide_config.rb.
 #
 # Self-update: by default the very first thing deploy.rb does is `git pull
 # --ff-only` the meta repo and `git submodule update --init --recursive`, so a
@@ -43,18 +70,26 @@
 # Real (non-mkcert) certs — e.g. internal-test.carbidecore.online signed by an
 # internal/corporate CA. Two standalone steps bracket your CA; neither touches
 # the build pipeline:
-#   PUBLIC_HOST=internal-test.carbidecore.online ./scripts/deploy.rb --csr
-#       -> writes <host>.key + <host>.csr to TLS_OUT_DIR (default ./tls).
+#   ./scripts/deploy.rb --public.host internal-test.carbidecore.online --csr
+#       -> writes <host>.key + <host>.csr to tls-opts.out-dir (default ./tls).
 #          Submit the .csr to your CA.
 #   ./scripts/deploy.rb --import-cert ./tls/<host>.crt
-#       -> loads the signed cert (+ the .key) into the TLS_SECRET k8s secret and
-#          wires it as Traefik's default cert. Later deploys reuse that secret.
+#       -> loads the signed cert (+ the .key) into the tls-opts.secret k8s secret
+#          and wires it as Traefik's default cert. Later deploys reuse that secret.
 
 require 'optparse'
 require 'tmpdir'
 require 'tempfile'
 require 'fileutils'
 require 'digest'
+require_relative 'lib/carbide_config'
+require_relative 'lib/carbide_command'
+require_relative 'lib/carbide_images'
+require_relative 'lib/carbide_tls'
+require_relative 'lib/carbide_cluster'
+require_relative 'lib/carbide_node'
+require_relative 'lib/carbide_storage'
+require_relative 'lib/carbide_control_plane'
 
 # Bundler/inline installs the two helper gems at runtime, which needs a ruby
 # whose gem dir is writable. A bare system ruby (e.g. /usr/bin/ruby on Debian)
@@ -90,9 +125,9 @@ module Carbide
   # Degrades gracefully: any failure here is non-fatal (the deploy already
   # happened), so methods rescue and return nil/empty rather than raising.
   class KubeStatus
-    def initialize(control_ns:)
+    def initialize(control_ns:, kubeconfig: '~/.kube/config')
       @control_ns = control_ns
-      @config = Kubeclient::Config.read(File.expand_path(ENV.fetch('KUBECONFIG', '~/.kube/config')))
+      @config = Kubeclient::Config.read(File.expand_path(kubeconfig))
       @context = @config.context
     rescue StandardError => e
       warn "  (kubeclient: could not read kubeconfig: #{e.message})"
@@ -144,12 +179,10 @@ module Carbide
   end
 
   class Deploy
-    # No registry exists in dev, so every one of these must be `k3d image import`ed
-    # or the pods ImagePullBackOff.
-    IMAGES = %w[carbide2:dev carbide2-control:dev carbide2-shell:dev].freeze
+    include Carbide::CommandRunner
 
-    def initialize(opts)
-      @opts       = opts
+    def initialize(config)
+      @config     = config
       @cmd        = TTY::Command.new(uuid: false, printer: :pretty)
       # A second command instance that prints NOTHING — used for the long,
       # noisy external builds whose raw docker/k3d output (much of it on stderr,
@@ -159,78 +192,219 @@ module Carbide
       @root       = File.expand_path('..', __dir__)
       @server     = File.join(@root, 'carbide2-server')
       @control    = File.join(@root, 'carbide2-control')
-      @cluster    = ENV.fetch('CLUSTER_NAME', 'carbide-dev')
-      @control_ns = ENV.fetch('CONTROL_NS', 'carbide-system')
-      @release    = ENV.fetch('RELEASE', 'carbide-control')
-      @http_port  = ENV.fetch('HTTP_PORT', '8080')
-      @https_port = ENV.fetch('HTTPS_PORT', '8443')
+      @cluster    = config.present('cluster.name') || 'carbide-dev'
+      @control_ns = config.present('control.namespace') || 'carbide-system'
+      @release    = config.present('control.release') || 'carbide-control'
+      @kubeconfig = config.present('kubeconfig') || '~/.kube/config'
+      # Deploy-flow toggles (defaults live in defaults.yaml; --no-<x> flips them).
+      @no_build   = !config.bool('build')
+      @no_shell   = !config.bool('shell')
+      @no_client  = !config.bool('client')
+      @no_infra   = !config.bool('infra')
+      @no_tls     = !config.bool('tls')
+      @no_pull    = !config.bool('pull')
+      # One-shot cert actions.
+      @csr         = config.bool('csr')
+      @import_cert = config.present('import-cert')
+      @key         = config.present('key')
+      # The local single-node backend (k3d default / k3s host-native) — its
+      # ports, infra bring-up, and containerd image-import path all live in the
+      # shared Carbide::Cluster helper (validates the backend on construction).
+      @cluster_iface = Carbide::Cluster.new(
+        cmd: @cmd, quiet: @quiet,
+        backend: config.present('cluster.backend') || 'k3d',
+        name: @cluster, server_root: @server,
+        http_port: config.get('cluster.http-port'), https_port: config.get('cluster.https-port')
+      )
+      @http_port  = @cluster_iface.http_port
+      @https_port = @cluster_iface.https_port
+      # Optional self-hosted registry. When registry.host is set, deploy switches
+      # from the single-node containerd-import path to building immutable SHA-
+      # tagged images, pushing them to a standalone registry:2 on this host, and
+      # pinning those tags into the control-plane chart — so every node in a
+      # multi-node cluster pulls the same image over HTTPS. Unset = legacy
+      # behavior (k3d/k3s `ctr images import`, :dev tags).
+      @registry_host = config.present('registry.host')
+      @registry_port = (config.present('registry.port') || '5000').to_s
+      @registry      = @registry_host ? "#{@registry_host}:#{@registry_port}/" : nil
+      # Split-host modes so a multi-node cluster needn't co-locate build+registry
+      # on a k3s node. publish-only: THIS host only builds + pushes images to its
+      # registry (no k3s/helm). external: THIS host is a k3s node that pulls from
+      # a registry someone ELSE runs, so skip standing up a local one and skip
+      # building (images are already pushed). registry.ca points at that external
+      # registry's CA so containerd + our reachability check trust it.
+      @publish_only      = config.bool('registry.publish-only')
+      @external_registry = config.bool('registry.external')
+      @registry_ca       = config.present('registry.ca')
+      validate_registry_modes!
+      # All image build/tag/registry logic lives in the shared Images library
+      # (also used by scripts/build.rb) so the two never drift.
+      @images = Carbide::Images.new(
+        cmd: @cmd, quiet: @quiet, root: @root,
+        registry_host: @registry_host, registry_port: @registry_port,
+        registry_ca: @registry_ca, registry_container: config.present('registry.container')
+      )
       # Which meta-repo branch/ref this deploy builds from. self_update checks it
       # out and fast-forwards it before doing anything, so the deployed images
       # always match a known ref instead of "whatever happened to be checked
-      # out". Default 'main' (the deployable line); --ref/DEPLOY_REF can target
-      # 'dev' for a test deploy. The resolved ref + SHA are logged up front.
-      @deploy_ref = (@opts[:ref] || ENV.fetch('DEPLOY_REF', 'main')).to_s
+      # out". Default 'main' (the deployable line); ref can target 'dev' for a
+      # test deploy. The resolved ref + SHA are logged up front.
+      @deploy_ref = (config.present('ref') || 'main').to_s
       # The hostname the BROWSER uses to reach the ingress. Drives the TLS cert
       # SANs, the public URL the control-plane advertises, and the Rails host
-      # allowlist. We refuse to silently guess 'localhost': that bakes the wrong
-      # cert SANs and advertises an unreachable URL whenever the box is actually
-      # reached by its LAN name. resolve_public_endpoint detects a real FQDN via
-      # `hostname -f` and otherwise STOPS with instructions (see method).
-      @public_host, @public_url = resolve_public_endpoint
-      # Which deployments roll_deployments restarts after a redeploy:
-      #   all     — control-plane AND workspace deployments (+ orphaned shell
-      #             pods). Version-coherent: the editor SPA (served by the
-      #             workspace pod) and the dashboard SPA (served by control-
-      #             plane) move together, avoiding client:server skew. Cost:
-      #             restarting a workspace deployment kills its worker and
-      #             drops all live project terminals/PTYs.
-      #   control — control-plane deployments only. Preserves active project
-      #             terminals, but risks a new dashboard talking to an old
-      #             workspace API. Use when iterating on control-plane only.
-      #   none    — skip rolling entirely (helm/CRD changes only).
-      # Default is 'all' because every current environment is dev, where
-      # coherence matters more than terminal uptime. CLI --roll-scope overrides.
-      @roll_scope = (@opts[:roll_scope] || ENV.fetch('ROLL_SCOPE', 'all')).to_s
+      # allowlist. We refuse to silently guess 'localhost'. The dedicated build/
+      # registry host (publish-only) serves no ingress, so don't demand an FQDN.
+      @public_host, @public_url = @publish_only ? ['', ''] : resolve_public_endpoint
+      # Which deployments roll_deployments restarts after a redeploy (all |
+      # control | none). Default 'all' (version-coherent; costs live terminals).
+      @roll_scope = (config.present('roll-scope') || 'all').to_s
+      # The persistent-storage backend seam: resolves storage.backend to a
+      # StorageClass the workspace PVCs use (the multi-node binary-bytes
+      # durability fix). local-path (default) keeps single-node behavior.
+      @storage = Carbide::Storage.for(
+        backend: config.present('storage.backend') || 'local-path',
+        cmd: @cmd, quiet: @quiet,
+        version: config.get('storage.longhorn.version'),
+        replicas: config.get('storage.longhorn.replicas')
+      )
+      @storage_class = @storage.storage_class
+      # The k3s/k3d node lifecycle (create/install/join, registry trust, and the
+      # shared in-cluster infra) — the Ruby replacement for the dev-cluster-*.sh
+      # and dev-agent-k3s.sh scripts. --role init brings a node up + installs
+      # infra; --role join adds a control-plane server to an existing cluster.
+      @role = (config.present('cluster.role') || 'init').to_s.downcase
+      node_registry_ca = @external_registry ? @registry_ca : (@registry_host ? @images.mkcert_ca_pem : nil)
+      @node = Carbide::Node.new(
+        cmd: @cmd, quiet: @quiet,
+        backend: config.present('cluster.backend') || 'k3d',
+        name: @cluster, server_root: @server,
+        http_port: @http_port, https_port: @https_port,
+        role: @role,
+        server_url: config.present('cluster.server-url'),
+        token: config.present('cluster.token'),
+        storage_class: @storage_class,
+        registry_host: @registry_host, registry_port: @registry_port,
+        registry_ca: node_registry_ca
+      )
+      # Ingress TLS/cert flows (mkcert default cert, CSR/import, CA trust hints)
+      # live in the shared Carbide::Tls helper.
+      @tls = Carbide::Tls.new(
+        cmd: @cmd, root: @root, public_host: @public_host,
+        traefik_ns: config.present('tls-opts.traefik-ns'),
+        secret: config.present('tls-opts.secret'),
+        hosts: config.get('tls-opts.hosts'),
+        out_dir: config.present('tls-opts.out-dir')
+      )
+      # The CRD + helm release + Deployment rollouts live in Carbide::ControlPlane;
+      # it reads image tags straight from @images so the chart pins what we built.
+      @control_plane = Carbide::ControlPlane.new(
+        cmd: @cmd, control_root: @control, namespace: @control_ns, release: @release,
+        images: @images, http_port: @http_port, https_port: @https_port,
+        public_url: @public_url, roll_scope: @roll_scope,
+        workspace_storage_class: @storage_class
+      )
+    end
+
+    # Aggregated by the parser at the bottom; the orchestration-level knobs.
+    def self.options
+      [
+        { key: 'ref', arg: 'REF', desc: 'Meta-repo branch/ref to deploy (default: main). Checked out + fast-forwarded before build' },
+        { key: 'build',  negatable: true, desc: 'Build the container images (--no-build to just re-import + redeploy)' },
+        { key: 'shell',  negatable: true, desc: 'Include the carbide2-shell image in the build (--no-shell reuses the existing one)' },
+        { key: 'client', negatable: true, desc: 'Build + upload the pinned SPA client to the MinIO static tier' },
+        { key: 'infra',  negatable: true, desc: 'Bring the cluster + infra up (--no-infra to skip)' },
+        { key: 'tls',    negatable: true, desc: 'mkcert TLS setup for the ingress (--no-tls leaves Traefik default cert)' },
+        { key: 'pull',   negatable: true, desc: 'Self-update (git pull + submodule update) before deploying (--no-pull to skip)' },
+        { key: 'roll-scope', arg: 'SCOPE', values: %w[all control none],
+          desc: 'Which deployments to roll after deploy: all (default), control, none' },
+        { key: 'public.host', arg: 'HOST', desc: 'Browser-facing FQDN for ingress/cert/host-auth (default: hostname -f)' },
+        { key: 'public.url', arg: 'URL', desc: 'Explicit full URL base for the ingress (wins over public.host)' },
+        { key: 'kubeconfig', arg: 'PATH', desc: 'kubeconfig for the verify step (default: ~/.kube/config)' },
+        { key: 'csr', desc: 'Generate a private key + CSR (tls-opts.hosts / public.host) in tls-opts.out-dir, then exit' },
+        { key: 'import-cert', arg: 'FILE', desc: 'Load a CA-signed cert into the TLS secret as the Traefik default, then exit' },
+        { key: 'key', arg: 'FILE', desc: 'Private key for --import-cert (default: the .key from --csr in tls-opts.out-dir)' }
+      ]
     end
 
     def run
       self_update
-      return generate_csr if @opts[:csr]
-      return import_cert if @opts[:import_cert]
+      return @tls.generate_csr if @csr
+      return @tls.import_cert(@import_cert, key_path: @key) if @import_cert
 
       require_tools
-      ensure_infra unless @opts[:no_infra]
-      build_images unless @opts[:no_build]
-      import_images
-      apply_crd
-      install_control_plane
-      setup_tls unless @opts[:no_tls]
-      roll_deployments
+      return join_run if @role == 'join'
+      return publish_only_run if @publish_only
+
+      ensure_registry if @registry && !@external_registry
+      # Cluster first, THEN the storage backend (creates its StorageClass), THEN
+      # infra — MinIO's PVC is pinned to that class, so it must exist beforehand.
+      @node.ensure_cluster! unless @no_infra
+      @storage.ensure!
+      @node.install_infra unless @no_infra
+      build_images unless @no_build || @external_registry || skip_build?
+      publish_images unless @external_registry
+      build_and_upload_client unless @no_client
+      @control_plane.apply_crd
+      @control_plane.install
+      @tls.setup_tls unless @no_tls
+      @control_plane.roll_deployments
       verify
       summary
       # Trust instructions go dead last so they're the final thing on screen —
       # they're the one manual step left and shouldn't scroll off behind build
       # spew or the verify report.
-      trust_ca_instructions unless @opts[:no_tls]
+      @tls.trust_ca_instructions unless @no_tls
     end
 
     private
 
+    # --publish-only: build the SHA-tagged images and push them to the self-hosted
+    # registry, then stop. Runs on the dedicated build/registry host (no k3s, no
+    # helm, no cluster) so the k3s nodes can pull the images over HTTPS. Pair it
+    # with --external-registry on each k3s node, which consumes this registry
+    # instead of standing up its own.
+    def publish_only_run
+      ensure_registry
+      build_images unless @no_build || skip_build?
+      @images.push
+      log "publish-only complete \u2014 images are in the registry at " \
+          "#{@registry_host}:#{@registry_port}"
+      log "next: on each k3s node run deploy.rb --external-registry " \
+          "--registry.host #{@registry_host} --registry.ca-file <rootCA.pem> " \
+          "(copy this host's mkcert rootCA.pem over first)"
+    end
+
+    # Guard the split-host registry flags: they only make sense with a registry,
+    # are mutually exclusive, and --external-registry needs the registry's CA.
+    def validate_registry_modes!
+      if @publish_only && @external_registry
+        abort "\e[1;31mxx\e[0m --publish-only and --external-registry are mutually " \
+              "exclusive: one builds+pushes images, the other consumes them."
+      end
+      if (@publish_only || @external_registry) && !@registry
+        abort "\e[1;31mxx\e[0m #{@publish_only ? '--publish-only' : '--external-registry'} " \
+              "needs --registry.host (the self-hosted registry to push to / pull from)."
+      end
+      if @external_registry && !@registry_ca
+        abort "\e[1;31mxx\e[0m --external-registry needs --registry.ca-file FILE (the registry's " \
+              "mkcert rootCA.pem, copied from the build host) so this node trusts it."
+      end
+    end
+
     # Resolve the browser-facing hostname + URL base. Order of precedence:
-    #   1. PUBLIC_URL_BASE  (explicit full URL, wins outright)
-    #   2. PUBLIC_HOST env / --public-host flag
+    #   1. public.url   (explicit full URL, wins outright)
+    #   2. public.host  (config / --public.host flag)
     #   3. `hostname -f`    (only if it yields a real, dotted FQDN)
     # If none of those produce a usable hostname we STOP rather than silently
     # falling back to 'localhost'. A localhost guess bakes the wrong TLS cert
     # SANs, advertises an unreachable dashboard URL, and (historically) produced
     # confusing "Blocked hosts" 403s when the box was reached by its LAN name.
     def resolve_public_endpoint
-      if (url = ENV['PUBLIC_URL_BASE']) && !url.strip.empty?
-        u    = url.strip
-        host = u.sub(%r{\A[a-zA-Z]+://}, '').sub(/:\d+\z/, '')
-        return [host, u]
+      if (url = @config.present('public.url'))
+        host = url.sub(%r{\A[a-zA-Z]+://}, '').sub(/:\d+\z/, '')
+        return [host, url]
       end
-      host = (@opts[:public_host] || ENV['PUBLIC_HOST'])&.strip
+      host = @config.present('public.host')
       fqdn = detect_fqdn
       host = fqdn if host.nil? || host.empty?
       unless host && !host.empty? && valid_public_host?(host)
@@ -239,11 +413,11 @@ module Carbide
              `hostname -f` returned #{fqdn.inspect}, which is not a usable FQDN
              (a bare short name like "dev1" won't resolve for remote browsers and
              makes useless cert SANs). Set one explicitly and re-run, e.g.:
-               PUBLIC_HOST=dev1.frankd.local ./scripts/deploy.rb
-               ./scripts/deploy.rb --public-host dev1.frankd.local
+               ./scripts/deploy.rb --public.host dev1.frankd.local
+               ./scripts/deploy.rb --public.host dev1.frankd.local
              or pin the full URL base:
-               PUBLIC_URL_BASE=https://dev1.frankd.local:#{@https_port} ./scripts/deploy.rb
-             (Use PUBLIC_HOST=localhost only for a purely-local, same-machine cluster.)
+               ./scripts/deploy.rb --public.url https://dev1.frankd.local:#{@https_port}
+             (Use --public.host localhost only for a purely-local, same-machine cluster.)
         MSG
       end
       [host, "https://#{host}:#{@https_port}"]
@@ -262,29 +436,13 @@ module Carbide
       host.include?('.') && host !~ /\s/ && !host.start_with?('.') && !host.end_with?('.')
     end
 
-    def log(msg) = puts("\e[1;34m==>\e[0m #{msg}")
-    def warn_(msg) = warn("\e[1;33m!!\e[0m #{msg}")
-
-    # Run a long, noisy external command without streaming its (often red,
-    # alarming-looking) docker/k3d output. Print one friendly line up front and
-    # only dump the captured output if the command actually fails.
-    def quiet_run(msg, *cmd_args, env: {})
-      log msg
-      result = @quiet.run!(*cmd_args, env: env)
-      return result if result.success?
-
-      $stdout.write(result.out)
-      $stderr.write(result.err)
-      abort "\e[1;31mxx\e[0m failed (output above): #{msg}"
-    end
-
     # Pull the meta repo + refresh submodules BEFORE any deploy work, so a deploy
     # always runs the newest orchestrator and the submodule SHAs it expects.
     # Default on; --no-pull skips it. If the pull changes deploy.rb itself we
     # re-exec the updated copy (CARBIDE_DEPLOY_PULLED guards against a loop —
     # it's inherited across the exec, so the child skips this step).
     def self_update
-      return if @opts[:no_pull]
+      return if @no_pull
       return if ENV['CARBIDE_DEPLOY_PULLED']
 
       log "self-update: fetch + checkout '#{@deploy_ref}' + submodule update in #{@root}"
@@ -313,7 +471,7 @@ module Carbide
       return unless before && after && before != after
 
       log 'self-update: deploy.rb changed — re-running the updated orchestrator'
-      exec(RbConfig.ruby, __FILE__, *ARGV)
+      exec(RbConfig.ruby, __FILE__, *ORIGINAL_ARGV)
     end
 
     def file_digest(path)
@@ -323,403 +481,99 @@ module Carbide
     end
 
     def require_tools
-      %w[docker k3d kubectl helm].each do |tool|
+      # k3s installs itself (vendor get.k3s.io), so it isn't a prereq tool;
+      # docker stays required for the build/import paths. --publish-only only
+      # builds + pushes images (docker only, no k8s CLI). --role join only adds a
+      # k3s server to an existing cluster: the vendor installer pulls itself via
+      # curl and we verify with kubectl — no docker/helm build tooling needed.
+      tools =
+        if @role == 'join'   then %w[kubectl curl]
+        elsif @publish_only  then %w[docker]
+        else %w[docker kubectl helm] + @cluster_iface.extra_tools
+        end
+      tools.each do |tool|
         next if system("command -v #{tool} >/dev/null 2>&1")
 
         abort "\e[1;31mxx\e[0m missing required tool: #{tool} " \
               "(run scripts/setmeup.sh on a fresh host to install everything)"
       end
 
-      # docker present but daemon unreachable is the #1 fresh-box gotcha: the
-      # user was added to the 'docker' group but hasn't re-logged in yet.
-      unless @cmd.run!('docker', 'info').success?
-        abort "\e[1;31mxx\e[0m docker is installed but the daemon isn't reachable. " \
-              "Is it running, and are you in the 'docker' group? " \
-              "(try: sudo systemctl enable --now docker; newgrp docker)"
+      unless @role == 'join'
+        # docker present but daemon unreachable is the #1 fresh-box gotcha: the
+        # user was added to the 'docker' group but hasn't re-logged in yet.
+        unless @cmd.run!('docker', 'info').success?
+          abort "\e[1;31mxx\e[0m docker is installed but the daemon isn't reachable. " \
+                "Is it running, and are you in the 'docker' group? " \
+                "(try: sudo systemctl enable --now docker; newgrp docker)"
+        end
+
+        # build-all.sh uses `docker buildx build --load` and `docker compose`.
+        # On Ubuntu these ship as SEPARATE packages (docker-buildx / docker-compose-v2)
+        # that a bare `docker.io` install omits — catch that here, not mid-build.
+        unless @no_build || @cmd.run!('docker', 'buildx', 'version').success?
+          abort "\e[1;31mxx\e[0m 'docker buildx' is unavailable but image build needs it. " \
+                "Install the buildx plugin (apt: docker-buildx) or pass --no-build."
+        end
       end
 
-      # build-all.sh uses `docker buildx build --load` and `docker compose`.
-      # On Ubuntu these ship as SEPARATE packages (docker-buildx / docker-compose-v2)
-      # that a bare `docker.io` install omits — catch that here, not mid-build.
-      unless @opts[:no_build] || @cmd.run!('docker', 'buildx', 'version').success?
-        abort "\e[1;31mxx\e[0m 'docker buildx' is unavailable but image build needs it. " \
-              "Install the buildx plugin (apt: docker-buildx) or pass --no-build."
+      # The k3s backend installs k3s and imports images into its host containerd,
+      # both of which need root. Prime sudo now (visible prompt) so the later
+      # quiet, output-captured steps don't hang on a hidden password prompt.
+      if @cluster_iface.needs_sudo? && !@publish_only && !system('sudo', '-v')
+        abort "\e[1;31mxx\e[0m the k3s backend needs sudo (k3s install + containerd " \
+              "image import). Grant sudo, or use the default --cluster.backend k3d."
       end
-    end
-
-    def ensure_infra
-      quiet_run('preparing the k3d cluster + infra (this may take a minute)',
-                File.join(@server, 'scripts', 'dev-cluster.sh'),
-                env: { 'CLUSTER_NAME' => @cluster,
-                       'HTTP_PORT' => @http_port,
-                       'HTTPS_PORT' => @https_port })
     end
 
     def build_images
-      env = @opts[:no_shell] ? { 'SKIP_SHELL' => '1' } : {}
-      quiet_run('building the container images — on a cold cache this builds ' \
-                'Ruby from source, so give it a few minutes (reticulating splines...)',
-                File.join(@root, 'scripts', 'build-all.sh'), env: env)
+      components = @no_shell ? %i[workspace control] : Carbide::Images::ALL
+      log 'building the container images — on a cold cache this builds Ruby from ' \
+          'source, so give it a few minutes (reticulating splines...)'
+      @images.build(components: components, quiet: true)
     end
 
-    def import_images
-      log "importing images into k3d cluster '#{@cluster}'"
-      node = "k3d-#{@cluster}-server-0"
-      IMAGES.each do |img|
-        # Every image here is required. A missing local image used to only warn
-        # and let the deploy finish — leaving the cluster in a broken state where
-        # pods ImagePullBackOff against docker.io (the image is local-only and was
-        # never pushed). Fail loudly instead so the operator builds it first.
-        # @quiet so `docker image inspect`'s multi-screen JSON dump never hits
-        # the console (we only care whether the image exists).
-        unless @quiet.run!("docker image inspect #{img}").success?
-          abort "\e[1;31mxx\e[0m #{img} not present locally — build it first " \
-                "(scripts/build-all.sh) then re-run. Refusing to deploy a cluster " \
-                "that will ImagePullBackOff."
-        end
-        log "  import #{img}"
-        # @quiet too — k3d's import progress is noise on success; surface it only
-        # if the import actually fails.
-        res = @quiet.run!('k3d', 'image', 'import', img, '-c', @cluster)
-        unless res.success?
-          $stdout.write(res.out)
-          $stderr.write(res.err)
-          abort "\e[1;31mxx\e[0m k3d image import failed for #{img} (output above)."
-        end
-        # Verify the image actually landed in the node's containerd. `k3d image
-        # import` has been observed to no-op/lose an image (e.g. shell image
-        # missing from the node despite a clean host build), which is invisible
-        # until the first pod tries to pull and falls back to docker.io.
-        unless node_has_image?(node, img)
-          abort "\e[1;31mxx\e[0m #{img} did not land in node '#{node}' containerd " \
-                "after import — pods would ImagePullBackOff. Aborting."
-        end
+    # Build the PINNED SPA clients (the carbide2-client submodule's checked-out
+    # SHA) and upload them to the MinIO static tier via scripts/build-client.
+    # Two families are published from the same source, differing only by build
+    # mode: 'workspace' (family carbide2-client, served by workspace pods) and
+    # 'control' (family carbide2-control, the dashboard served by the control
+    # pod). Neither is baked into any image — they live only in MinIO, served at
+    # /clients/<family>/<sha>/, and the pod loaders resolve them at request
+    # time. Runs after ensure_infra (which brings MinIO up) so the upload target
+    # exists. --no-client skips it (e.g. redeploys that don't touch the client).
+    def build_and_upload_client
+      %w[workspace control].each do |mode|
+        quiet_run("building + uploading the pinned '#{mode}' SPA client to the MinIO static tier",
+                  File.join(@root, 'scripts', 'build-client'), '--mode', mode,
+                  env: { 'CARBIDE_MINIO_NS' => @control_ns })
       end
     end
 
-    # True if the node's containerd holds <repo>:<tag>. crictl's positional and
-    # -q reference filters are unreliable across versions (they ignore the
-    # filter and list everything), so match repo+tag as exact columns instead.
-    # Local-only images normalize to the docker.io/library/ prefix in containerd.
-    def node_has_image?(node, img)
-      repo, tag = img.split(':', 2)
-      tag ||= 'latest'
-      ref = "docker.io/library/#{repo}"
-      res = @quiet.run!("docker exec #{node} crictl images")
-      return false unless res.success?
-      res.out.each_line.any? do |line|
-        cols = line.split
-        cols[0] == ref && cols[1] == tag
-      end
+    # Image tagging, building, and registry lifecycle all live in the shared
+    # Carbide::Images library (also used by scripts/build.rb).
+
+    # Publish the freshly-built images so the cluster can pull them. Registry
+    # mode pushes SHA tags to the standalone registry (works across every node);
+    # legacy mode imports :dev into the single node's containerd.
+    def publish_images
+      @registry ? @images.push : @cluster_iface.import_images
     end
 
-    # Generate a locally-trusted TLS cert with mkcert and install it as the
-    # Traefik *default* certificate, so every IngressRoute that leaves its tls
-    # block empty (tls: {}) — the control-plane route AND the operator's
-    # per-workspace ws-* routes — serves a trusted cert. Without this Traefik
-    # falls back to its built-in "TRAEFIK DEFAULT CERT" (wrong host, untrusted),
-    # which browsers let you click through for page loads but NOT for wss://
-    # WebSocket handshakes — so the IDE socket fails with no response headers.
-    def setup_tls
-      ns     = ENV.fetch('TRAEFIK_NS', 'traefik')
-      secret = ENV.fetch('TLS_SECRET', 'carbide-tls')
-
-      if @cmd.run!('kubectl', '-n', ns, 'get', "secret/#{secret}").success?
-        log "TLS secret #{ns}/#{secret} already present — reusing (delete it to regenerate)"
-        ensure_tls_store(ns, secret)
-        return
-      end
-
-      unless system('command -v mkcert >/dev/null 2>&1')
-        abort <<~ERR
-          \e[1;31mxx mkcert not found.\e[0m It is required to mint a locally-trusted TLS
-          cert for the ingress. Without a trusted cert the dashboard loads after a
-          browser click-through, but the IDE WebSocket (wss://) silently fails.
-
-          Install mkcert, then re-run this script:
-            # Debian/Ubuntu
-            sudo apt-get install -y libnss3-tools
-            curl -JLO "https://dl.filippo.io/mkcert/latest?for=linux/amd64"
-            chmod +x mkcert-v*-linux-amd64 && sudo mv mkcert-v*-linux-amd64 /usr/local/bin/mkcert
-            mkcert -install
-
-          Alternatives:
-            - bring a real CA-signed cert: ./scripts/deploy.rb --csr  then
-              ./scripts/deploy.rb --import-cert <signed.crt>, or
-            - set TLS_SECRET to an existing kubernetes TLS secret in the
-              '#{ns}' namespace to skip mkcert, or
-            - re-run with --no-tls to leave Traefik on its (untrusted) default cert.
-        ERR
-      end
-
-      hosts = tls_hosts
-      log "minting locally-trusted cert via mkcert for: #{hosts.join(' ')}"
-      Dir.mktmpdir do |dir|
-        crt = File.join(dir, 'tls.crt')
-        key = File.join(dir, 'tls.key')
-        @cmd.run('mkcert', '-cert-file', crt, '-key-file', key, *hosts)
-        @cmd.run('kubectl', '-n', ns, 'create', 'secret', 'tls', secret,
-                 "--cert=#{crt}", "--key=#{key}")
-      end
-      ensure_tls_store(ns, secret)
+    # When every SHA tag is already in the registry there's nothing to build —
+    # immutable tags mean identical content, so skip the (slow) build entirely.
+    def skip_build?
+      skip = @images.all_present?
+      log "all image tags already in registry #{@registry_host}:#{@registry_port} — skipping build" if skip
+      skip
     end
 
-    # Tell the operator how to trust the signing CA on whatever machine runs the
-    # browser — the ONE manual step wss:// needs. We export the public root next
-    # to the repo as carbide-rootCA.pem (friendlier than mkcert's internal
-    # rootCA.pem) so it's easy to copy/import. The browser machine is NOT
-    # necessarily this host (someone on Windows/macOS/another Linux box may be
-    # reaching the deploy by hostname), so we print steps for every platform
-    # rather than guessing from the deploy host's OS. Called dead-last in run().
-    def trust_ca_instructions
-      caroot, = @cmd.run!('mkcert', '-CAROOT')
-      caroot = (caroot || '').strip
-      src = File.join(caroot, 'rootCA.pem')
-      dest = File.expand_path('carbide-rootCA.pem', @root)
-      FileUtils.cp(src, dest) if File.exist?(src)
+    def ensure_registry = @images.ensure_registry
 
-      warn_ 'LAST STEP — trust the carbide root CA on the machine running your browser,'
-      warn_ 'or the IDE WebSocket (wss://) silently fails even though the page loads.'
-      warn_ "  root CA exported to: #{dest}"
-      warn_ '  copy it to the browser machine (e.g. scp), then import for that OS:'
-      warn_ ''
-      warn_ '  Windows (Chromium/Edge use the Windows store; no admin needed):'
-      warn_ '    certutil.exe -addstore -user -f Root carbide-rootCA.pem'
-      if wsl?
-        warn_ "    WSL: copy it across first — cp '#{dest}' /mnt/c/Users/Public/carbide-rootCA.pem"
-        warn_ '         then run the certutil line above on C:\\Users\\Public\\carbide-rootCA.pem'
-      end
-      warn_ '    Firefox keeps its own store: Settings > Privacy & Security > Certificates > Import.'
-      warn_ ''
-      warn_ '  Linux (system trust — curl/node/etc.):'
-      warn_ '    sudo cp carbide-rootCA.pem /usr/local/share/ca-certificates/carbide-rootCA.crt'
-      warn_ '    sudo update-ca-certificates'
-      warn_ '    Chrome/Chromium (NSS): certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n carbide -i carbide-rootCA.pem'
-      warn_ ''
-      warn_ '  macOS:'
-      warn_ '    sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain carbide-rootCA.pem'
-    end
-
-    # True when running under WSL — the browser then lives on the Windows host,
-    # so the CA must be trusted in Windows, not this Linux userland.
-    def wsl?
-      @wsl ||= File.exist?('/proc/version') &&
-               File.read('/proc/version').match?(/microsoft/i)
-    end
-
-    # The TLSStore named 'default' in Traefik's namespace is the cert Traefik
-    # serves whenever an IngressRoute's tls block names no explicit secret.
-    def ensure_tls_store(ns, secret)
-      store = <<~YAML
-        apiVersion: traefik.io/v1alpha1
-        kind: TLSStore
-        metadata:
-          name: default
-          namespace: #{ns}
-        spec:
-          defaultCertificate:
-            secretName: #{secret}
-      YAML
-      Tempfile.create(['tlsstore', '.yaml']) do |f|
-        f.write(store)
-        f.flush
-        @cmd.run('kubectl', 'apply', '-f', f.path)
-      end
-    end
-
-    # Hostnames/IPs the cert is valid for. Override with TLS_HOSTS="a b c";
-    # otherwise auto-detect this host's FQDN, short name, and IPs plus loopback.
-    def tls_hosts
-      return ENV['TLS_HOSTS'].split if ENV['TLS_HOSTS'] && !ENV['TLS_HOSTS'].strip.empty?
-
-      hosts = %w[localhost 127.0.0.1 ::1]
-      hosts << @public_host unless @public_host.empty?
-      %w[-f -s].each do |flag|
-        out, = @cmd.run!('hostname', flag)
-        v = (out || '').strip
-        hosts << v unless v.empty?
-      end
-      ips, = @cmd.run!('hostname', '-I')
-      hosts.concat((ips || '').strip.split)
-      hosts.uniq
-    end
-
-    # --- bring-your-own-CA cert flow -------------------------------------------
-    # For a real cert (internal/corporate CA, public ACME-portal, etc.) you don't
-    # want a locally-trusted mkcert cert — you want a CSR your CA can sign. These
-    # two steps bracket the CA and exit without touching the build pipeline.
-
-    # Where --csr writes the key/CSR and where --import-cert looks for the key.
-    def csr_dir = File.expand_path(ENV.fetch('TLS_OUT_DIR', 'tls'))
-
-    # Pick the cert CN: prefer an explicit FQDN (PUBLIC_HOST or a dotted SAN),
-    # falling back to the first host so the file naming stays predictable.
-    def csr_common_name(hosts)
-      return @public_host unless @public_host.empty? || @public_host == 'localhost'
-
-      hosts.find { |h| h.include?('.') && !h.match?(/\A[0-9.]+\z/) } || hosts.first
-    end
-
-    def dns_san?(host) = !host.include?(':') && !host.match?(/\A[0-9.]+\z/)
-
-    def openssl_csr_config(cn, hosts)
-      sans = hosts.each_with_index
-                  .map { |h, i| "#{dns_san?(h) ? 'DNS' : 'IP'}.#{i + 1} = #{h}" }
-                  .join("\n")
-      <<~CNF
-        [req]
-        distinguished_name = dn
-        req_extensions = v3_req
-        prompt = no
-        [dn]
-        CN = #{cn}
-        [v3_req]
-        basicConstraints = CA:FALSE
-        keyUsage = digitalSignature, keyEncipherment
-        extendedKeyUsage = serverAuth
-        subjectAltName = @alt
-        [alt]
-        #{sans}
-      CNF
-    end
-
-    def generate_csr
-      unless system('command -v openssl >/dev/null 2>&1')
-        abort "\e[1;31mxx\e[0m openssl not found — required to generate a CSR."
-      end
-
-      hosts = tls_hosts
-      cn    = csr_common_name(hosts)
-      FileUtils.mkdir_p(csr_dir)
-      key = File.join(csr_dir, "#{cn}.key")
-      csr = File.join(csr_dir, "#{cn}.csr")
-      log "generating RSA key + CSR for CN=#{cn}"
-      log "  SANs: #{hosts.join(' ')}"
-      Tempfile.create(['csr', '.cnf']) do |cfg|
-        cfg.write(openssl_csr_config(cn, hosts))
-        cfg.flush
-        @cmd.run('openssl', 'req', '-new', '-newkey', 'rsa:2048', '-nodes',
-                 '-keyout', key, '-out', csr, '-config', cfg.path)
-      end
-      File.chmod(0o600, key)
-      puts <<~MSG
-
-        \e[1;32mCSR written.\e[0m Keep the key private; submit the CSR to your CA.
-          key: #{key}   (private — do not share)
-          csr: #{csr}
-
-        When your CA returns the signed certificate (PEM), import it:
-          ./scripts/deploy.rb --import-cert #{csr.sub(/\.csr\z/, '.crt')}
-
-        If the CA gives you a chain, concatenate the leaf + intermediates into
-        that .crt (leaf first) before importing.
-      MSG
-    end
-
-    def import_cert
-      unless system('command -v kubectl >/dev/null 2>&1')
-        abort "\e[1;31mxx\e[0m kubectl not found — required to import the cert."
-      end
-
-      ns     = ENV.fetch('TRAEFIK_NS', 'traefik')
-      secret = ENV.fetch('TLS_SECRET', 'carbide-tls')
-      crt    = File.expand_path(@opts[:import_cert])
-      abort "\e[1;31mxx\e[0m cert not found: #{crt}" unless File.file?(crt)
-
-      key = @opts[:key] ? File.expand_path(@opts[:key]) : default_csr_key
-      unless key && File.file?(key)
-        abort "\e[1;31mxx\e[0m private key not found. Pass --key PATH (or run " \
-              "--csr first so the key lives in #{csr_dir})."
-      end
-
-      log "importing cert into secret #{ns}/#{secret}"
-      log "  cert: #{crt}"
-      log "  key:  #{key}"
-      # Recreate so a re-import replaces an older cert rather than failing on AlreadyExists.
-      @cmd.run!('kubectl', '-n', ns, 'delete', 'secret', secret, '--ignore-not-found')
-      @cmd.run('kubectl', '-n', ns, 'create', 'secret', 'tls', secret,
-               "--cert=#{crt}", "--key=#{key}")
-      ensure_tls_store(ns, secret)
-      puts <<~MSG
-
-        \e[1;32mCert imported.\e[0m Traefik now serves #{ns}/#{secret} as its default cert.
-        Run ./scripts/deploy.rb (it reuses an existing TLS_SECRET) or, if the
-        stack is already up, the new cert is live immediately.
-      MSG
-    end
-
-    # The single .key left in TLS_OUT_DIR by --csr, when --key isn't given.
-    def default_csr_key
-      keys = Dir.glob(File.join(csr_dir, '*.key'))
-      keys.first if keys.size == 1
-    end
-
-    def apply_crd
-      log "applying Workspace CRD"
-      @cmd.run('kubectl', 'apply', '-f', File.join(@control, 'deploy', 'crd-workspace.yaml'))
-      @cmd.run('kubectl', 'wait', '--for=condition=established',
-               'crd/workspaces.carbide.dev', '--timeout=60s')
-    end
-
-    def install_control_plane
-      log "installing/upgrading control-plane release '#{@release}' in ns '#{@control_ns}'"
-      @cmd.run('helm', 'upgrade', '--install', @release,
-               File.join(@control, 'charts', 'control-plane'),
-               '--namespace', @control_ns, '--create-namespace',
-               '--set', "ingress.publicPort=#{@http_port}",
-               '--set', "ingress.publicHttpsPort=#{@https_port}",
-               '--set', "publicUrlBase=#{@public_url}",
-               '--set-json', 'ingress.entryPoints=["web","websecure"]',
-               '--set-json', 'ingress.tls={}',
-               '--wait', '--timeout', '5m')
-    end
-
-    def roll_deployments
-      if @roll_scope == 'none'
-        log "roll-scope=none — skipping deployment rollouts"
-        return
-      end
-
-      # helm upgrade is a no-op for the pod spec when only image *contents* change
-      # (same tag), so force a rollout to pull the freshly-imported images.
-      log "rolling control-plane Deployments to pick up new images"
-      %w[control-plane-rails control-plane-operator].each do |dep|
-        @cmd.run('kubectl', '-n', @control_ns, 'rollout', 'restart', "deploy/#{dep}")
-        @cmd.run('kubectl', '-n', @control_ns, 'rollout', 'status', "deploy/#{dep}", '--timeout=5m')
-      end
-
-      if @roll_scope == 'control'
-        log "roll-scope=control — leaving workspace deployments (and live terminals) untouched"
-        return
-      end
-
-      # Roll any existing workspace deployments so re-deploys refresh them too.
-      workspace_namespaces.each do |ns|
-        next unless @cmd.run!('kubectl', '-n', ns, 'get', "deploy/#{ns}").success?
-
-        log "rolling workspace deployment #{ns}"
-        @cmd.run('kubectl', '-n', ns, 'rollout', 'restart', "deploy/#{ns}")
-
-        # Delete orphaned per-project shell pods. The worker spawns these as
-        # bare pods (restartPolicy: Never, no controller), so the deployment
-        # rollout above does NOT recreate them. After a same-tag image
-        # re-import they keep running stale code, and any that were stuck in
-        # ImagePullBackOff (e.g. spawned before the image was imported) stay
-        # wedged in an exponential back-off forever — which makes terminal
-        # creation hang until the client times out. Restarting the worker
-        # wipes its in-memory pod map, so these are already orphaned; delete
-        # them here and the restarted worker respawns each one fresh against
-        # the freshly-imported image on the next terminal create.
-        @cmd.run('kubectl', '-n', ns, 'delete', 'pod',
-                 '-l', 'app.kubernetes.io/name=carbide2-shell',
-                 '--ignore-not-found')
-      end
-    end
-
-    def workspace_namespaces
-      out, = @cmd.run!('kubectl', 'get', 'ns', '-o', 'name')
-      (out || '').lines.map { |l| l.strip.sub('namespace/', '') }
-                 .select { |n| n.match?(/\Aws-\d+\z/) }
+    # --role join: add THIS host to an existing cluster as a control-plane
+    # server, then stop. Node-level only — the shared cluster already has the
+    # images, infra, and control plane, so nothing is built or helm-installed.
+    def join_run
+      @node.join!
     end
 
     def verify
@@ -729,7 +583,7 @@ module Carbide
       log "  http://localhost:#{@http_port}/   -> #{http} (expect 301/308 redirect)"
       log "  https://localhost:#{@https_port}/ -> #{https} (expect 200)"
 
-      status = KubeStatus.new(control_ns: @control_ns)
+      status = KubeStatus.new(control_ns: @control_ns, kubeconfig: @kubeconfig)
       return unless status.available?
 
       pods = status.control_pods
@@ -763,36 +617,50 @@ module Carbide
           kubectl -n #{@control_ns} get pods,ingressroute
           helm -n #{@control_ns} get values #{@release}
 
-        Re-run this script any time to rebuild + redeploy. Flags:
-          --ref REF          meta branch/ref to deploy (default main; e.g. --ref dev)
-          --no-pull          skip self-update (git pull + submodule update)
-          --no-build         skip image build (just re-import + redeploy)
-          --no-infra         skip cluster/infra bring-up
-          --no-tls           skip mkcert TLS setup (leave Traefik default cert)
-          --roll-scope all   roll everything (default; coherent but drops terminals)
-          --roll-scope control   roll control-plane only (keeps project terminals alive)
-          --roll-scope none      skip rollouts (helm/CRD changes only)
+        Re-run this script any time to rebuild + redeploy. Common flags
+        (every --a.b.c flag sets the a.b.c config key; --help lists them all):
+          --ref REF                meta branch/ref to deploy (default main; e.g. --ref dev)
+          --cluster.backend k3s    local k8s backend: k3d (default) or k3s (host-native)
+          --storage.backend longhorn  replicated RWO storage for multi-node (default local-path)
+          --registry.host H        push SHA-tagged images to a self-hosted registry at H
+                                   (multi-node: nodes pull from it; needs the CA trusted
+                                   per node via scripts/setmeup.sh --registry-host)
+          --no-pull                skip self-update (git pull + submodule update)
+          --no-build               skip image build (just re-import + redeploy)
+          --no-client              skip building + uploading the pinned SPA client
+          --no-infra               skip cluster/infra bring-up
+          --no-tls                 skip mkcert TLS setup (leave Traefik default cert)
+          --roll-scope all         roll everything (default; coherent but drops terminals)
+          --roll-scope control     roll control-plane only (keeps project terminals alive)
+          --roll-scope none        skip rollouts (helm/CRD changes only)
+          --config FILE            merge a YAML config over the defaults (before CLI flags)
+          --yaml-out FILE          FREEZE: write the fully-resolved config (secrets included) + exit; does NOT deploy. Deploy from it with --config FILE
+          --yaml-safeout FILE      like --yaml-out but redact secrets (not usable by joiners); then exit
       MSG
     end
   end
 end
 
-opts = { no_build: false, no_infra: false, no_tls: false, no_pull: false, csr: false, import_cert: nil, key: nil, roll_scope: nil, public_host: nil, ref: nil }
-OptionParser.new do |o|
-  o.banner = 'Usage: deploy.rb [--ref REF] [--no-pull] [--no-build] [--no-shell] [--no-infra] [--no-tls] [--roll-scope SCOPE] [--csr | --import-cert FILE]'
-  o.on('--ref REF', 'Meta-repo branch/ref to deploy (default: main; DEPLOY_REF env). Checked out + fast-forwarded before build') { |v| opts[:ref] = v }
-  o.on('--no-pull',  'Skip self-update (git pull + submodule update before deploy)') { opts[:no_pull] = true }
-  o.on('--no-build', 'Skip image build (just re-import + redeploy)') { opts[:no_build] = true }
-  o.on('--no-shell', 'Skip rebuilding the carbide2-shell image (reuse existing carbide2-shell:dev)') { opts[:no_shell] = true }
-  o.on('--no-infra', 'Skip cluster/infra bring-up')                  { opts[:no_infra] = true }
-  o.on('--no-tls',   'Skip mkcert TLS setup (Traefik default cert)')  { opts[:no_tls] = true }
-  o.on('--public-host HOST', 'Browser-facing FQDN for ingress/cert/host-auth (default: hostname -f; localhost only for same-machine)') { |v| opts[:public_host] = v }
-  o.on('--roll-scope SCOPE', %w[all control none],
-       'Which deployments to roll: all (default), control, none') { |v| opts[:roll_scope] = v }
-  o.on('--csr', 'Generate a private key + CSR (TLS_HOSTS/PUBLIC_HOST) in TLS_OUT_DIR, then exit') { opts[:csr] = true }
-  o.on('--import-cert FILE', 'Load a CA-signed cert into TLS_SECRET as Traefik default, then exit') { |v| opts[:import_cert] = v }
-  o.on('--key FILE', 'Private key for --import-cert (default: the .key from --csr in TLS_OUT_DIR)') { |v| opts[:key] = v }
-  o.on('-h', '--help', 'Show this help') { puts o; exit 0 }
-end.parse!(ARGV)
+# Configuration = defaults.yaml -> --config input.yaml -> CLI flags (last wins).
+# Each module contributes its own option specs; Config aggregates them so this
+# file never grows a monster parser. Every --a.b.c flag maps to the a.b.c key.
+specs = [
+  Carbide::Deploy,
+  Carbide::Cluster,
+  Carbide::Node,
+  Carbide::Storage,
+  Carbide::Tls,
+  Carbide::Images,
+  Carbide::ControlPlane
+].flat_map(&:options)
 
-Carbide::Deploy.new(opts).run
+# OptionParser#parse! mutates (empties) ARGV, so snapshot the original args now —
+# self_update re-execs with them when a pull changes deploy.rb.
+ORIGINAL_ARGV = ARGV.dup
+
+config = Carbide::Config.new(
+  defaults_path: File.expand_path('defaults.yaml', __dir__),
+  specs: specs
+).parse!(ARGV)
+
+Carbide::Deploy.new(config).run

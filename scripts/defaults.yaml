@@ -1,0 +1,70 @@
+# defaults.yaml — the single source of deploy.rb defaults.
+#
+# Every default lives here (no implicit defaults scattered through the Ruby).
+# deploy.rb merges this with an optional --config input.yaml and then CLI flags
+# (--a.b.c sets the a.b.c key). Emit the fully-resolved set with
+#   ./scripts/deploy.rb --yaml-out cluster.yaml         (secrets included)
+#   ./scripts/deploy.rb --yaml-safeout cluster.safe.yaml (secrets redacted)
+# A "" value means "unset / auto-detect" for that optional knob.
+
+# --- orchestration toggles ---------------------------------------------------
+ref: main            # meta-repo branch/ref to check out + fast-forward before build
+build: true          # build the container images
+shell: true          # include the carbide2-shell image in the build
+client: true         # build + upload the pinned SPA client to the MinIO static tier
+infra: true          # bring the cluster + infra up
+tls: true            # mkcert TLS setup for the ingress
+pull: true           # self-update (git pull + submodule update) before deploying
+roll-scope: all      # which deployments to roll after deploy: all | control | none
+
+# One-shot cert actions (normally unset; set via CLI for a single run).
+csr: false           # generate key + CSR, then exit
+import-cert: ''       # path to a CA-signed cert to load as the Traefik default, then exit
+key: ''               # private key for import-cert (default: the .key from --csr)
+
+kubeconfig: '~/.kube/config'   # read by the verify step (kubeclient)
+
+# --- local Kubernetes backend ------------------------------------------------
+cluster:
+  backend: k3d       # k3d (k3s-in-Docker) | k3s (host-native)
+  name: carbide-dev
+  http-port: ''      # "" => backend default (k3d 8080 / k3s 80)
+  https-port: ''     # "" => backend default (k3d 8443 / k3s 443)
+  # Multi-node k3s (host-native only). Every node consumes the same emitted YAML:
+  # the first runs --role init (mints token if blank); the rest --role join.
+  role: init         # init (first server) | join (additional control-plane server)
+  server-url: ''     # https://<first-node>:6443 — join: required; init: extra API-cert SAN
+  token: ''          # k3s shared join secret; init mints one if blank. SECRET.
+
+# --- control plane -----------------------------------------------------------
+control:
+  namespace: carbide-system
+  release: carbide-control
+
+# --- self-hosted image registry (multi-node) ---------------------------------
+registry:
+  host: ''           # "" => single-node containerd import (:dev tags); set => push SHA tags
+  port: '5000'
+  ca: ''             # inline PEM of an externally-run registry's CA (--registry.ca-file to load)
+  container: carbide-registry
+  publish-only: false   # build + push images then exit (dedicated build/registry host)
+  external: false       # this node pulls from a registry run elsewhere (skip local registry + build)
+
+# --- browser-facing endpoint -------------------------------------------------
+public:
+  host: ''           # browser FQDN for ingress/cert/host-auth ("" => hostname -f)
+  url: ''            # explicit full URL base (wins over host)
+
+# --- ingress TLS -------------------------------------------------------------
+tls-opts:
+  traefik-ns: traefik
+  secret: carbide-tls
+  hosts: ''          # space-separated SAN list ("" => auto-detect FQDN/short/IPs)
+  out-dir: tls       # where --csr writes the key/CSR and --import-cert looks for the key
+
+# --- persistent storage backend ----------------------------------------------
+storage:
+  backend: local-path   # local-path (node-local, single-node) | longhorn (replicated RWO, multi-node)
+  longhorn:
+    version: 1.7.2      # "" => chart latest
+    replicas: ''        # "" => Longhorn default (3); set to node count on small clusters

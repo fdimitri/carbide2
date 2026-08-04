@@ -1,0 +1,17 @@
+# examples/k3d-local.yaml — single-node dev on k3d with node-local storage.
+#
+# This is the zero-config baseline: every value here already matches
+# defaults.yaml, so `./scripts/deploy.rb` with no flags does the same thing.
+# It exists as the explicit, copyable starting point for the other examples.
+#
+#   ./scripts/deploy.rb --config examples/k3d-local.yaml
+#
+# k3d publishes the ingress on host 8080/8443 (-> Traefik 80/443). Storage is
+# local-path (hostPath): fine for one node, NOT durable if a pod reschedules to
+# another node — which never happens on a single-node cluster.
+
+cluster:
+  backend: k3d
+
+storage:
+  backend: local-path

@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# c2r-rmclient — delete one or more client SPA builds from the cluster's MinIO
+# `clients` bucket and regenerate the registry.json index so the loaders and
+# picker stop offering them.
+#
+# It talks to whatever cluster your kubectl currently points at — so make sure
+# `kubectl config current-context` is the cluster you mean before running.
+# Use c2r-lsclient first to see what's there.
+#
+# Usage:
+#   c2r-rmclient <family> <sha> [<sha> ...]     # delete these builds of <family>
+#   c2r-rmclient -y <family> <sha>              # skip the confirmation prompt
+#
+#   <family> is carbide2-client (workspace) or carbide2-control (dashboard).
+#   <sha> is the 12-char build id as shown by c2r-lsclient (exact match).
+#
+# Env (same as c2r-lsclient):
+#   CARBIDE_MINIO_NS     (default carbide-system)   namespace of the MinIO svc
+#   CARBIDE_MINIO_SVC    (default minio)            MinIO service name
+#   CARBIDE_MINIO_SECRET (default minio-credentials) secret with root creds
+#   CARBIDE_MC           path to the MinIO client (Debian's `mc` is Midnight
+#                        Commander, NOT this — install `mcli` or set CARBIDE_MC)
+set -euo pipefail
+
+NS="${CARBIDE_MINIO_NS:-carbide-system}"
+SVC="${CARBIDE_MINIO_SVC:-minio}"
+SECRET="${CARBIDE_MINIO_SECRET:-minio-credentials}"
+ASSUME_YES=0
+
+die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+
+usage() {
+  sed -n '2,/^set -euo/p' "$0" | sed -e '/^set -euo/d' -e 's/^# \{0,1\}//'
+}
+
+FAMILY=""
+SHAS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -y|--yes) ASSUME_YES=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) die "unknown arg: $1 (see --help)" ;;
+    *)
+      if [ -z "$FAMILY" ]; then FAMILY="$1"; else SHAS+=("$1"); fi
+      shift ;;
+  esac
+done
+
+[ -n "$FAMILY" ]     || die "need a family (carbide2-client | carbide2-control); see --help"
+[ "${#SHAS[@]}" -gt 0 ] || die "need at least one <sha> to delete; see --help"
+case "$FAMILY" in
+  carbide2-client|carbide2-control) : ;;
+  *) die "unexpected family '$FAMILY' (want carbide2-client or carbide2-control)" ;;
+esac
+
+command -v kubectl >/dev/null || die "kubectl not found"
+command -v jq      >/dev/null || die "jq not found"
+
+# Resolve the MinIO client, verifying each candidate really is it (its --version
+# mentions "minio") so we never mistake GNU Midnight Commander's `mc` for it.
+is_minio_mc() { command -v "$1" >/dev/null 2>&1 && "$1" --version 2>&1 | grep -qi minio; }
+MC=""
+for cand in "${CARBIDE_MC:-}" mcli mc "$HOME/.local/bin/mcli"; do
+  [ -n "$cand" ] || continue
+  if is_minio_mc "$cand"; then MC="$cand"; break; fi
+done
+[ -n "$MC" ] || die "MinIO client not found (tried mcli, mc). Install it or set CARBIDE_MC."
+
+CTX="$(kubectl config current-context 2>/dev/null || echo '?')"
+echo "About to DELETE from cluster '$CTX', bucket clients/, family $FAMILY:"
+for s in "${SHAS[@]}"; do echo "  - $FAMILY/$s"; done
+if [ "$ASSUME_YES" -ne 1 ]; then
+  printf 'Proceed? [y/N] '
+  read -r ans
+  case "$ans" in y|Y|yes|YES) : ;; *) die "aborted" ;; esac
+fi
+
+U="$(kubectl -n "$NS" get secret "$SECRET" -o jsonpath='{.data.root-user}'     | base64 -d)"
+P="$(kubectl -n "$NS" get secret "$SECRET" -o jsonpath='{.data.root-password}' | base64 -d)"
+[ -n "$U" ] && [ -n "$P" ] || die "could not read $SECRET in ns/$NS"
+
+WORK="$(mktemp -d /tmp/c2r-rmclient.XXXXXX)"
+PF_PID=""
+cleanup() {
+  [ -n "$PF_PID" ] && kill "$PF_PID" >/dev/null 2>&1 || true
+  rm -rf "$WORK" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# Let kubectl pick a free local port (":9000"), then read it back from the log —
+# avoids colliding with a build-client/c2r-lsclient port-forward on :9000.
+PFLOG="$WORK/pf.log"
+kubectl -n "$NS" port-forward "svc/$SVC" :9000 >"$PFLOG" 2>&1 &
+PF_PID=$!
+
+LPORT=""
+for _ in $(seq 1 50); do
+  LPORT="$(sed -n 's/.*Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 9000.*/\1/p' "$PFLOG" | head -1)"
+  [ -n "$LPORT" ] && break
+  kill -0 "$PF_PID" 2>/dev/null || die "port-forward died: $(cat "$PFLOG")"
+  sleep 0.2
+done
+[ -n "$LPORT" ] || die "port-forward never became ready: $(cat "$PFLOG")"
+
+MC_CFG="$WORK/.mc"
+mc_run() { "$MC" --config-dir "$MC_CFG" "$@"; }
+mc_run alias set t "http://127.0.0.1:$LPORT" "$U" "$P" >/dev/null || die "mc alias set failed"
+
+for s in "${SHAS[@]}"; do
+  log "deleting clients/$FAMILY/$s/"
+  mc_run rm --recursive --force "t/clients/$FAMILY/$s/" || die "failed to delete $FAMILY/$s"
+done
+
+# Regenerate the registry index exactly as build-client does (authoritative,
+# self-healing): list every remaining manifest.json and aggregate with jq,
+# newest-first by commit_time (git commit date), falling back to build_time.
+log "regenerating clients/registry.json index"
+manifest_keys="$(mc_run --json ls --recursive t/clients/ \
+  | jq -r 'select(.key | endswith("manifest.json")) | .key')"
+
+registry_tmp="$WORK/registry.json"
+if [ -n "$manifest_keys" ]; then
+  # shellcheck disable=SC2086
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    mc_run cat "t/clients/$key"
+  done <<< "$manifest_keys" \
+    | jq -s '{
+        generated: (now | todateiso8601),
+        families: (
+          group_by(.family)
+          | map({ (.[0].family): (sort_by(.commit_time // .build_time) | reverse) })
+          | add
+        )
+      }' > "$registry_tmp"
+else
+  printf '{"generated":"%s","families":{}}' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$registry_tmp"
+fi
+
+mc_run cp "$registry_tmp" "t/clients/registry.json" >/dev/null
+log "done — deleted ${#SHAS[@]} build(s) from $FAMILY; registry.json regenerated"

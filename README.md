@@ -132,7 +132,7 @@ your browser will warn the first time). The seed user is
 
 > `./scripts/build-all.sh` only builds images; `./scripts/deploy.rb` is what
 > actually puts the stack on the cluster. Running `build-all.sh` plus the
-> infra-only `carbide2-server/scripts/dev-cluster.sh` leaves Traefik up with
+> infra-only `carbide2-server/scripts/dev-cluster-k3d.sh` leaves Traefik up with
 > no routes — every URL 404s until the control plane is deployed.
 
 ## Licence
