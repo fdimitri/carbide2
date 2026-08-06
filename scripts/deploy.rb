@@ -401,7 +401,11 @@ module Carbide
     # confusing "Blocked hosts" 403s when the box was reached by its LAN name.
     def resolve_public_endpoint
       if (url = @config.present('public.url'))
-        host = url.sub(%r{\A[a-zA-Z]+://}, '').sub(/:\d+\z/, '')
+        host = url.sub(%r{\A[a-zA-Z]+://}, '').sub(%r{/.*\z}m, '').sub(/:\d+\z/, '')
+        unless valid_public_host?(host)
+          abort "\e[1;31mxx\e[0m public.url #{url.inspect} does not contain a usable hostname " \
+                "(got #{host.inspect}). Expected something like https://host.example.com/."
+        end
         return [host, url]
       end
       host = @config.present('public.host')
