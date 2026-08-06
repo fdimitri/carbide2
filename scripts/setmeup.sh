@@ -5,32 +5,37 @@
 # intervention. Other Debian-family releases will probably work but are
 # UNTESTED — the script warns and continues if --force is given.
 #
-# What it installs:
-#   ESSENTIAL (always, unless already present):
+# What it installs (anything already present at the pinned version is skipped):
+#   ALWAYS — no flag turns these off:
 #     - apt build/runtime deps (build-essential, libpq-dev, libssl-dev, …)
 #     - Docker engine + buildx + compose v2  (Ubuntu's docker.io + plugin pkgs)
 #     - kubectl, helm                         (pinned upstream releases)
-#     - k3d                                    (default backend; k3s-in-Docker.
-#                                              Skipped with --kube-backend=k3s,
-#                                              where deploy.rb (Carbide::Node)
-#                                              installs host-native k3s at deploy
-#                                              time)
 #     - rbenv + ruby-build + Ruby + bundler   (to run deploy.rb under a writable
 #                                              gem dir; deploy.rb re-execs here)
+#   DEPENDS ON THE CHOSEN BACKEND:
+#     - k3d                                   (k3s-in-Docker) is installed ONLY
+#                                              for the k3d backend. Choosing k3s
+#                                              (--k3s / --kube-backend=k3s) skips
+#                                              it entirely and installs nothing
+#                                              extra here — deploy.rb
+#                                              (Carbide::Node) puts host-native
+#                                              k3s down at deploy time.
+#   ON BY DEFAULT — negatable:
 #     - mkcert (+ libnss3-tools)              (locally-trusted TLS certs so wss://
-#                                              works; skip with --no-mkcert)
-#     - MinIO client as 'mcli'                 (build-client uploads SPA builds to
+#                                              works; --no-mkcert skips)
+#     - MinIO client as 'mcli'                (build-client uploads SPA builds to
 #                                              the MinIO static tier; installed as
 #                                              'mcli' because Debian's 'mc' package
-#                                              is Midnight Commander. --no-minio-client
-#                                              skips)
-#   OPTIONAL (behind flags):
+#                                              is Midnight Commander;
+#                                              --no-minio-client skips)
+#   OFF BY DEFAULT — behind flags:
 #     --node       Node.js 20 (Vite client build outside containers + Playwright)
 #     --socat      socat      (host LM Studio relay for local LLM agents)
-#     --no-mkcert  skip the default mkcert install (bring your own TLS / --no-tls)
-#     --no-minio-client  skip the default MinIO client (mcli) install
-#     --kube-backend=k3s  provision for host-native k3s instead of k3d (skips the
-#                  k3d install; k3s itself is installed by deploy.rb at run time)
+#
+# Other flags:
+#     --k3d / --k3s / --kube-backend=k3d|k3s   pick the backend up front. With
+#                  none of them the script asks before it installs anything, and
+#                  falls back to k3d if there is no TTY to ask on.
 #     --registry-host=HOST  trust a self-hosted registry on THIS node so docker
 #                  (build/push) and curl reach it over TLS: installs the registry
 #                  CA into the OS trust store. The k3s CONTAINERD trust is done at
@@ -38,11 +43,15 @@
 #                  config. Pair with --registry-ca=PATH
 #                  (default ./carbide-rootCA.pem, exported by deploy.rb) and
 #                  optionally --registry-port=PORT (default 5000).
-#     --all        all of the above optionals
+#     --all        turn on everything off-by-default (--node --socat); the two
+#                  on-by-default installs stay on. It does NOT touch the backend
+#                  choice.
 #
 # After this finishes (and you re-login for the docker group), the deploy is:
 #     git clone --recurse-submodules https://github.com/fdimitri/carbide2.git
 #     cd carbide2 && ./scripts/deploy.rb
+# deploy.rb defaults to k3d too, so a k3s host needs --cluster.backend k3s there
+# as well; the summary this script prints at the end spells out the right line.
 #
 # Idempotent: re-running skips anything already present at the pinned version.
 # Pinned versions are the ones verified on the reference box (Ubuntu 24.04.2).
@@ -66,11 +75,13 @@ WANT_SOCAT=0
 WANT_MKCERT=1
 WANT_MINIO_CLIENT=1
 FORCE=0
-# Which local Kubernetes backend to provision for. k3d (default) is k3s-in-Docker
-# and is installed here. k3s is host-native and is installed at deploy time by
-# deploy.rb (Carbide::Node, with the right --disable flags), so for k3s we just
-# skip the k3d binary and leave docker/kubectl/helm in place.
+# Which local Kubernetes backend to provision for; k3d here is only the fallback
+# for a non-interactive run, not an unconditional install. k3d is k3s-in-Docker
+# and its binary is installed by this script. k3s is host-native and is installed
+# at deploy time by deploy.rb (Carbide::Node, with the right --disable flags), so
+# for k3s we install no backend binary at all and leave docker/kubectl/helm in place.
 KUBE_BACKEND=k3d
+KUBE_BACKEND_SET=0
 # Optional self-hosted registry trust (see configure_registry_trust). Read from
 # env here so REGISTRY_HOST=... setmeup.sh works; flags below override.
 REGISTRY_HOST="${REGISTRY_HOST:-}"
@@ -84,9 +95,9 @@ for arg in "$@"; do
     --no-mkcert) WANT_MKCERT=0 ;;
     --minio-client)    WANT_MINIO_CLIENT=1 ;;
     --no-minio-client) WANT_MINIO_CLIENT=0 ;;
-    --kube-backend=*)  KUBE_BACKEND="${arg#*=}" ;;
-    --k3d)       KUBE_BACKEND=k3d ;;
-    --k3s)       KUBE_BACKEND=k3s ;;
+    --kube-backend=*)  KUBE_BACKEND="${arg#*=}"; KUBE_BACKEND_SET=1 ;;
+    --k3d)       KUBE_BACKEND=k3d; KUBE_BACKEND_SET=1 ;;
+    --k3s)       KUBE_BACKEND=k3s; KUBE_BACKEND_SET=1 ;;
     --registry-host=*) REGISTRY_HOST="${arg#*=}" ;;
     --registry-port=*) REGISTRY_PORT="${arg#*=}" ;;
     --registry-ca=*)   REGISTRY_CA="${arg#*=}" ;;
@@ -151,6 +162,27 @@ fi
 
 ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 [[ "$ARCH" == "amd64" ]] || warn "architecture is '$ARCH', not amd64 — pinned binaries below assume amd64 and may fail."
+
+# --- backend choice ---------------------------------------------------------
+# Asked here, before the first apt call, so the run is unattended after this.
+if [[ $KUBE_BACKEND_SET -eq 0 ]]; then
+  if [[ -t 0 ]]; then
+    echo
+    echo "Which Kubernetes backend should this host be provisioned for?"
+    echo "  1) k3d — k3s inside Docker. Disposable, single host, quickest to tear down."
+    echo "  2) k3s — host-native, installed by deploy.rb. Survives reboots, multi-node."
+    read -r -p "choice [1]: " reply
+    case "${reply:-1}" in
+      1|k3d) KUBE_BACKEND=k3d ;;
+      2|k3s) KUBE_BACKEND=k3s ;;
+      *) die "not a choice: $reply (pass --k3d or --k3s to skip this prompt)" ;;
+    esac
+    echo
+  else
+    warn "no TTY to ask on — defaulting to --kube-backend=$KUBE_BACKEND"
+  fi
+fi
+log "kube-backend: $KUBE_BACKEND"
 
 # ---------------------------------------------------------------------------
 # 1. apt packages (build/runtime deps + Docker + buildx + compose)
@@ -351,11 +383,13 @@ if have mcli && mcli --version 2>&1 | grep -qi minio; then
   printf '  %-9s %s\n' mcli "$(mcli --version 2>/dev/null | head -1)"
 fi
 
+DEPLOY_HINT="./scripts/deploy.rb"
+[[ "$KUBE_BACKEND" == "k3s" ]] && DEPLOY_HINT="./scripts/deploy.rb --cluster.backend k3s"
 cat <<EOF
 
 Next:
   git clone --recurse-submodules https://github.com/fdimitri/carbide2.git
-  cd carbide2 && ./scripts/deploy.rb
+  cd carbide2 && $DEPLOY_HINT
 
 EOF
 
