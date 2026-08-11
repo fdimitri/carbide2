@@ -38,8 +38,10 @@ module Carbide
   class Config
     # Leaf key names matching this are treated as secrets and redacted by
     # --yaml-safeout. Convention catches the common cases; SECRET_PATHS below
-    # covers anything the naming misses.
-    SECRET_NAME  = /token|secret|password|private[-_]?key|key[-_]?string/i
+    # covers anything the naming misses. A bare `secret` leaf is deliberately
+    # NOT here: it names a Kubernetes Secret (tls-opts.secret) rather than
+    # holding one. Keys that really do hold a credential carry secret: true.
+    SECRET_NAME  = /token|password|private[-_]?key|key[-_]?string/i
     # Explicit dotted paths to redact regardless of their leaf name.
     SECRET_PATHS = %w[].freeze
     REDACTED     = '<redacted>'
@@ -114,6 +116,7 @@ module Carbide
         o.on('--config PATH', 'Merge a YAML config over the defaults (before CLI flags)') { |v| @input_path = v }
         o.on('--yaml-out PATH', 'FREEZE the fully-resolved config (secrets included) to PATH and exit; does NOT deploy — deploy from it with --config PATH') { |v| @emit = [:full, v] }
         o.on('--yaml-safeout PATH', 'Like --yaml-out but redact secrets (not usable by joiners); then exit') { |v| @emit = [:safe, v] }
+        o.on('--schema-out PATH', 'Dump the option specs + resolved defaults as JSON to PATH and exit (drives scripts/configure.rb)') { |v| @emit = [:schema, v] }
         o.on('-h', '--help', 'Show this help') { puts o; exit 0 }
       end
     end
@@ -205,9 +208,25 @@ module Carbide
 
     def emit_and_exit!
       mode, path = @emit
+      return emit_schema_and_exit!(path) if mode == :schema
+
       out = mode == :safe ? redacted(@data) : @data
       File.write(File.expand_path(path), YAML.dump(out))
       warn "wrote #{mode == :safe ? 'redacted ' : ''}config to #{path}"
+      exit 0
+    end
+
+    # The specs ARE the UI schema: key, metavar, enum, negatable-ness and help
+    # text are everything a form needs. Emitting them keeps configure.rb from
+    # re-declaring knobs that already live next to the code that uses them.
+    # Values are NOT redacted: the form has to round-trip them, and a redacted
+    # placeholder would be written back as if it were the real setting.
+    def emit_schema_and_exit!(path)
+      require 'json'
+      payload = { 'specs' => @specs.map { |s| s.transform_keys(&:to_s) },
+                  'defaults' => @data }
+      File.write(File.expand_path(path), JSON.pretty_generate(payload))
+      warn "wrote option schema to #{path}"
       exit 0
     end
 
