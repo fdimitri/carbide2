@@ -390,6 +390,7 @@ module Carbide
       @token  = opts[:token]
       @ui_dir = resolve_ui_dir
       @vue    = resolve_vue
+      @vendor = resolve_vendor
       @runner = Runner.new(ROOT)
     end
 
@@ -461,6 +462,26 @@ module Carbide
       File.exist?(local) ? local : nil
     end
 
+    # deploy.rb's output is ANSI, so the log pane is an xterm.js terminal. Same
+    # local-then-CDN deal as Vue.
+    VENDOR = {
+      'xterm.js' => ['node_modules/@xterm/xterm/lib/xterm.mjs',
+                     'https://unpkg.com/@xterm/xterm@6/lib/xterm.mjs', 'text/javascript'],
+      'xterm.css' => ['node_modules/@xterm/xterm/css/xterm.css',
+                      'https://unpkg.com/@xterm/xterm@6/css/xterm.css', 'text/css'],
+      'xterm-addon-fit.js' => ['node_modules/@xterm/addon-fit/lib/addon-fit.mjs',
+                               'https://unpkg.com/@xterm/addon-fit@0.11/lib/addon-fit.mjs',
+                               'text/javascript']
+    }.freeze
+
+    def resolve_vendor
+      base = File.expand_path('../..', @ui_dir)
+      VENDOR.each_with_object({}) do |(name, (rel, _cdn, _type)), out|
+        path = File.join(base, rel)
+        out[name] = path if File.exist?(path)
+      end
+    end
+
     def webrick_options
       opts = {
         BindAddress: @opts[:bind], Port: @opts[:port],
@@ -477,6 +498,9 @@ module Carbide
       server.mount_proc('/styles.css')      { |req, res| guard(req, res) { static(res, 'styles.css', 'text/css') } }
       server.mount_proc('/tokens.css')      { |req, res| guard(req, res) { tokens(res) } }
       server.mount_proc('/vendor/vue.js')   { |req, res| guard(req, res) { vue(res) } }
+      VENDOR.each_key do |name|
+        server.mount_proc("/vendor/#{name}") { |req, res| guard(req, res) { vendor(res, name) } }
+      end
       server.mount_proc('/api/preflight')   { |req, res| guard(req, res) { json(res, Preflight.all) } }
       server.mount_proc('/api/schema')      { |req, res| guard(req, res) { json(res, @schema || { 'specs' => [], 'defaults' => {} }) } }
       server.mount_proc('/api/plan')        { |req, res| guard(req, res) { plan(req, res) } }
@@ -626,6 +650,18 @@ module Carbide
 
       res['Content-Type'] = 'text/javascript'
       res.body = File.read(@vue)
+    end
+
+    def vendor(res, name)
+      _rel, cdn, type = VENDOR[name]
+      unless @vendor[name]
+        res.status = 302
+        res['Location'] = cdn
+        return
+      end
+
+      res['Content-Type'] = type
+      res.body = File.read(@vendor[name])
     end
 
     def json(res, payload)
