@@ -358,7 +358,8 @@ module Carbide
       return k3s_lm_note unless k3d?
 
       relay = File.join(@server_root, 'scripts', 'dev-lmstudio-relay.sh')
-      unless @quiet.run!('command', '-v', 'socat').success? || system('command -v socat >/dev/null 2>&1')
+      # `command -v` is a shell builtin, so it has to go through a shell.
+      unless system('command -v socat >/dev/null 2>&1')
         log 'socat not installed — skipping LM Studio relay (apt-get install -y socat if you need LLM agents)'
         return
       end
