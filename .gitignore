@@ -5,3 +5,7 @@ carbide-rootCA.pem
 # Frozen deploy configs (deploy.rb --yaml-out, scripts/configure.rb). These carry
 # cluster.token — a credential that joins a node as a control-plane member.
 /cluster*.yaml
+carbide2-bridge*/
+carbide2-site/
+carbide2-docs/
+legacy*/
