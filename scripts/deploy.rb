@@ -86,6 +86,7 @@ require_relative 'lib/carbide_config'
 require_relative 'lib/carbide_command'
 require_relative 'lib/carbide_images'
 require_relative 'lib/carbide_tls'
+require_relative 'lib/carbide_jwt'
 require_relative 'lib/carbide_cluster'
 require_relative 'lib/carbide_node'
 require_relative 'lib/carbide_storage'
@@ -295,6 +296,15 @@ module Carbide
         hosts: config.get('tls-opts.hosts'),
         out_dir: config.present('tls-opts.out-dir')
       )
+      # JWT signing key lifecycle (ADR-015 RS256): control holds the private key
+      # in a Secret; pods verify against the public JWKS. Ensured before the
+      # control-plane chart installs so its pod can mount the key.
+      @jwt = Carbide::JwtKey.new(
+        cmd: @cmd,
+        namespace: config.present('jwt.namespace') || @control_ns,
+        secret: config.present('jwt.secret') || 'workspace-jwt',
+        key_dir: config.present('jwt.key-dir') || '~/.carbide/jwt'
+      )
       # The CRD + helm release + Deployment rollouts live in Carbide::ControlPlane;
       # it reads image tags straight from @images so the chart pins what we built.
       @control_plane = Carbide::ControlPlane.new(
@@ -345,6 +355,7 @@ module Carbide
       publish_images unless @external_registry
       build_and_upload_client unless @no_client
       @control_plane.apply_crd
+      @jwt.ensure_signing_key!
       @control_plane.install
       @tls.setup_tls unless @no_tls
       @control_plane.roll_deployments
@@ -654,6 +665,7 @@ specs = [
   Carbide::Node,
   Carbide::Storage,
   Carbide::Tls,
+  Carbide::JwtKey,
   Carbide::Images,
   Carbide::ControlPlane
 ].flat_map(&:options)

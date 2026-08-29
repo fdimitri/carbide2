@@ -62,6 +62,12 @@ tls-opts:
   hosts: ''          # space-separated SAN list ("" => auto-detect FQDN/short/IPs)
   out-dir: tls       # where --csr writes the key/CSR and --import-cert looks for the key
 
+# --- JWT signing key (ADR-015 RS256) -----------------------------------------
+jwt:
+  namespace: ''      # control-plane namespace holding the signing-key secret ("" => control.namespace)
+  secret: workspace-jwt  # Secret name the control chart mounts as JWT_SIGNING_KEY
+  key-dir: '~/.carbide/jwt'  # host-side dir persisting the private key (never in cluster.yaml)
+
 # --- persistent storage backend ----------------------------------------------
 storage:
   backend: local-path   # local-path (node-local, single-node) | longhorn (replicated RWO, multi-node)
