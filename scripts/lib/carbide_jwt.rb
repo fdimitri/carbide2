@@ -41,19 +41,47 @@ module Carbide
     end
 
     # Ensure the control namespace has the signing-key Secret with a `secret`
-    # key holding an RSA private key PEM. Reuses an existing key (host disk or
-    # already-present Secret); only generates + creates when both are missing.
+    # key holding an RSA private key PEM. Reuses an existing VALID key (host disk
+    # or already-present Secret); replaces a present-but-invalid secret (the old
+    # HS256 shared string) and only generates when nothing valid exists.
     def ensure_signing_key!
-      if secret_present?
-        log "JWT signing key secret #{@namespace}/#{@secret} already present — reusing"
+      existing = fetch_secret_pem
+      if existing && valid_rsa?(existing)
+        log "JWT signing key secret #{@namespace}/#{@secret} already present and valid — reusing"
         return
       end
 
       key = load_or_generate_key
+      if existing
+        log "replacing #{@namespace}/#{@secret}: existing value is not an RSA key"
+        @cmd.run('kubectl', '-n', @namespace, 'delete', 'secret', @secret, '--ignore-not-found')
+      end
       create_secret(key)
     end
 
     private
+
+    # The decoded `secret` value from the Secret, or nil if absent.
+    def fetch_secret_pem
+      out, = @cmd.run!('kubectl', '-n', @namespace, 'get', "secret/#{@secret}",
+                       '-o', 'jsonpath={.data.secret}')
+      pem = (out || '').strip
+      return nil if pem.empty?
+
+      begin
+        require 'base64'
+        Base64.decode64(pem)
+      rescue StandardError
+        nil
+      end
+    end
+
+    def valid_rsa?(pem)
+      OpenSSL::PKey::RSA.new(pem)
+      true
+    rescue OpenSSL::OpenSSLError
+      false
+    end
 
     def secret_present?
       @cmd.run!('kubectl', '-n', @namespace, 'get', "secret/#{@secret}").success?
