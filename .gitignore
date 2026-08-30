@@ -9,3 +9,6 @@ carbide2-bridge*/
 carbide2-site/
 carbide2-docs/
 legacy*/
+
+# Agent-local state (memories, etc.) — never commit
+/.carbide/
