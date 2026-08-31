@@ -151,9 +151,26 @@ module Carbide
     def write_registry_ca_values(ca_pem)
       require 'tmpdir'
       file = File.join(Dir.mktmpdir('carbide-registry-ca'), 'values.yaml')
-      lines = ca_pem.lines.map { |l| "    #{l.chomp}" }.join("\n")
+      pem  = normalize_pem(ca_pem)
+      lines = pem.lines.map { |l| "    #{l.chomp}" }.join("\n")
       File.write(file, "registry:\n  ca: |\n#{lines}\n")
       file
+    end
+
+    # Reconstruct a canonical multi-line PEM regardless of how the source string
+    # arrived (folded single-quoted scalar, space-joined blob, or already a
+    # proper block). Collapse whitespace, then re-wrap the base64 body to 64
+    # columns between the BEGIN/END markers.
+    def normalize_pem(pem)
+      body = pem.to_s.gsub(/\s+/, '')
+      return '' if body.empty?
+
+      m = body.match(/-----BEGIN\s+CERTIFICATE-----(.*)-----END\s+CERTIFICATE-----/m)
+      return pem unless m
+
+      b64 = m[1]
+      wrapped = b64.scan(/.{1,64}/).join("\n")
+      "-----BEGIN CERTIFICATE-----\n#{wrapped}\n-----END CERTIFICATE-----\n"
     end
 
     def workspace_namespaces
