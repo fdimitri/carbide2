@@ -159,17 +159,17 @@ module Carbide
 
     # Reconstruct a canonical multi-line PEM regardless of how the source string
     # arrived (folded single-quoted scalar, space-joined blob, or already a
-    # proper block). Collapse whitespace, then re-wrap the base64 body to 64
-    # columns between the BEGIN/END markers.
+    # proper block). Collapse ALL whitespace first (including the space inside
+    # the BEGIN/END markers), then match the collapsed markers and re-wrap the
+    # base64 body to 64 columns.
     def normalize_pem(pem)
-      body = pem.to_s.gsub(/\s+/, '')
-      return '' if body.empty?
+      s = pem.to_s.gsub(/\s+/, '')
+      return '' if s.empty?
 
-      m = body.match(/-----BEGIN\s+CERTIFICATE-----(.*)-----END\s+CERTIFICATE-----/m)
+      m = s.match(/-----BEGINCERTIFICATE-----(.*)-----ENDCERTIFICATE-----/m)
       return pem unless m
 
-      b64 = m[1]
-      wrapped = b64.scan(/.{1,64}/).join("\n")
+      wrapped = m[1].scan(/.{1,64}/).join("\n")
       "-----BEGIN CERTIFICATE-----\n#{wrapped}\n-----END CERTIFICATE-----\n"
     end
 
