@@ -463,7 +463,7 @@ module Carbide
       return if ENV['CARBIDE_DEPLOY_PULLED']
 
       log "self-update: fetch + checkout '#{@deploy_ref}' + submodule update in #{@root}"
-      before = file_digest(__FILE__)
+      before_head = git_head
       Dir.chdir(@root) do
         unless @cmd.run!('git', 'fetch', '--prune', 'origin').success?
           abort "\e[1;31mxx\e[0m self-update: 'git fetch origin' failed in #{@root}. " \
@@ -482,13 +482,20 @@ module Carbide
         sha, = @cmd.run!('git', 'rev-parse', '--short', 'HEAD')
         log "self-update: deploying ref '#{@deploy_ref}' @ #{(sha || '').strip}"
       end
-      after = file_digest(__FILE__)
 
       ENV['CARBIDE_DEPLOY_PULLED'] = '1'
-      return unless before && after && before != after
+      after_head = git_head
+      return unless before_head && after_head && before_head != after_head
 
-      log 'self-update: deploy.rb changed — re-running the updated orchestrator'
+      log 'self-update: orchestrator changed — re-running the updated deploy.rb (and its libs)'
       exec(RbConfig.ruby, __FILE__, *ORIGINAL_ARGV)
+    end
+
+    def git_head
+      out, = @cmd.run!('git', 'rev-parse', 'HEAD')
+      (out || '').strip
+    rescue StandardError
+      nil
     end
 
     def file_digest(path)
