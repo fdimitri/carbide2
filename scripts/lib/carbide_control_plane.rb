@@ -25,7 +25,8 @@ module Carbide
     #                WORKSPACE_STORAGE_CLASS env); blank => chart default.
     def initialize(cmd:, control_root:, namespace:, release:, images:,
                    http_port:, https_port:, public_url:, roll_scope:,
-                   workspace_storage_class: nil)
+                   workspace_storage_class: nil, registry_url: nil,
+                   registry_ca: nil)
       @cmd        = cmd
       @control    = control_root
       @namespace  = namespace
@@ -36,6 +37,8 @@ module Carbide
       @public_url = public_url
       @roll_scope = roll_scope
       @workspace_storage_class = workspace_storage_class.to_s.strip
+      @registry_url = registry_url.to_s.strip
+      @registry_ca  = registry_ca.to_s
     end
 
     # Config option specs owned by the control plane (aggregated by deploy.rb).
@@ -75,6 +78,11 @@ module Carbide
                   '--set-string', "workspace.image=#{@images.repository(:workspace)}",
                   '--set-string', "workspace.imageTag=#{tags[:workspace]}",
                   '--set-string', "workspace.shellImage=#{@images.image_ref(:shell)}")
+        # ADR-025: hand control the registry coordinates so its image picker can
+        # list available tags. The CA PEM is the mkcert rootCA that signs the
+        # registry's cert.
+        args.push('--set-string', "registry.url=#{@registry_url}")
+        args.push('--set-string', "registry.ca=#{@registry_ca}")
       end
       args.push('--wait', '--timeout', '5m')
       @cmd.run(*args)

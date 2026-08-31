@@ -311,7 +311,9 @@ module Carbide
         cmd: @cmd, control_root: @control, namespace: @control_ns, release: @release,
         images: @images, http_port: @http_port, https_port: @https_port,
         public_url: @public_url, roll_scope: @roll_scope,
-        workspace_storage_class: @storage_class
+        workspace_storage_class: @storage_class,
+        registry_url: @registry ? "https://#{@registry_host}:#{@registry_port}" : nil,
+        registry_ca: @registry ? @images.registry_ca_text : nil
       )
     end
 
