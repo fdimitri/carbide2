@@ -146,11 +146,12 @@ module Carbide
     private
 
     # Write the CA PEM as a YAML block scalar so helm can consume it without the
-    # multi-line --set-string shell-mangling problem.
+    # multi-line --set-string shell-mangling problem. Content must be indented
+    # MORE than the `ca` key (4 spaces under a 2-space key).
     def write_registry_ca_values(ca_pem)
       require 'tmpdir'
       file = File.join(Dir.mktmpdir('carbide-registry-ca'), 'values.yaml')
-      lines = ca_pem.lines.map { |l| "  #{l.chomp}" }.join("\n")
+      lines = ca_pem.lines.map { |l| "    #{l.chomp}" }.join("\n")
       File.write(file, "registry:\n  ca: |\n#{lines}\n")
       file
     end
