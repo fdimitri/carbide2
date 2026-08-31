@@ -80,9 +80,13 @@ module Carbide
                   '--set-string', "workspace.shellImage=#{@images.image_ref(:shell)}")
         # ADR-025: hand control the registry coordinates so its image picker can
         # list available tags. The CA PEM is the mkcert rootCA that signs the
-        # registry's cert.
+        # registry's cert — multi-line, so it must be a YAML block scalar in a
+        # values file, never a --set-string (newlines would break helm).
         args.push('--set-string', "registry.url=#{@registry_url}")
-        args.push('--set-string', "registry.ca=#{@registry_ca}")
+        if @registry_ca && !@registry_ca.empty?
+          ca_file = write_registry_ca_values(@registry_ca)
+          args.push('--values', ca_file)
+        end
       end
       args.push('--wait', '--timeout', '5m')
       @cmd.run(*args)
@@ -140,6 +144,16 @@ module Carbide
     end
 
     private
+
+    # Write the CA PEM as a YAML block scalar so helm can consume it without the
+    # multi-line --set-string shell-mangling problem.
+    def write_registry_ca_values(ca_pem)
+      require 'tmpdir'
+      file = File.join(Dir.mktmpdir('carbide-registry-ca'), 'values.yaml')
+      lines = ca_pem.lines.map { |l| "  #{l.chomp}" }.join("\n")
+      File.write(file, "registry:\n  ca: |\n#{lines}\n")
+      file
+    end
 
     def workspace_namespaces
       out, = @cmd.run!('kubectl', 'get', 'ns', '-o', 'name')
