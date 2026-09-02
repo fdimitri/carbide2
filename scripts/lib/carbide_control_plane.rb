@@ -25,7 +25,8 @@ module Carbide
     #                WORKSPACE_STORAGE_CLASS env); blank => chart default.
     def initialize(cmd:, control_root:, namespace:, release:, images:,
                    http_port:, https_port:, public_url:, roll_scope:,
-                   workspace_storage_class: nil)
+                   workspace_storage_class: nil, registry_url: nil,
+                   registry_ca: nil)
       @cmd        = cmd
       @control    = control_root
       @namespace  = namespace
@@ -36,6 +37,8 @@ module Carbide
       @public_url = public_url
       @roll_scope = roll_scope
       @workspace_storage_class = workspace_storage_class.to_s.strip
+      @registry_url = registry_url.to_s.strip
+      @registry_ca  = registry_ca.to_s
     end
 
     # Config option specs owned by the control plane (aggregated by deploy.rb).
@@ -75,6 +78,15 @@ module Carbide
                   '--set-string', "workspace.image=#{@images.repository(:workspace)}",
                   '--set-string', "workspace.imageTag=#{tags[:workspace]}",
                   '--set-string', "workspace.shellImage=#{@images.image_ref(:shell)}")
+        # ADR-025: hand control the registry coordinates so its image picker can
+        # list available tags. The CA PEM is the mkcert rootCA that signs the
+        # registry's cert — multi-line, so it must be a YAML block scalar in a
+        # values file, never a --set-string (newlines would break helm).
+        args.push('--set-string', "registry.url=#{@registry_url}")
+        if @registry_ca && !@registry_ca.empty?
+          ca_file = write_registry_ca_values(@registry_ca)
+          args.push('--values', ca_file)
+        end
       end
       args.push('--wait', '--timeout', '5m')
       @cmd.run(*args)
@@ -132,6 +144,34 @@ module Carbide
     end
 
     private
+
+    # Write the CA PEM as a YAML block scalar so helm can consume it without the
+    # multi-line --set-string shell-mangling problem. Content must be indented
+    # MORE than the `ca` key (4 spaces under a 2-space key).
+    def write_registry_ca_values(ca_pem)
+      require 'tmpdir'
+      file = File.join(Dir.mktmpdir('carbide-registry-ca'), 'values.yaml')
+      pem  = normalize_pem(ca_pem)
+      lines = pem.lines.map { |l| "    #{l.chomp}" }.join("\n")
+      File.write(file, "registry:\n  ca: |\n#{lines}\n")
+      file
+    end
+
+    # Reconstruct a canonical multi-line PEM regardless of how the source string
+    # arrived (folded single-quoted scalar, space-joined blob, or already a
+    # proper block). Collapse ALL whitespace first (including the space inside
+    # the BEGIN/END markers), then match the collapsed markers and re-wrap the
+    # base64 body to 64 columns.
+    def normalize_pem(pem)
+      s = pem.to_s.gsub(/\s+/, '')
+      return '' if s.empty?
+
+      m = s.match(/-----BEGINCERTIFICATE-----(.*)-----ENDCERTIFICATE-----/m)
+      return pem unless m
+
+      wrapped = m[1].scan(/.{1,64}/).join("\n")
+      "-----BEGIN CERTIFICATE-----\n#{wrapped}\n-----END CERTIFICATE-----\n"
+    end
 
     def workspace_namespaces
       out, = @cmd.run!('kubectl', 'get', 'ns', '-o', 'name')

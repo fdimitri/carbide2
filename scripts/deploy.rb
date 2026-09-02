@@ -86,6 +86,7 @@ require_relative 'lib/carbide_config'
 require_relative 'lib/carbide_command'
 require_relative 'lib/carbide_images'
 require_relative 'lib/carbide_tls'
+require_relative 'lib/carbide_jwt'
 require_relative 'lib/carbide_cluster'
 require_relative 'lib/carbide_node'
 require_relative 'lib/carbide_storage'
@@ -295,13 +296,24 @@ module Carbide
         hosts: config.get('tls-opts.hosts'),
         out_dir: config.present('tls-opts.out-dir')
       )
+      # JWT signing key lifecycle (ADR-015 RS256): control holds the private key
+      # in a Secret; pods verify against the public JWKS. Ensured before the
+      # control-plane chart installs so its pod can mount the key.
+      @jwt = Carbide::JwtKey.new(
+        cmd: @cmd,
+        namespace: config.present('jwt.namespace') || @control_ns,
+        secret: config.present('jwt.secret') || 'workspace-jwt',
+        key_dir: config.present('jwt.key-dir') || '~/.carbide/jwt'
+      )
       # The CRD + helm release + Deployment rollouts live in Carbide::ControlPlane;
       # it reads image tags straight from @images so the chart pins what we built.
       @control_plane = Carbide::ControlPlane.new(
         cmd: @cmd, control_root: @control, namespace: @control_ns, release: @release,
         images: @images, http_port: @http_port, https_port: @https_port,
         public_url: @public_url, roll_scope: @roll_scope,
-        workspace_storage_class: @storage_class
+        workspace_storage_class: @storage_class,
+        registry_url: @registry ? "https://#{@registry_host}:#{@registry_port}" : nil,
+        registry_ca: @registry ? @images.registry_ca_text : nil
       )
     end
 
@@ -345,6 +357,7 @@ module Carbide
       publish_images unless @external_registry
       build_and_upload_client unless @no_client
       @control_plane.apply_crd
+      @jwt.ensure_signing_key!
       @control_plane.install
       @tls.setup_tls unless @no_tls
       @control_plane.roll_deployments
@@ -450,7 +463,7 @@ module Carbide
       return if ENV['CARBIDE_DEPLOY_PULLED']
 
       log "self-update: fetch + checkout '#{@deploy_ref}' + submodule update in #{@root}"
-      before = file_digest(__FILE__)
+      before_head = git_head
       Dir.chdir(@root) do
         unless @cmd.run!('git', 'fetch', '--prune', 'origin').success?
           abort "\e[1;31mxx\e[0m self-update: 'git fetch origin' failed in #{@root}. " \
@@ -469,13 +482,20 @@ module Carbide
         sha, = @cmd.run!('git', 'rev-parse', '--short', 'HEAD')
         log "self-update: deploying ref '#{@deploy_ref}' @ #{(sha || '').strip}"
       end
-      after = file_digest(__FILE__)
 
       ENV['CARBIDE_DEPLOY_PULLED'] = '1'
-      return unless before && after && before != after
+      after_head = git_head
+      return unless before_head && after_head && before_head != after_head
 
-      log 'self-update: deploy.rb changed — re-running the updated orchestrator'
+      log 'self-update: orchestrator changed — re-running the updated deploy.rb (and its libs)'
       exec(RbConfig.ruby, __FILE__, *ORIGINAL_ARGV)
+    end
+
+    def git_head
+      out, = @cmd.run!('git', '-C', @root, 'rev-parse', 'HEAD')
+      (out || '').strip
+    rescue StandardError
+      nil
     end
 
     def file_digest(path)
@@ -654,6 +674,7 @@ specs = [
   Carbide::Node,
   Carbide::Storage,
   Carbide::Tls,
+  Carbide::JwtKey,
   Carbide::Images,
   Carbide::ControlPlane
 ].flat_map(&:options)

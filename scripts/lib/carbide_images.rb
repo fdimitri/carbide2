@@ -178,6 +178,21 @@ module Carbide
       @mkcert_ca = File.exist?(pem) ? pem : nil
     end
 
+    # The CA PEM *text* (for handing to control as REGISTRY_CA env), or empty.
+    # registry.ca may be inline PEM text (from --yaml-out / --registry.ca) or a
+    # file path (from --registry.ca-file). Return the text either way; never
+    # fall back to the LOCAL mkcert root when inline PEM was supplied.
+    def registry_ca_text
+      return @registry_ca if @registry_ca&.include?('-----BEGIN')
+
+      path = mkcert_ca_pem
+      return '' unless path
+
+      File.read(path).strip
+    rescue StandardError
+      ''
+    end
+
     # Bring up (or reuse) a standalone registry:2 on this host over TLS. The cert
     # reuses the carbide mkcert root CA, so nodes that already trust that CA can
     # pull without extra config. Idempotent.
