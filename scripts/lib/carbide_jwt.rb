@@ -45,6 +45,7 @@ module Carbide
     # or already-present Secret); replaces a present-but-invalid secret (the old
     # HS256 shared string) and only generates when nothing valid exists.
     def ensure_signing_key!
+      ensure_namespace!
       existing = fetch_secret_pem
       if existing && valid_rsa?(existing)
         log "JWT signing key secret #{@namespace}/#{@secret} already present and valid — reusing"
@@ -60,6 +61,17 @@ module Carbide
     end
 
     private
+
+    # The control-plane namespace may be a custom name that nothing else creates
+    # before this point (infra only creates 'carbide-system'; helm --create-namespace
+    # runs AFTER the secret). Ensure it exists so `kubectl create secret` can't
+    # abort the deploy on a missing namespace.
+    def ensure_namespace!
+      return if @cmd.run!('kubectl', 'get', 'namespace', @namespace).success?
+
+      log "creating namespace #{@namespace}"
+      @cmd.run('kubectl', 'create', 'namespace', @namespace)
+    end
 
     # The decoded `secret` value from the Secret, or nil if absent.
     def fetch_secret_pem
