@@ -95,10 +95,6 @@ module Carbide
         return File.read(key_path)
       end
 
-      unless system('command -v openssl >/dev/null 2>&1')
-        abort "\e[1;31mxx\e[0m openssl not found — required to generate the JWT signing key."
-      end
-
       log "generating RSA 2048 signing key"
       FileUtils.mkdir_p(@key_dir)
       key = OpenSSL::PKey::RSA.generate(2048).to_pem

@@ -492,7 +492,7 @@ module Carbide
     end
 
     def git_head
-      out, = @cmd.run!('git', 'rev-parse', 'HEAD')
+      out, = @cmd.run!('git', '-C', @root, 'rev-parse', 'HEAD')
       (out || '').strip
     rescue StandardError
       nil
