@@ -13,8 +13,8 @@ module Carbide
   # (traefik, local-path, cnpg, minio).
   #
   # Homogeneous nodes, one artifact: every node consumes the same emitted YAML.
-  # The first node runs `--role init` (k3s --cluster-init, mints cluster.token if
-  # blank); every other runs `--role join` against cluster.server-url with that
+  # The first node runs `node.role init` (k3s --cluster-init, mints cluster.token if
+  # blank); every other runs `node.role join` against cluster.server-url with that
   # same token — a full server, not an agent.
   #
   # Idempotent: a converged node is a no-op — the k3s installer is skipped when
@@ -24,37 +24,45 @@ module Carbide
   class Node
     include Carbide::CommandRunner
 
-    ROLES               = %w[init join].freeze
+    ROLES               = %w[init join agent none].freeze
+    BACKENDS            = %w[k3d k3s none].freeze
     K3S_INSTALLER       = 'https://get.k3s.io'
     K3S_CHANNEL         = 'stable'
     LOCAL_PATH_MANIFEST = 'https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.31/deploy/local-path-storage.yaml'
+    # Where the k3d node reads containerd registry config + the CA we hand it.
+    K3D_REGISTRIES_YAML = '/etc/rancher/k3s/registries.yaml'
+    K3D_REGISTRY_CA     = '/etc/rancher/k3s/carbide-registry-ca.pem'
 
-    # Config option specs owned by the node/join seam (aggregated by deploy.rb).
+    # Config option specs owned by the node seam (aggregated by deploy.rb).
     def self.options
       [
-        { key: 'cluster.role', arg: 'ROLE', values: ROLES,
-          desc: 'k3s node role: init (first server, default) or join (additional control-plane server)' },
+        { key: 'node.backend', arg: 'BACKEND', values: BACKENDS,
+          desc: 'What this box is: k3d (k3s-in-Docker, single node), k3s (host-native), none (no cluster here)' },
+        { key: 'node.role', arg: 'ROLE', values: ROLES,
+          desc: 'k3s only: init (first server; default), join (additional server), agent (unimplemented)' },
         { key: 'cluster.server-url', arg: 'URL',
           desc: 'k3s server URL joiners reach the first node on (e.g. https://node1.lan:6443). join: required; init: seeds a --tls-san' },
         { key: 'cluster.token', arg: 'TOKEN', secret: true,
-          generate: :hex32, generate_when: [%w[cluster.backend k3s], %w[cluster.role init]],
+          generate: :hex32, generate_when: [%w[node.backend k3s], %w[node.role init]],
           desc: 'k3s shared join secret (K3S_TOKEN). init: minted if blank; join: required. Keep secret.' }
       ]
     end
 
     # cmd/quiet     : streaming / capturing TTY::Command.
-    # backend       : 'k3d' | 'k3s' (already validated by Carbide::Cluster).
+    # backend       : 'k3d' | 'k3s' | 'none'.
     # name          : cluster name.
     # server_root   : carbide2-server checkout (holds deploy/*.yaml + scripts/).
     # http_port/https_port : ingress ports (k3d publishes them; k3s binds real 80/443).
-    # role          : 'init' | 'join'.
+    # role          : 'init' | 'join' | 'none' (resolved by the caller).
     # server_url    : k3s server URL (join: required; init: extra API-cert SAN).
     # token         : k3s shared secret (init mints if blank via Config generator).
     # storage_class : StorageClass to pin MinIO's PVC to (multi-node durability).
-    # registry_host/port/ca : optional self-hosted registry to trust (inline CA PEM).
+    # registry      : Carbide::Registry (may be unconfigured).
+    # pull          : this node's containerd will pull from the registry, so it
+    #                 must be able to resolve it and trust its CA (ADR-028 §5).
     def initialize(cmd:, quiet:, backend:, name:, server_root:, http_port:, https_port:,
                    role: 'init', server_url: nil, token: nil, storage_class: 'local-path',
-                   registry_host: nil, registry_port: '5000', registry_ca: nil)
+                   registry: nil, pull: false)
       @cmd           = cmd
       @quiet         = quiet
       @backend       = backend.to_s.downcase
@@ -66,14 +74,15 @@ module Carbide
       @server_url    = normalize_server_url(server_url)
       @token         = token
       @storage_class = (storage_class.nil? || storage_class.to_s.strip.empty?) ? 'local-path' : storage_class
-      @registry_host = registry_host
-      @registry_port = (registry_port || '5000').to_s
-      @registry_ca   = registry_ca
-      abort "\e[1;31mxx\e[0m unknown cluster.role '#{@role}' (expected init or join)" unless ROLES.include?(@role)
+      @registry      = registry
+      @pull          = pull && registry&.configured?
+      abort "\e[1;31mxx\e[0m unknown node.backend '#{@backend}'" unless BACKENDS.include?(@backend)
+      abort "\e[1;31mxx\e[0m unknown node.role '#{@role}'" unless ROLES.include?(@role)
     end
 
-    def k3d? = @backend == 'k3d'
-    def k3s? = @backend == 'k3s'
+    def k3d?  = @backend == 'k3d'
+    def k3s?  = @backend == 'k3s'
+    def none? = @backend == 'none'
 
     # Bring THIS node up as the first/only member and install the shared infra.
     # k3d is single-node only; k3s inits a new server (HA-capable etcd).
@@ -86,7 +95,8 @@ module Carbide
     # so the storage backend (Longhorn's StorageClass) can be installed in between:
     # install_infra pins MinIO's PVC to that class, so the class must exist first.
     def ensure_cluster!
-      abort "\e[1;31mxx\e[0m --role join requires the k3s backend (k3d is single-node)" if @role == 'join' && k3d?
+      abort "\e[1;31mxx\e[0m node.role join requires the k3s backend (k3d is single-node)" if @role == 'join' && k3d?
+      abort "\e[1;31mxx\e[0m node.backend none has no cluster to bring up" if none?
       k3d? ? ensure_k3d : ensure_k3s_server(init: true)
     end
 
@@ -94,9 +104,9 @@ module Carbide
     # server. Node-level only: the shared cluster already has traefik/cnpg/etc,
     # so no infra is (re)installed here.
     def join!
-      abort "\e[1;31mxx\e[0m --role join requires the k3s backend" unless k3s?
-      abort "\e[1;31mxx\e[0m --role join needs cluster.server-url (https://<first-node>:6443)" if blank?(@server_url)
-      abort "\e[1;31mxx\e[0m --role join needs cluster.token (the shared secret from the init node's config)" if blank?(@token)
+      abort "\e[1;31mxx\e[0m node.role join requires the k3s backend" unless k3s?
+      abort "\e[1;31mxx\e[0m node.role join needs cluster.server-url (https://<first-node>:6443)" if blank?(@server_url)
+      abort "\e[1;31mxx\e[0m node.role join needs cluster.token (the shared secret from the init node's config)" if blank?(@token)
       ensure_k3s_server(init: false)
       log "node joined cluster '#{@name}' as a control-plane server"
     end
@@ -107,6 +117,7 @@ module Carbide
     def ensure_k3d
       if k3d_cluster_exists?
         log "cluster '#{@name}' already exists, skipping creation"
+        trust_registry_k3d_existing! if @pull
       else
         log "creating k3d cluster '#{@name}' (HTTP #{@http_port} / HTTPS #{@https_port})"
         @cmd.run('k3d', 'cluster', 'create', @name,
@@ -114,8 +125,13 @@ module Carbide
                  '--k3s-arg', '--disable=local-storage@server:*',
                  '--port', "#{@http_port}:80@loadbalancer",
                  '--port', "#{@https_port}:443@loadbalancer",
-                 '--agents', '0', '--wait')
+                 '--agents', '0', *k3d_registry_create_args, '--wait')
       end
+      # The registry container must be reachable from the node BY NAME. On the
+      # host the name resolves to loopback; inside the node loopback is the
+      # node. Putting the container on the cluster's network under that alias
+      # makes Docker's embedded DNS answer with the container (ADR-028 §5).
+      @registry.join_docker_network("k3d-#{@name}") if @pull && @registry.serve?
       log 'kubectl context:'
       @cmd.run('kubectl', 'config', 'current-context')
       @cmd.run('kubectl', 'get', 'nodes')
@@ -126,9 +142,51 @@ module Carbide
       out.to_s.lines.any? { |l| l.split.first == @name }
     end
 
+    # At create time k3d can hand containerd a registries.yaml and mount the CA
+    # file it names, so the node trusts the registry from first boot.
+    def k3d_registry_create_args
+      return [] unless @pull
+
+      ca = @registry.ca_path
+      args = ['--registry-config', write_tempfile('k3d-registries', k3d_registries_yaml(ca))]
+      args += ['--volume', "#{ca}:#{K3D_REGISTRY_CA}@server:*"] if ca
+      args
+    end
+
+    # An existing k3d cluster has no create-time hook, so write the same files
+    # into the node and restart it (k3s reads registries.yaml at start).
+    def trust_registry_k3d_existing!
+      node = "k3d-#{@name}-server-0"
+      ca   = @registry.ca_path
+      cur, = @quiet.run!('docker', 'exec', node, 'cat', K3D_REGISTRIES_YAML)
+      desired = k3d_registries_yaml(ca)
+      return log "registry #{@registry.endpoint} already trusted in node #{node}" if cur.to_s == desired
+
+      log "trusting registry #{@registry.endpoint} in node #{node} (registries.yaml + restart)"
+      @quiet.run!('docker', 'exec', node, 'mkdir', '-p', File.dirname(K3D_REGISTRIES_YAML))
+      @cmd.run('docker', 'cp', ca, "#{node}:#{K3D_REGISTRY_CA}") if ca
+      @cmd.run('docker', 'cp', write_tempfile('k3d-registries', desired), "#{node}:#{K3D_REGISTRIES_YAML}")
+      @cmd.run('docker', 'restart', node)
+      @cmd.run('kubectl', 'wait', '--for=condition=Ready', "node/#{node}", '--timeout=120s')
+    end
+
+    def k3d_registries_yaml(ca)
+      ep = @registry.endpoint
+      tls = ca ? "    tls:\n      ca_file: \"#{K3D_REGISTRY_CA}\"\n" : ''
+      "configs:\n  \"#{ep}\":\n#{tls}"
+    end
+
+    def write_tempfile(prefix, content)
+      f = Tempfile.new([prefix, '.yaml'])
+      f.write(content)
+      f.flush
+      (@tempfiles ||= []) << f
+      f.path
+    end
+
     # --- k3s (host-native server) ---------------------------------------------
     def ensure_k3s_server(init:)
-      trust_registry! unless blank?(@registry_host)
+      trust_registry! if @pull
       if k3s_node_ready?
         log "k3s already running with a Ready node, skipping install"
       else
@@ -216,18 +274,17 @@ module Carbide
     # Pin the self-hosted registry's CA in registries.yaml so containerd can pull
     # over TLS. Idempotent: only (re)written and only restarts k3s on change.
     def trust_registry!
-      if blank?(@registry_ca)
-        log "registry CA empty — skipping registry trust (pods may ImagePullBackOff)"
+      ca_src = @registry.ca_path
+      if ca_src.nil?
+        log "registry #{@registry.endpoint} has no private CA — relying on the system trust store"
         return
       end
-      # A PEM pasted into a plain YAML scalar comes back with its newlines folded to
-      # spaces, which containerd can't parse. Canonicalize before trusting it.
-      ca = normalize_pem(@registry_ca)
+      ca = normalize_pem(File.read(ca_src))
       unless ca.include?('-----BEGIN CERTIFICATE-----')
-        abort "\e[1;31mxx\e[0m registry CA is not a PEM certificate (got #{@registry_ca.to_s.strip[0, 40].inspect}). " \
+        abort "\e[1;31mxx\e[0m registry CA at #{ca_src} is not a PEM certificate. " \
               'Pass it with --registry.ca-file PATH, or as a YAML block scalar (ca: |).'
       end
-      endpoint = @registry_host.include?(':') ? @registry_host : "#{@registry_host}:#{@registry_port}"
+      endpoint = @registry.endpoint
       ca_dest  = '/etc/rancher/k3s/carbide-registry-ca.pem'
       desired  = <<~YAML
         configs:

@@ -41,19 +41,21 @@ gemfile(true) do
   gem 'tty-command', '~> 0.10'
 end
 
+require_relative 'lib/carbide_registry'
 require_relative 'lib/carbide_images'
 
 COMPONENTS = { 'workspace' => :workspace, 'control' => :control, 'shell' => :shell }.freeze
 
-opts = { registry_host: nil, registry_port: nil, registry_ca: nil,
+opts = { registry_host: nil, registry_port: nil, registry_ca: nil, serve: nil,
          no_push: false, no_shell: false, force_rebuild: false,
          server_ref: nil, worker_ref: nil, control_ref: nil, client_ref: nil }
 OptionParser.new do |o|
   o.banner = 'Usage: build.rb [components...] [--registry-host HOST] [--no-push] ' \
              '[--server-ref REF] [--no-shell]'
-  o.on('--registry-host HOST', 'Self-hosted registry to push SHA-tagged images to (REGISTRY_HOST env)') { |v| opts[:registry_host] = v }
+  o.on('--registry-host HOST', 'Registry to push SHA-tagged images to (REGISTRY_HOST env)') { |v| opts[:registry_host] = v }
   o.on('--registry-port PORT', 'Registry port (default 5000; REGISTRY_PORT env)') { |v| opts[:registry_port] = v }
-  o.on('--registry-ca FILE', 'CA pem of an externally-run registry, so this host trusts it (REGISTRY_CA env)') { |v| opts[:registry_ca] = v }
+  o.on('--registry-ca FILE', 'CA pem of a registry someone else runs, so this host trusts it (REGISTRY_CA env)') { |v| opts[:registry_ca] = v }
+  o.on('--[no-]serve-registry', 'This host runs the registry:2 (default: yes unless --registry-ca is given)') { |v| opts[:serve] = v }
   o.on('--no-push', 'Build the registry SHA tags but do not push them') { opts[:no_push] = true }
   o.on('--force-rebuild', 'Rebuild even components whose SHA tag already exists in the registry') { opts[:force_rebuild] = true }
   o.on('--no-shell', 'Skip the (slow) carbide2-shell image (SKIP_SHELL env)') { opts[:no_shell] = true }
@@ -87,11 +89,18 @@ root = File.expand_path('..', __dir__)
 cmd   = TTY::Command.new(uuid: false, printer: :pretty)
 quiet = TTY::Command.new(uuid: false, printer: :null)
 
-images = Carbide::Images.new(
-  cmd: cmd, quiet: quiet, root: root,
-  registry_host: registry_host, registry_port: registry_port || '5000',
-  registry_ca: opts[:registry_ca] || ENV['REGISTRY_CA']
+# The registry is a fact (host/port/ca) plus whether THIS host runs it. The
+# old behaviour was "run it unless a CA was handed in"; keep that as the default
+# so existing invocations don't change, but let it be said explicitly.
+registry_ca = opts[:registry_ca] || ENV['REGISTRY_CA']
+serve = opts[:serve].nil? ? registry_ca.to_s.strip.empty? : opts[:serve]
+registry = Carbide::Registry.new(
+  cmd: cmd, quiet: quiet,
+  host: registry_host, port: registry_port || Carbide::Registry::DEFAULT_PORT,
+  ca: registry_ca, serve: serve
 )
+
+images = Carbide::Images.new(cmd: cmd, quiet: quiet, root: root, registry: registry)
 
 refs = { server: opts[:server_ref], worker: opts[:worker_ref],
          control: opts[:control_ref], client: opts[:client_ref] }

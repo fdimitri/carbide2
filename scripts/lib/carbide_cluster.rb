@@ -18,7 +18,7 @@ module Carbide
   class Cluster
     include Carbide::CommandRunner
 
-    BACKENDS = %w[k3d k3s].freeze
+    BACKENDS = %w[k3d k3s none].freeze
     # The local images the single-node path imports into the node's containerd.
     IMPORT_IMAGES = %w[carbide2:dev carbide2-control:dev carbide2-shell:dev].freeze
 
@@ -32,7 +32,7 @@ module Carbide
       @quiet   = quiet
       @backend = backend.to_s.downcase
       unless BACKENDS.include?(@backend)
-        abort "\e[1;31mxx\e[0m unknown cluster.backend '#{@backend}' (expected k3d or k3s)"
+        abort "\e[1;31mxx\e[0m unknown node.backend '#{@backend}' (expected k3d, k3s or none)"
       end
       @name        = name
       @server_root = server_root
@@ -43,11 +43,10 @@ module Carbide
       @https_port = blank?(https_port) ? default_https : https_port.to_s.strip
     end
 
-    # Config option specs owned by the cluster backend (aggregated by deploy.rb).
+    # Config option specs owned by the cluster (aggregated by deploy.rb).
+    # node.backend lives with Carbide::Node (ADR-028: what this box IS).
     def self.options
       [
-        { key: 'cluster.backend', arg: 'BACKEND', values: %w[k3d k3s],
-          desc: 'Local Kubernetes backend: k3d (default, k3s-in-Docker) or k3s (host-native)' },
         { key: 'cluster.name', arg: 'NAME', desc: 'Cluster name (default: carbide-dev)' },
         { key: 'cluster.http-port', arg: 'PORT', desc: 'Ingress HTTP port (blank => backend default: k3d 8080 / k3s 80)' },
         { key: 'cluster.https-port', arg: 'PORT', desc: 'Ingress HTTPS port (blank => backend default: k3d 8443 / k3s 443)' }
@@ -56,8 +55,9 @@ module Carbide
 
     attr_reader :backend, :name, :http_port, :https_port
 
-    def k3d? = @backend == 'k3d'
-    def k3s? = @backend == 'k3s'
+    def k3d?  = @backend == 'k3d'
+    def k3s?  = @backend == 'k3s'
+    def none? = @backend == 'none'
 
     # CLI tools this backend needs on top of the always-required docker/kubectl/helm.
     def extra_tools = k3d? ? %w[k3d] : []
@@ -65,10 +65,12 @@ module Carbide
     # k3s installs itself and imports into host containerd — both need root.
     def needs_sudo? = k3s?
 
-    # Single-node path (no registry): import the local :dev images straight into
+    # Single-node path: import the local :dev images straight into
     # the backend's containerd, failing loudly if an image is missing or the
     # import silently no-ops — both would ImagePullBackOff later.
     def import_images
+      abort "\e[1;31mxx\e[0m import_images on node.backend none: nothing to import into" if none?
+
       log "importing images into #{@backend} cluster '#{@name}'"
       IMPORT_IMAGES.each do |img|
         # Every image here is required. A missing local image used to only warn

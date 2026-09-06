@@ -29,22 +29,26 @@
 # first run via bundler/inline.
 #
 # Usage:
-#   ./scripts/deploy.rb                 full build + deploy
-#   ./scripts/deploy.rb --cluster.backend k3s   deploy to host-native k3s (default: k3d)
+#   ./scripts/deploy.rb                 full build + deploy (k3d, imported :dev images)
+#   ./scripts/deploy.rb --node.backend k3s      deploy to host-native k3s (default: k3d)
 #   ./scripts/deploy.rb --storage.backend longhorn   replicated RWO storage (multi-node)
-#   ./scripts/deploy.rb --registry.host HOST  push SHA-tagged images to a self-hosted
-#                                       registry at HOST (multi-node: every node pulls
-#                                       from it instead of a per-node containerd import)
-#   ./scripts/deploy.rb --publish-only --registry.host HOST
-#                                       build + push images to the registry, then STOP.
-#                                       For a dedicated build/registry host that runs no
-#                                       k3s (pair with --external-registry on the nodes).
-#   ./scripts/deploy.rb --external-registry --registry.host HOST --registry.ca-file FILE
-#                                       deploy to a k3s node that pulls from a registry
-#                                       run ELSEWHERE: skip the local registry + build,
-#                                       just pull the already-pushed tags.
-#   ./scripts/deploy.rb --no-build      skip image build (re-import + redeploy)
-#   ./scripts/deploy.rb --no-shell      build everything EXCEPT the carbide2-shell image
+#
+#   Three blocks answer three questions (ADR-028):
+#     node:     what this box IS      — backend k3d|k3s|none, role init|join|none
+#     images:   what it DOES with images — build, shell, push, consume auto|import|pull
+#     registry: where the registry IS — host, port, ca, serve
+#
+#   ./scripts/deploy.rb --images.push --registry.serve --registry.host HOST
+#                                       build, push SHA tags, and run the registry the
+#                                       fleet pulls from; this box's own k3d still
+#                                       imports :dev (consume: auto)
+#   ./scripts/deploy.rb --node.backend none --images.push --registry.serve --registry.host HOST
+#                                       dedicated build/registry host: no cluster
+#   ./scripts/deploy.rb --node.backend k3s --node.role join --no-images.build --registry.host HOST
+#                                       a k3s node that only pulls (consume: auto -> pull)
+#   ./scripts/deploy.rb --images.consume pull   force the pull path on k3d (tests it)
+#   ./scripts/deploy.rb --no-images.build      skip image build (re-import + redeploy)
+#   ./scripts/deploy.rb --no-images.shell      build everything EXCEPT the carbide2-shell image
 #   ./scripts/deploy.rb --no-client     skip building + uploading the pinned SPA client
 #   ./scripts/deploy.rb --no-infra      skip cluster/infra bring-up
 #   ./scripts/deploy.rb --no-tls        skip mkcert TLS setup (Traefik default cert)
@@ -84,6 +88,7 @@ require 'fileutils'
 require 'digest'
 require_relative 'lib/carbide_config'
 require_relative 'lib/carbide_command'
+require_relative 'lib/carbide_registry'
 require_relative 'lib/carbide_images'
 require_relative 'lib/carbide_tls'
 require_relative 'lib/carbide_jwt'
@@ -198,8 +203,8 @@ module Carbide
       @release    = config.present('control.release') || 'carbide-control'
       @kubeconfig = config.present('kubeconfig') || '~/.kube/config'
       # Deploy-flow toggles (defaults live in defaults.yaml; --no-<x> flips them).
-      @no_build   = !config.bool('build')
-      @no_shell   = !config.bool('shell')
+      @no_build   = !config.bool('images.build')
+      @no_shell   = !config.bool('images.shell')
       @no_client  = !config.bool('client')
       @no_infra   = !config.bool('infra')
       @no_tls     = !config.bool('tls')
@@ -208,43 +213,37 @@ module Carbide
       @csr         = config.bool('csr')
       @import_cert = config.present('import-cert')
       @key         = config.present('key')
-      # The local single-node backend (k3d default / k3s host-native) — its
-      # ports, infra bring-up, and containerd image-import path all live in the
+
+      # --- ADR-028: what this box IS ---------------------------------------
+      @backend = (config.present('node.backend') || 'k3d').downcase
+      # role '' resolves: k3s defaults to init (first server); k3d/none have none.
+      @role = (config.present('node.role') || (@backend == 'k3s' ? 'init' : 'none')).downcase
+
+      # --- ADR-028: the registry, a fact about the fleet --------------------
+      @registry = Carbide::Registry.new(
+        cmd: @cmd, quiet: @quiet,
+        host: config.present('registry.host'), port: config.present('registry.port'),
+        ca: config.present('registry.ca'), serve: config.bool('registry.serve')
+      )
+
+      # --- ADR-028: what this box DOES with images --------------------------
+      @push    = config.bool('images.push')
+      @consume = resolve_consume(config.present('images.consume') || 'auto')
+      validate_shape!(config)
+
+      # The local backend's ports + containerd image-import path live in the
       # shared Carbide::Cluster helper (validates the backend on construction).
       @cluster_iface = Carbide::Cluster.new(
-        cmd: @cmd, quiet: @quiet,
-        backend: config.present('cluster.backend') || 'k3d',
+        cmd: @cmd, quiet: @quiet, backend: @backend,
         name: @cluster, server_root: @server,
         http_port: config.get('cluster.http-port'), https_port: config.get('cluster.https-port')
       )
       @http_port  = @cluster_iface.http_port
       @https_port = @cluster_iface.https_port
-      # Optional self-hosted registry. When registry.host is set, deploy switches
-      # from the single-node containerd-import path to building immutable SHA-
-      # tagged images, pushing them to a standalone registry:2 on this host, and
-      # pinning those tags into the control-plane chart — so every node in a
-      # multi-node cluster pulls the same image over HTTPS. Unset = legacy
-      # behavior (k3d/k3s `ctr images import`, :dev tags).
-      @registry_host = config.present('registry.host')
-      @registry_port = (config.present('registry.port') || '5000').to_s
-      @registry      = @registry_host ? "#{@registry_host}:#{@registry_port}/" : nil
-      # Split-host modes so a multi-node cluster needn't co-locate build+registry
-      # on a k3s node. publish-only: THIS host only builds + pushes images to its
-      # registry (no k3s/helm). external: THIS host is a k3s node that pulls from
-      # a registry someone ELSE runs, so skip standing up a local one and skip
-      # building (images are already pushed). registry.ca points at that external
-      # registry's CA so containerd + our reachability check trust it.
-      @publish_only      = config.bool('registry.publish-only')
-      @external_registry = config.bool('registry.external')
-      @registry_ca       = config.present('registry.ca')
-      validate_registry_modes!
-      # All image build/tag/registry logic lives in the shared Images library
-      # (also used by scripts/build.rb) so the two never drift.
-      @images = Carbide::Images.new(
-        cmd: @cmd, quiet: @quiet, root: @root,
-        registry_host: @registry_host, registry_port: @registry_port,
-        registry_ca: @registry_ca, registry_container: config.present('registry.container')
-      )
+      # All image build/tag logic lives in the shared Images library (also used
+      # by scripts/build.rb) so the two never drift. It pushes to, but never
+      # runs, the registry.
+      @images = Carbide::Images.new(cmd: @cmd, quiet: @quiet, root: @root, registry: @registry)
       # Which meta-repo branch/ref this deploy builds from. self_update checks it
       # out and fast-forwards it before doing anything, so the deployed images
       # always match a known ref instead of "whatever happened to be checked
@@ -253,9 +252,9 @@ module Carbide
       @deploy_ref = (config.present('ref') || 'main').to_s
       # The hostname the BROWSER uses to reach the ingress. Drives the TLS cert
       # SANs, the public URL the control-plane advertises, and the Rails host
-      # allowlist. We refuse to silently guess 'localhost'. The dedicated build/
-      # registry host (publish-only) serves no ingress, so don't demand an FQDN.
-      @public_host, @public_url = @publish_only ? ['', ''] : resolve_public_endpoint
+      # allowlist. We refuse to silently guess 'localhost'. A box with no
+      # cluster serves no ingress, so don't demand an FQDN of it.
+      @public_host, @public_url = @backend == 'none' ? ['', ''] : resolve_public_endpoint
       # Which deployments roll_deployments restarts after a redeploy (all |
       # control | none). Default 'all' (version-coherent; costs live terminals).
       @roll_scope = (config.present('roll-scope') || 'all').to_s
@@ -270,22 +269,18 @@ module Carbide
       )
       @storage_class = @storage.storage_class
       # The k3s/k3d node lifecycle (create/install/join, registry trust, and the
-      # shared in-cluster infra) — the Ruby replacement for the dev-cluster-*.sh
-      # and dev-agent-k3s.sh scripts. --role init brings a node up + installs
-      # infra; --role join adds a control-plane server to an existing cluster.
-      @role = (config.present('cluster.role') || 'init').to_s.downcase
-      node_registry_ca = @external_registry ? @registry_ca : (@registry_host ? @images.mkcert_ca_pem : nil)
+      # shared in-cluster infra). It gets the Registry and whether this node
+      # PULLS from it — which is what decides whether containerd must trust it.
       @node = Carbide::Node.new(
         cmd: @cmd, quiet: @quiet,
-        backend: config.present('cluster.backend') || 'k3d',
+        backend: @backend,
         name: @cluster, server_root: @server,
         http_port: @http_port, https_port: @https_port,
         role: @role,
         server_url: config.present('cluster.server-url'),
         token: config.present('cluster.token'),
         storage_class: @storage_class,
-        registry_host: @registry_host, registry_port: @registry_port,
-        registry_ca: node_registry_ca
+        registry: @registry, pull: @consume == :pull
       )
       # Ingress TLS/cert flows (mkcert default cert, CSR/import, CA trust hints)
       # live in the shared Carbide::Tls helper.
@@ -307,14 +302,16 @@ module Carbide
         key_dir: config.present('jwt.key-dir') || '~/.carbide/jwt'
       )
       # The CRD + helm release + Deployment rollouts live in Carbide::ControlPlane;
-      # it reads image tags straight from @images so the chart pins what we built.
+      # it reads image tags straight from @images so the chart pins what we built
+      # — but only when this cluster PULLS (ADR-028 §5).
       @control_plane = Carbide::ControlPlane.new(
         cmd: @cmd, control_root: @control, namespace: @control_ns, release: @release,
-        images: @images, http_port: @http_port, https_port: @https_port,
+        images: @images, pull: @consume == :pull,
+        http_port: @http_port, https_port: @https_port,
         public_url: @public_url, roll_scope: @roll_scope,
         workspace_storage_class: @storage_class,
-        registry_url: @registry ? "https://#{@registry_host}:#{@registry_port}" : nil,
-        registry_ca: @registry ? @images.registry_ca_text : nil
+        registry_url: @registry.base_url,
+        registry_ca: @registry.configured? ? @registry.ca_text : nil
       )
     end
 
@@ -322,8 +319,6 @@ module Carbide
     def self.options
       [
         { key: 'ref', arg: 'REF', desc: 'Meta-repo branch/ref to deploy (default: main). Checked out + fast-forwarded before build' },
-        { key: 'build',  negatable: true, desc: 'Build the container images (--no-build to just re-import + redeploy)' },
-        { key: 'shell',  negatable: true, desc: 'Include the carbide2-shell image in the build (--no-shell reuses the existing one)' },
         { key: 'client', negatable: true, desc: 'Build + upload the pinned SPA client to the MinIO static tier' },
         { key: 'infra',  negatable: true, desc: 'Bring the cluster + infra up (--no-infra to skip)' },
         { key: 'tls',    negatable: true, desc: 'mkcert TLS setup for the ingress (--no-tls leaves Traefik default cert)' },
@@ -346,16 +341,16 @@ module Carbide
 
       require_tools
       return join_run if @role == 'join'
-      return publish_only_run if @publish_only
+      return publish_run if @backend == 'none'
 
-      ensure_registry if @registry && !@external_registry
+      @registry.ensure! if @registry.serve?
       # Cluster first, THEN the storage backend (creates its StorageClass), THEN
       # infra — MinIO's PVC is pinned to that class, so it must exist beforehand.
       @node.ensure_cluster! unless @no_infra
       @storage.ensure!
       @node.install_infra unless @no_infra
-      build_images unless @no_build || @external_registry || skip_build?
-      publish_images unless @external_registry
+      build_images unless @no_build || skip_build?
+      publish_images
       build_and_upload_client unless @no_client
       @control_plane.apply_crd
       @jwt.ensure_signing_key!
@@ -372,39 +367,68 @@ module Carbide
 
     private
 
-    # --publish-only: build the SHA-tagged images and push them to the self-hosted
-    # registry, then stop. Runs on the dedicated build/registry host (no k3s, no
-    # helm, no cluster) so the k3s nodes can pull the images over HTTPS. Pair it
-    # with --external-registry on each k3s node, which consumes this registry
-    # instead of standing up its own.
-    def publish_only_run
-      ensure_registry
+    # node.backend none: this box has no cluster. It builds and/or pushes and/or
+    # serves the registry for the boxes that do (ADR-028 §2), then stops.
+    def publish_run
+      @registry.ensure! if @registry.serve?
       build_images unless @no_build || skip_build?
-      @images.push
-      log "publish-only complete \u2014 images are in the registry at " \
-          "#{@registry_host}:#{@registry_port}"
-      log "next: on each k3s node run deploy.rb --external-registry " \
-          "--registry.host #{@registry_host} --registry.ca-file <rootCA.pem> " \
-          "(copy this host's mkcert rootCA.pem over first)"
-    end
-
-    # Guard the split-host registry flags: they only make sense with a registry,
-    # are mutually exclusive, and --external-registry needs the registry's CA.
-    def validate_registry_modes!
-      if @publish_only && @external_registry
-        abort "\e[1;31mxx\e[0m --publish-only and --external-registry are mutually " \
-              "exclusive: one builds+pushes images, the other consumes them."
-      end
-      if (@publish_only || @external_registry) && !@registry
-        abort "\e[1;31mxx\e[0m #{@publish_only ? '--publish-only' : '--external-registry'} " \
-              "needs --registry.host (the self-hosted registry to push to / pull from)."
-      end
-      if @external_registry && !@registry_ca
-        abort "\e[1;31mxx\e[0m --external-registry needs --registry.ca-file FILE (the registry's " \
-              "mkcert rootCA.pem, copied from the build host) so this node trusts it."
+      @images.push if @push
+      if @push
+        log "published — images are in the registry at #{@registry.endpoint}"
+        log "next: on each cluster node set registry.host #{@registry.host} and images.consume pull " \
+            '(and registry.ca, if this registry uses a private CA: run --yaml-out here and copy the file)'
+      else
+        log 'built; nothing pushed (images.push is false)'
       end
     end
 
+    # images.consume: how this box's own cluster obtains images (ADR-028 §3).
+    # auto: no cluster => none; k3d => import; k3s => pull iff a registry is
+    # configured, else import. Explicit values are honoured and validated.
+    def resolve_consume(mode)
+      case mode.to_s.downcase
+      when 'import' then :import
+      when 'pull'   then :pull
+      when 'auto'
+        return :none if @backend == 'none'
+        return :import if @backend == 'k3d'
+
+        @registry.configured? ? :pull : :import
+      else
+        abort "\e[1;31mxx\e[0m images.consume must be auto, import or pull (got #{mode.inspect})"
+      end
+    end
+
+    # ADR-028 §4: fail at config time, not mid-deploy.
+    def validate_shape!(config)
+      if %w[join agent].include?(@role) && @backend != 'k3s'
+        abort "\e[1;31mxx\e[0m node.role #{@role} requires node.backend k3s."
+      end
+      if @role == 'agent'
+        abort "\e[1;31mxx\e[0m node.role agent is not implemented yet (ADR-028 §2); every joiner is a full server today — use join."
+      end
+      if @backend == 'k3d' && @role != 'none'
+        abort "\e[1;31mxx\e[0m node.role #{@role} is meaningless on k3d (single node); leave it blank."
+      end
+      if @push && !@registry.configured?
+        abort "\e[1;31mxx\e[0m images.push needs registry.host — nothing to push to."
+      end
+      if @registry.serve? && !@registry.configured?
+        abort "\e[1;31mxx\e[0m registry.serve needs registry.host — the registry must know what name it answers to."
+      end
+      if @registry.serve? && config.present('registry.ca')
+        warn "\e[1;33m!!\e[0m registry.ca is ignored on the box that serves the registry (mkcert's CA is used)."
+      end
+      if @consume == :pull && !@registry.configured?
+        abort "\e[1;31mxx\e[0m images.consume pull needs registry.host."
+      end
+      if @consume == :import && @backend == 'k3s' && @role != 'init'
+        abort "\e[1;31mxx\e[0m images.consume import needs a single node; a k3s #{@role} has no node of its own to import into."
+      end
+      if @backend == 'none' && !@push && !@registry.serve? && @no_build
+        abort "\e[1;31mxx\e[0m node.backend none with no images.build, images.push or registry.serve: this box would do nothing."
+      end
+    end
     # Resolve the browser-facing hostname + URL base. Order of precedence:
     #   1. public.url   (explicit full URL, wins outright)
     #   2. public.host  (config / --public.host flag)
@@ -507,13 +531,14 @@ module Carbide
 
     def require_tools
       # k3s installs itself (vendor get.k3s.io), so it isn't a prereq tool;
-      # docker stays required for the build/import paths. --publish-only only
-      # builds + pushes images (docker only, no k8s CLI). --role join only adds a
-      # k3s server to an existing cluster: the vendor installer pulls itself via
-      # curl and we verify with kubectl — no docker/helm build tooling needed.
+      # docker stays required for the build/import paths. A node.backend none
+      # box only builds + pushes images (docker only, no k8s CLI). --role join
+      # only adds a k3s server to an existing cluster: the vendor installer
+      # pulls itself via curl and we verify with kubectl — no docker/helm build
+      # tooling needed.
       tools =
-        if @role == 'join'   then %w[kubectl curl]
-        elsif @publish_only  then %w[docker]
+        if @role == 'join'        then %w[kubectl curl]
+        elsif @backend == 'none'  then %w[docker]
         else %w[docker kubectl helm] + @cluster_iface.extra_tools
         end
       tools.each do |tool|
@@ -544,9 +569,9 @@ module Carbide
       # The k3s backend installs k3s and imports images into its host containerd,
       # both of which need root. Prime sudo now (visible prompt) so the later
       # quiet, output-captured steps don't hang on a hidden password prompt.
-      if @cluster_iface.needs_sudo? && !@publish_only && !system('sudo', '-v')
+      if @cluster_iface.needs_sudo? && @backend != 'none' && !system('sudo', '-v')
         abort "\e[1;31mxx\e[0m the k3s backend needs sudo (k3s install + containerd " \
-              "image import). Grant sudo, or use the default --cluster.backend k3d."
+              "image import). Grant sudo, or use the default --node.backend k3d."
       end
     end
 
@@ -577,23 +602,26 @@ module Carbide
     # Image tagging, building, and registry lifecycle all live in the shared
     # Carbide::Images library (also used by scripts/build.rb).
 
-    # Publish the freshly-built images so the cluster can pull them. Registry
-    # mode pushes SHA tags to the standalone registry (works across every node);
-    # legacy mode imports :dev into the single node's containerd.
+    # Get the freshly-built images where they need to be (ADR-028 §5). Two
+    # independent questions: does this box PUSH for the fleet, and how does its
+    # OWN cluster consume. A dev box that serves the fleet's registry does both:
+    # pushes SHA tags for the k3s nodes AND imports :dev into its own k3d.
     def publish_images
-      @registry ? @images.push : @cluster_iface.import_images
+      @images.push if @push
+      @cluster_iface.import_images if @consume == :import
     end
 
     # When every SHA tag is already in the registry there's nothing to build —
     # immutable tags mean identical content, so skip the (slow) build entirely.
+    # Only meaningful when this box pushes; an importing box has no registry
+    # copy to compare against.
     def skip_build?
+      return false unless @push
+
       skip = @images.all_present?
-      log "all image tags already in registry #{@registry_host}:#{@registry_port} — skipping build" if skip
+      log "all image tags already in registry #{@registry.endpoint} — skipping build" if skip
       skip
     end
-
-    def ensure_registry = @images.ensure_registry
-
     # --role join: add THIS host to an existing cluster as a control-plane
     # server, then stop. Node-level only — the shared cluster already has the
     # images, infra, and control plane, so nothing is built or helm-installed.
@@ -645,13 +673,13 @@ module Carbide
         Re-run this script any time to rebuild + redeploy. Common flags
         (every --a.b.c flag sets the a.b.c config key; --help lists them all):
           --ref REF                meta branch/ref to deploy (default main; e.g. --ref dev)
-          --cluster.backend k3s    local k8s backend: k3d (default) or k3s (host-native)
+          --node.backend k3s       what this box is: k3d (default), k3s (host-native), none (no cluster)
           --storage.backend longhorn  replicated RWO storage for multi-node (default local-path)
-          --registry.host H        push SHA-tagged images to a self-hosted registry at H
-                                   (multi-node: nodes pull from it; needs the CA trusted
-                                   per node via scripts/setmeup.sh --registry-host)
+          --registry.host H        the fleet's registry; with --registry.serve this box runs it,
+                                   with --images.push this box pushes SHA tags to it
+          --images.consume pull    make THIS cluster pull SHA tags (default auto: k3d imports :dev)
           --no-pull                skip self-update (git pull + submodule update)
-          --no-build               skip image build (just re-import + redeploy)
+          --no-images.build        skip image build (just re-import + redeploy)
           --no-client              skip building + uploading the pinned SPA client
           --no-infra               skip cluster/infra bring-up
           --no-tls                 skip mkcert TLS setup (leave Traefik default cert)
@@ -676,6 +704,7 @@ specs = [
   Carbide::Storage,
   Carbide::Tls,
   Carbide::JwtKey,
+  Carbide::Registry,
   Carbide::Images,
   Carbide::ControlPlane
 ].flat_map(&:options)
@@ -684,9 +713,25 @@ specs = [
 # self_update re-execs with them when a pull changes deploy.rb.
 ORIGINAL_ARGV = ARGV.dup
 
+# --yaml-out on the box that SERVES the registry embeds its mkcert CA so the
+# emitted file is self-contained for every consumer in the fleet (ADR-028 §1).
+# Nothing else is rewritten: the file stays a faithful freeze of THIS box, and a
+# joiner overrides its per-box keys (--node.role join --no-registry.serve ...).
+embed_registry_ca = lambda do |cfg|
+  next unless cfg.bool('registry.serve') && cfg.present('registry.host') && !cfg.present('registry.ca')
+
+  root = `mkcert -CAROOT 2>/dev/null`.strip
+  pem  = File.join(root, 'rootCA.pem')
+  next unless !root.empty? && File.file?(pem)
+
+  cfg.set!('registry.ca', File.read(pem).strip)
+  warn "embedded this host's registry CA (mkcert rootCA.pem) so consumers can trust #{cfg.present('registry.host')}"
+end
+
 config = Carbide::Config.new(
   defaults_path: File.expand_path('defaults.yaml', __dir__),
-  specs: specs
+  specs: specs,
+  before_emit: embed_registry_ca
 ).parse!(ARGV)
 
 Carbide::Deploy.new(config).run

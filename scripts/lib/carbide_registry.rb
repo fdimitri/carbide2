@@ -1,0 +1,223 @@
+# frozen_string_literal: true
+
+require 'fileutils'
+require 'tempfile'
+require_relative 'carbide_command'
+
+module Carbide
+  # The self-hosted image registry as a FACT about the deployment (ADR-028 §1):
+  # where it is, what CA signs its certificate, and whether THIS box runs it.
+  # Identical on every node of a fleet except for `serve`.
+  #
+  # Extracted from Carbide::Images, which used to both build images and run the
+  # registry as a side effect of building them. Images now takes one of these
+  # (or nil) and only builds / pushes / imports; Node takes one and asks it for
+  # the CA the node's containerd must trust.
+  #
+  # The CA (ADR-028 §1, "one field, three cases"):
+  #   serve: true   -> the CA is mkcert's rootCA.pem on this box's disk; any
+  #                    configured `ca` is ignored (with a warning upstream).
+  #   serve: false  -> `ca` is the inline PEM a consumer trusts, or blank to
+  #                    mean "the system trust store" (a publicly-signed registry).
+  class Registry
+    include Carbide::CommandRunner
+
+    DEFAULT_PORT      = '5000'
+    DEFAULT_CONTAINER = 'carbide-registry'
+    CERT_DIR          = '~/.carbide/registry'
+
+    # Config option specs owned by the registry (aggregated by deploy.rb).
+    def self.options
+      [
+        { key: 'registry.host', arg: 'HOST',
+          desc: 'Registry endpoint every node in the fleet pushes to / pulls from (blank => no registry)' },
+        { key: 'registry.port', arg: 'PORT', desc: "Registry port (default: #{DEFAULT_PORT})" },
+        { key: 'registry.ca', arg: 'PEM',
+          desc: 'Inline CA PEM a consumer trusts (blank => system trust store; ignored when registry.serve)' },
+        { key: 'registry.ca', long: 'registry.ca-file', arg: 'FILE', file: true,
+          desc: 'Load registry.ca from a PEM file (the serving host\'s mkcert rootCA.pem)' },
+        { key: 'registry.serve', negatable: true,
+          desc: 'This box runs the registry:2 container (its cert is minted by mkcert here)' }
+      ]
+    end
+
+    attr_reader :host, :port
+
+    # cmd/quiet : streaming / capturing TTY::Command.
+    # host      : registry hostname; nil/blank => not configured.
+    # port      : registry port.
+    # ca        : inline PEM (or a file path, from older configs) a consumer trusts.
+    # serve     : this box runs the registry.
+    def initialize(cmd:, quiet:, host:, port: DEFAULT_PORT, ca: nil, serve: false,
+                   container: DEFAULT_CONTAINER)
+      @cmd   = cmd
+      @quiet = quiet
+      h = host.to_s.strip
+      @host  = h.empty? ? nil : h
+      @port  = (port.to_s.strip.empty? ? DEFAULT_PORT : port.to_s.strip)
+      c = ca.to_s.strip
+      @ca    = c.empty? ? nil : c
+      @serve = serve ? true : false
+      @container = container.to_s.strip.empty? ? DEFAULT_CONTAINER : container.to_s.strip
+    end
+
+    def configured? = !@host.nil?
+    def serve?      = @serve
+    def endpoint    = configured? ? "#{@host}:#{@port}" : nil
+    # Image-ref prefix ("host:port/"), or nil when no registry is configured.
+    def prefix      = configured? ? "#{endpoint}/" : nil
+    def base_url    = configured? ? "https://#{endpoint}" : nil
+
+    # Path to the CA PEM the pull side trusts, or nil for the system store.
+    # serve: mkcert's root on this box. Otherwise the configured PEM, written to
+    # a tempfile if it arrived inline (containerd and curl both want a path).
+    def ca_path
+      return @ca_path if defined?(@ca_path)
+
+      @ca_path =
+        if @serve
+          mkcert_root
+        elsif @ca.nil?
+          nil
+        elsif @ca.include?('-----BEGIN')
+          write_ca_tempfile(@ca)
+        elsif File.file?(File.expand_path(@ca))
+          File.expand_path(@ca)
+        end
+    end
+
+    # The CA PEM text, or '' when there is none to hand out. This is what
+    # --yaml-out embeds so a consumer's config is self-contained, and what
+    # control receives as REGISTRY_CA for its image picker.
+    def ca_text
+      path = ca_path
+      return '' unless path && File.file?(path)
+
+      File.read(path).strip
+    rescue StandardError
+      ''
+    end
+
+    # Bring up (or reuse) registry:2 on this box over TLS with an mkcert cert.
+    # Idempotent. Only meaningful when serve?.
+    def ensure!
+      raise 'ensure! called on a registry this box does not serve' unless @serve
+      raise 'ensure! called without registry.host' unless configured?
+
+      log "ensuring standalone registry at #{endpoint}"
+      dir = File.expand_path(CERT_DIR)
+      crt = File.join(dir, 'registry.crt')
+      key = File.join(dir, 'registry.key')
+      ensure_cert(dir, crt, key)
+      ensure_container(dir)
+      verify!
+    end
+
+    # Attach the registry container to a Docker network under an alias equal to
+    # registry.host, so a k3d node on that network resolves the name to the
+    # container instead of to its own loopback (ADR-028 §5). Idempotent.
+    def join_docker_network(network)
+      raise 'join_docker_network on a registry this box does not serve' unless @serve
+
+      nets, = @quiet.run!('docker', 'inspect', @container, '--format', '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}')
+      return log "registry already on docker network #{network}" if nets.to_s.split.include?(network)
+
+      log "attaching registry container to docker network #{network} as #{@host}"
+      @cmd.run('docker', 'network', 'connect', '--alias', @host, network, @container)
+    end
+
+    # True if <name>:<tag> exists in the registry (HEAD/GET of the manifest).
+    def has_manifest?(name, tag)
+      return false unless configured?
+
+      curl('-sf', '-o', '/dev/null',
+           '-H', 'Accept: application/vnd.docker.distribution.manifest.v2+json',
+           "#{base_url}/v2/#{name}/manifests/#{tag}").success?
+    end
+
+    # curl against the registry, trusting its CA when one is known.
+    def curl(*args)
+      cmd = ['curl']
+      cmd += ['--cacert', ca_path] if ca_path
+      @quiet.run!(*cmd, *args)
+    end
+
+    private
+
+    def mkcert_root
+      out, = @cmd.run!('mkcert', '-CAROOT')
+      pem  = File.join((out || '').strip, 'rootCA.pem')
+      File.exist?(pem) ? pem : nil
+    end
+
+    def write_ca_tempfile(pem)
+      f = Tempfile.new(['carbide-registry-ca', '.pem'])
+      f.write(normalize_pem(pem))
+      f.write("\n")
+      f.flush
+      @ca_tempfile = f # keep a reference so the file outlives this method
+      f.path
+    end
+
+    # A PEM pasted into a plain YAML scalar comes back with its newlines folded
+    # to spaces. Re-wrap the base64 body at 64 columns.
+    def normalize_pem(pem)
+      s = pem.to_s.strip
+      return s if s.include?("\n")
+
+      m = s.match(/\A(-----BEGIN [^-]+-----)\s*(.*?)\s*(-----END [^-]+-----)\z/m)
+      return s unless m
+
+      body = m[2].gsub(/\s+/, '')
+      [m[1], *body.scan(/.{1,64}/), m[3]].join("\n")
+    end
+
+    def ensure_cert(dir, crt, key)
+      return if File.exist?(crt) && File.exist?(key)
+
+      unless system('command -v mkcert >/dev/null 2>&1')
+        abort "\e[1;31mxx mkcert not found.\e[0m It mints the registry's TLS cert " \
+              '(and the CA nodes trust to pull). Install mkcert and retry.'
+      end
+      FileUtils.mkdir_p(dir)
+      hosts = tls_hosts
+      log "minting registry TLS cert via mkcert for: #{hosts.join(' ')}"
+      @cmd.run('mkcert', '-cert-file', crt, '-key-file', key, *hosts)
+    end
+
+    def tls_hosts
+      hosts = [@host, 'localhost', '127.0.0.1']
+      ips, = @cmd.run!('hostname', '-I')
+      hosts.concat((ips || '').strip.split)
+      hosts.uniq
+    end
+
+    def ensure_container(dir)
+      running, = @cmd.run!('docker', 'ps', '-q', '-f', "name=^#{@container}$")
+      unless (running || '').strip.empty?
+        log "registry container '#{@container}' already running \u2014 reusing"
+        return
+      end
+
+      @quiet.run!('docker', 'rm', '-f', @container)
+      log "starting registry:2 container '#{@container}' on :#{@port}"
+      @cmd.run('docker', 'run', '-d', '--restart=always', '--name', @container,
+               '-p', "#{@port}:5000",
+               '-v', "#{dir}:/certs:ro",
+               '-e', 'REGISTRY_HTTP_TLS_CERTIFICATE=/certs/registry.crt',
+               '-e', 'REGISTRY_HTTP_TLS_KEY=/certs/registry.key',
+               'registry:2')
+    end
+
+    def verify!
+      url = "#{base_url}/v2/"
+      15.times do
+        return if curl('-sf', '-o', '/dev/null', url).success?
+
+        sleep 1
+      end
+      abort "\e[1;31mxx\e[0m registry did not become reachable at #{url}. Check " \
+            "`docker logs #{@container}` and that the mkcert CA is trusted on this host."
+    end
+  end
+end

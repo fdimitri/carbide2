@@ -10,8 +10,11 @@
 # local-path (hostPath): fine for one node, NOT durable if a pod reschedules to
 # another node — which never happens on a single-node cluster.
 
-cluster:
+node:
   backend: k3d
+images:
+  build: true
+  consume: auto     # k3d imports its own :dev build
 
 storage:
   backend: local-path

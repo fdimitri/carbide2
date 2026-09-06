@@ -48,7 +48,9 @@ module Carbide
 
     # defaults_path : scripts/defaults.yaml (checked in).
     # specs         : aggregated option specs from every module.
-    def initialize(defaults_path:, specs:)
+    # before_emit   : optional callable(data) run just before --yaml-out writes,
+    #                 so a serving box can embed its registry CA for the fleet.
+    def initialize(defaults_path:, specs:, before_emit: nil)
       @defaults_path = defaults_path
       @specs         = specs
       @secret_keys   = specs.select { |s| s[:secret] }.map { |s| s[:key] }
@@ -56,6 +58,7 @@ module Carbide
       @overrides     = {}   # dotted-key => value, applied as the last layer
       @input_path    = nil
       @emit          = nil  # [:full | :safe, path]
+      @before_emit   = before_emit
     end
 
     # Build the parser, parse argv (mutates it), then resolve the three layers.
@@ -100,6 +103,9 @@ module Carbide
     end
 
     def to_h = @data
+
+    # Public setter for before_emit callables.
+    def set!(dotted, val) = set(dotted, val)
 
     private
 
@@ -210,6 +216,7 @@ module Carbide
       mode, path = @emit
       return emit_schema_and_exit!(path) if mode == :schema
 
+      @before_emit&.call(self)
       out = mode == :safe ? redacted(@data) : @data
       File.write(File.expand_path(path), YAML.dump(out))
       warn "wrote #{mode == :safe ? 'redacted ' : ''}config to #{path}"

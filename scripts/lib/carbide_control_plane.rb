@@ -18,12 +18,14 @@ module Carbide
     # namespace    : the control-plane namespace.
     # release      : the helm release name.
     # images       : Carbide::Images (registry prefix + per-component tags).
+    # pull         : this cluster pulls SHA tags from the registry (ADR-028 §5).
+    #                When false the chart gets bare :dev refs and a forced roll.
     # http_port/https_port/public_url : ingress values for the chart.
     # roll_scope   : 'all' | 'control' | 'none'.
     # workspace_storage_class : StorageClass the operator stamps into each
     #                workspace PVC (chart value workspace.storageClassName ->
     #                WORKSPACE_STORAGE_CLASS env); blank => chart default.
-    def initialize(cmd:, control_root:, namespace:, release:, images:,
+    def initialize(cmd:, control_root:, namespace:, release:, images:, pull: false,
                    http_port:, https_port:, public_url:, roll_scope:,
                    workspace_storage_class: nil, registry_url: nil,
                    registry_ca: nil)
@@ -32,6 +34,7 @@ module Carbide
       @namespace  = namespace
       @release    = release
       @images     = images
+      @pull       = pull
       @http_port  = http_port
       @https_port = https_port
       @public_url = public_url
@@ -70,7 +73,10 @@ module Carbide
       # on it (the multi-node binary-bytes durability fix). --set-string so a
       # class name is never coerced.
       args.push('--set-string', "workspace.storageClassName=#{@workspace_storage_class}") unless @workspace_storage_class.empty?
-      if @images.registry
+      # Only a PULLING cluster gets registry-pinned SHA tags. A box that pushes
+      # to a registry for others but imports :dev locally must not point its
+      # own pods at that registry (ADR-028 §5) — that was the ImagePullBackOff.
+      if @pull
         tags = @images.image_tags
         # --set-string so an all-digit SHA tag is never coerced to a number.
         args.push('--set-string', "image.repository=#{@images.repository(:control)}",
@@ -98,12 +104,12 @@ module Carbide
         return
       end
 
-      # Registry mode pins a new immutable tag on every code change, so the helm
-      # upgrade above already changed the pod spec and Kubernetes rolled the
+      # A pulling cluster pins a new immutable tag on every code change, so the
+      # helm upgrade above already changed the pod spec and Kubernetes rolled the
       # affected Deployments. A forced restart would only churn pods pointlessly
       # (and re-pull is a no-op on IfNotPresent), so skip it.
-      if @images.registry
-        log "registry mode — helm rolled changed deployments via new image tags; skipping forced restart"
+      if @pull
+        log 'pull mode — helm rolled changed deployments via new image tags; skipping forced restart'
         return
       end
 

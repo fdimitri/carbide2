@@ -206,26 +206,38 @@ module Carbide
     def build(answers, overrides = {}, defaults = {})
       topo = answers['topology'].to_s
       join = topo == 'k3s-multi' && answers['role'].to_s == 'join'
-      cfg  = { 'cluster' => { 'backend' => topo.start_with?('k3d') ? 'k3d' : 'k3s' } }
+      cfg  = { 'node' => { 'backend' => topo.start_with?('k3d') ? 'k3d' : 'k3s' } }
 
       if topo == 'k3s-multi'
-        cfg['cluster']['role'] = join ? 'join' : 'init'
+        cfg['node']['role'] = join ? 'join' : 'init'
+        cfg['cluster'] = {}
         put(cfg['cluster'], 'server-url', answers['serverUrl'])
         put(cfg['cluster'], 'token', answers['clusterToken']) if join
+        cfg.delete('cluster') if cfg['cluster'].empty?
       end
 
       cfg['storage'] = { 'backend' => topo == 'k3s-multi' ? 'longhorn' : 'local-path' }
       put((cfg['public'] = {}), 'host', answers['publicHost'])
       cfg.delete('public') if cfg['public'].empty?
 
+      # ADR-028: the wizard's one registry answer becomes three facts.
+      #   local    -> this box serves the registry and pushes to it
+      #   external -> a registry elsewhere; this box only pulls
+      #   join     -> never builds, pushes, or serves, whatever the answer
       case answers['registry'].to_s
       when 'local'
-        cfg['registry'] = {}
+        cfg['registry'] = { 'serve' => !join }
         put(cfg['registry'], 'host', answers['registryHost'])
+        cfg['images'] = { 'push' => !join }
       when 'external'
-        cfg['registry'] = { 'external' => true }
+        cfg['registry'] = { 'serve' => false }
         put(cfg['registry'], 'host', answers['registryHost'])
         put(cfg['registry'], 'ca', answers['registryCa'])
+        cfg['images'] = { 'build' => false, 'push' => false }
+      end
+      if join
+        cfg['images'] = (cfg['images'] || {}).merge('build' => false, 'push' => false)
+        (cfg['registry'] ||= {})['serve'] = false
       end
 
       apply_overrides(cfg, overrides, defaults)
@@ -276,7 +288,7 @@ module Carbide
     def steps(answers)
       topo = answers['topology'].to_s
       join = answers['role'].to_s == 'join'
-      return ['./scripts/deploy.rb --config cluster.yaml --cluster.role join'] if topo == 'k3s-multi' && join
+      return ['./scripts/deploy.rb --config cluster.yaml --node.role join'] if topo == 'k3s-multi' && join
       return ['./scripts/deploy.rb --config cluster.yaml'] unless topo == 'k3s-multi'
 
       ['./scripts/deploy.rb --config cluster.yaml --yaml-out cluster.frozen.yaml',
@@ -290,7 +302,7 @@ module Carbide
       return out unless answers['topology'].to_s == 'k3s-multi' && answers['role'].to_s != 'join'
 
       out + ['# then on every other node, from the SAME cluster.frozen.yaml:',
-             './scripts/deploy.rb --config cluster.frozen.yaml --cluster.role join']
+             './scripts/deploy.rb --config cluster.frozen.yaml --node.role join']
     end
 
     def header(answers)
