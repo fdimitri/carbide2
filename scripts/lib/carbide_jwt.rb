@@ -22,12 +22,14 @@ module Carbide
     # cmd       : TTY::Command (streaming).
     # namespace : control-plane namespace holding the secret.
     # secret    : Secret name the control chart mounts as JWT_SIGNING_KEY.
+    # release   : the helm release that will own the Secret once installed.
     # key_dir   : host-side persistence directory for the private key.
     def initialize(cmd:, namespace: 'carbide-system', secret: 'workspace-jwt',
-                   key_dir: '~/.carbide/jwt')
+                   release: 'carbide-control', key_dir: '~/.carbide/jwt')
       @cmd       = cmd
       @namespace = namespace.to_s.strip
       @secret    = secret.to_s.strip
+      @release   = release.to_s.strip
       @key_dir   = File.expand_path(key_dir.to_s.strip)
     end
 
@@ -117,6 +119,12 @@ module Carbide
 
     # Put the PEM into the Secret under the `secret` key (matches the chart's
     # `secretKeyRef: { key: secret }`).
+    #
+    # The chart also renders this Secret, and Helm 3 refuses to install over a
+    # resource it did not create unless it carries Helm's ownership label and
+    # release annotations. Stamp them so the first `helm install` adopts the
+    # Secret rather than failing on it (only bites on a fresh cluster: on an
+    # existing one the Secret is already Helm-owned and this path is skipped).
     def create_secret(key)
       log "creating JWT signing-key secret #{@namespace}/#{@secret}"
       Tempfile.create(['jwt', '.pem']) do |f|
@@ -125,6 +133,11 @@ module Carbide
         @cmd.run('kubectl', '-n', @namespace, 'create', 'secret', 'generic', @secret,
                  "--from-file=secret=#{f.path}")
       end
+      @cmd.run('kubectl', '-n', @namespace, 'label', 'secret', @secret,
+               'app.kubernetes.io/managed-by=Helm')
+      @cmd.run('kubectl', '-n', @namespace, 'annotate', 'secret', @secret,
+               "meta.helm.sh/release-name=#{@release}",
+               "meta.helm.sh/release-namespace=#{@namespace}")
     end
   end
 end

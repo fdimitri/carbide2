@@ -303,6 +303,7 @@ module Carbide
         cmd: @cmd,
         namespace: config.present('jwt.namespace') || @control_ns,
         secret: config.present('jwt.secret') || 'workspace-jwt',
+        release: @release,
         key_dir: config.present('jwt.key-dir') || '~/.carbide/jwt'
       )
       # The CRD + helm release + Deployment rollouts live in Carbide::ControlPlane;
