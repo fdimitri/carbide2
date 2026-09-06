@@ -11,8 +11,7 @@ The two tools that do the work:
 | [`scripts/setmeup.sh`](scripts/setmeup.sh) | Provision a clean host with every dependency `deploy.rb` needs. |
 | [`scripts/deploy.rb`](scripts/deploy.rb) | Build images, bring up the cluster + infra, install the charts, set up TLS, verify. Idempotent — also the redeploy path. |
 
-> Component-specific notes live in [`carbide2-server/INSTALL.md`](carbide2-server/INSTALL.md)
-> (docker-compose dev, volume layout) and [`carbide2-server/DEPLOY-k3d.md`](carbide2-server/DEPLOY-k3d.md).
+> Component-specific notes live in [`carbide2-server/DEPLOY-k3d.md`](carbide2-server/DEPLOY-k3d.md).
 
 ---
 

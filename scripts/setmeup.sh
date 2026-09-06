@@ -189,14 +189,13 @@ log "kube-backend: $KUBE_BACKEND"
 # ---------------------------------------------------------------------------
 # The 'pg' gem needs libpq-dev; ruby-build needs the -dev headers; postgresql-client
 # gives psql for poking at the CNPG database. docker.io is Ubuntu's Docker engine;
-# docker-buildx-plugin / docker-compose-v2 are SEPARATE packages (build-all.sh
-# uses `docker buildx build --load`, quickstart.sh uses `docker compose`).
+# docker-buildx is a SEPARATE package (build-all.sh uses `docker buildx build --load`).
 APT_PKGS=(
   build-essential git curl ca-certificates gnupg lsb-release
   pkg-config libpq-dev libyaml-dev libffi-dev zlib1g-dev libssl-dev
   libreadline-dev libsqlite3-dev autoconf bison
   postgresql-client
-  docker.io docker-buildx docker-compose-v2
+  docker.io docker-buildx
 )
 [[ $WANT_SOCAT -eq 1 ]] && APT_PKGS+=(socat)
 

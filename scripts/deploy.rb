@@ -531,9 +531,9 @@ module Carbide
                 "(try: sudo systemctl enable --now docker; newgrp docker)"
         end
 
-        # build-all.sh uses `docker buildx build --load` and `docker compose`.
-        # On Ubuntu these ship as SEPARATE packages (docker-buildx / docker-compose-v2)
-        # that a bare `docker.io` install omits — catch that here, not mid-build.
+        # build-all.sh uses `docker buildx build --load`. On Ubuntu buildx ships
+        # as a SEPARATE package (docker-buildx) that a bare `docker.io` install
+        # omits — catch that here, not mid-build.
         unless @no_build || @cmd.run!('docker', 'buildx', 'version').success?
           abort "\e[1;31mxx\e[0m 'docker buildx' is unavailable but image build needs it. " \
                 "Install the buildx plugin (apt: docker-buildx) or pass --no-build."

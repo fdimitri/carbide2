@@ -61,9 +61,8 @@ take effect. Known-working versions (pinned in `setmeup.sh`):
 | helm | v3.x |
 | Ruby (via rbenv) | 3.4.2 |
 
-> Other paths: `setmeup.sh` provisions the **k3d** deploy path used by
-> `scripts/deploy.rb` (below). For the simpler single-host docker-compose
-> stack instead, see `carbide2-server/INSTALL.md`.
+> `setmeup.sh` provisions the **k3d** deploy path used by `scripts/deploy.rb`
+> (below). It is the only deploy path (ADR-031).
 
 Give the box **≥ 80 GB** of root disk — the images are large (`carbide2-shell`
 alone is ~4 GB) and they live on the node's containerd, on the host root disk.
