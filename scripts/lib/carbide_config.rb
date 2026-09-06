@@ -71,6 +71,7 @@ module Carbide
       if @input_path
         merged = load_yaml_file(@input_path)
         abort "\e[1;31mxx\e[0m --config #{@input_path}: expected a YAML mapping" unless merged.is_a?(Hash)
+        reject_unknown_keys!(merged)
         deep_merge!(@data, merged)
       end
       @overrides.each { |dotted, val| set(dotted, val) }
@@ -108,6 +109,25 @@ module Carbide
     def set!(dotted, val) = set(dotted, val)
 
     private
+
+    # defaults.yaml is the whole schema: a key that is not in it is not read by
+    # anything, so accepting it would silently do nothing. No legacy mapping
+    # (ADR-028): old shapes fail here, by name, with the file that carried them.
+    def reject_unknown_keys!(merged)
+      known   = dotted_leaves(@data)
+      unknown = dotted_leaves(merged) - known
+      return if unknown.empty?
+
+      abort "\e[1;31mxx\e[0m --config #{@input_path}: unknown key#{'s' if unknown.size > 1} " \
+            "(not in defaults.yaml): #{unknown.join(', ')}"
+    end
+
+    def dotted_leaves(hash, prefix = '')
+      hash.flat_map do |k, v|
+        path = prefix.empty? ? k.to_s : "#{prefix}.#{k}"
+        v.is_a?(Hash) && !v.empty? ? dotted_leaves(v, path) : [path]
+      end
+    end
 
     def build_parser
       OptionParser.new do |o|
@@ -184,7 +204,7 @@ module Carbide
     end
 
     def load_yaml_file(path)
-      return {} unless File.file?(path)
+      abort "\e[1;31mxx\e[0m config file not found: #{path}" unless File.file?(path)
 
       data = YAML.safe_load_file(path)
       data.is_a?(Hash) ? data : {}
