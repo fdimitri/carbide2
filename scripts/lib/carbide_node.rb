@@ -132,6 +132,12 @@ module Carbide
       # node. Putting the container on the cluster's network under that alias
       # makes Docker's embedded DNS answer with the container (ADR-028 §5).
       @registry.join_docker_network("k3d-#{@name}") if @pull && @registry.serve?
+      # Pin kubectl/helm to THIS cluster (#113). k3d only flips the context when
+      # it CREATES a cluster; on a re-deploy of an existing cluster the context
+      # stays wherever it last was, and the whole deploy (helm + kubectl + verify)
+      # silently targets the wrong cluster. Bind it explicitly, failing loudly if
+      # the context is missing rather than running against whatever is current.
+      @cmd.run!('kubectl', 'config', 'use-context', "k3d-#{@name}")
       log 'kubectl context:'
       @cmd.run('kubectl', 'config', 'current-context')
       @cmd.run('kubectl', 'get', 'nodes')
