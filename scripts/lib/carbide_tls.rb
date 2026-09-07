@@ -239,12 +239,19 @@ module Carbide
       hosts << @public_host unless @public_host.empty?
       %w[-f -s].each do |flag|
         out, = @cmd.run!('hostname', flag)
-        v = (out || '').strip
-        hosts << v unless v.empty?
+        # WSL's `hostname -f` returns "NAME." with a trailing dot; mkcert
+        # rejects that as not a hostname. Strip it, and skip anything that is
+        # still not a name mkcert will take.
+        v = (out || '').strip.sub(/\.\z/, '')
+        hosts << v if san_ok?(v)
       end
       ips, = @cmd.run!('hostname', '-I')
       hosts.concat((ips || '').strip.split)
       hosts.uniq
+    end
+
+    def san_ok?(v)
+      !v.empty? && v !~ /[\s\/@]/ && v !~ /\A\.|\.\z|\.\./
     end
 
     # Where --csr writes the key/CSR and where --import-cert looks for the key.
