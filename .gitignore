@@ -12,3 +12,4 @@ legacy*/
 
 # Agent-local state (memories, etc.) — never commit
 /.carbide/
+AGENTS.md

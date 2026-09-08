@@ -181,6 +181,78 @@ Requirements for the split:
   default *NAT* mode needs a Windows-side `netsh interface portproxy` forwarding
   `:5000` into the VM.)
 
+## Multiple clusters on one host (k3d)
+
+"Multiple workspaces" and "multiple isolated Carbides" are different things.
+Multiple **workspaces** (`ws-1`, `ws-2`, …) share one control plane, one CNPG
+Postgres (`carbide-pg`), one operator, one MinIO — each workspace is just its own
+`ws-<id>` namespace with its own logical DB. To get a *fully independent* Carbide
+(own control, own Postgres, own operator, own JWT), you need a **second cluster**,
+not a second namespace — those components are cluster-wide singletons referenced
+by literal name (`carbide-system`, `carbide-pg`, `carbide-control`).
+
+On k3d, a second cluster is cheap and `deploy.rb` creates it for you
+(idempotently — it skips creation if a cluster with that name already exists):
+
+```sh
+./scripts/deploy.rb \
+  --cluster.name carbide-dev2 \
+  --cluster.http-port 9080 \
+  --cluster.https-port 9443 \
+  --jwt.key-dir ~/.carbide/jwt2
+```
+
+Why each of those four flags matters:
+
+- **`--cluster.name`** — k3d names the new cluster; every other fact derives
+  from it.
+- **`--cluster.http-port` / `--cluster.https-port`** — k3d maps host `8080`/`8443`
+  by default, and both clusters can't own the same host ports. Pick a distinct
+  pair (e.g. `9080`/`9443`); the dashboard URL becomes `https://<host>:9443`.
+  The same `--public.host` on both clusters is fine (both get the same mkcert
+  cert).
+- **`--jwt.key-dir`** — defaults to `~/.carbide/jwt`, **not** keyed by cluster
+  name. Without a distinct dir, both clusters share the same RS256 signing key,
+  which defeats isolation (cluster B's control plane could mint tokens cluster
+  A's workspaces accept). Give each cluster its own dir.
+
+Two host-level things `deploy.rb` does **not** handle for you, and they bite
+when operating two clusters side by side:
+
+1. **kubeconfig context.** `deploy.rb` shells out to `kubectl`/`helm` (which use
+   whatever context is *current*) and `verify` reads `KubeStatus`'s
+   `@config.context` — i.e. the current context, not necessarily the cluster you
+   just deployed. `k3d cluster create` sets the new cluster current, so a
+   one-shot deploy works, but switching back and forth means `helm`/`verify` can
+   silently target the wrong cluster. There's no `--context` flag; `--kubeconfig`
+   picks a *file*, not a context. Get in the habit of checking:
+
+   ```sh
+   kubectl config current-context          # k3d-carbide-dev or k3d-carbide-dev2?
+   kubectl config use-context k3d-carbide-dev2   # switch before operating dev2
+   ```
+
+2. **One checkout = one ref.** `self_update` runs `git checkout <ref>` in the
+   single meta-repo working tree, so you can't have cluster A on `main` and
+   cluster B on an `adr/...` branch from the same checkout. Same `--ref` on both
+   is fine (they build/import the same images); different refs need a second
+   checkout of the repo.
+
+Resources roughly double (a second k3s server + CNPG Postgres + operator + MinIO
++ Traefik + workspace pod). MinIO *could* be shared across clusters (it's just an
+HTTP endpoint), but that's cross-cluster networking work — simplest is one MinIO
+per cluster.
+
+To tear one down:
+
+```sh
+k3d cluster delete carbide-dev2
+```
+
+(The `carbide-dev`/`carbide-dev2` names are the k3d *cluster* names; the kubectl
+context names are `k3d-carbide-dev`/`k3d-carbide-dev2` — the `k3d-` prefix k3d
+adds.)
+
 ## The "show me everything" commands
 
 Most useful inspection commands, roughly in the order you'd reach for them:
