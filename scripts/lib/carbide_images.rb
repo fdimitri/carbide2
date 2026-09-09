@@ -231,8 +231,8 @@ module Carbide
     # image. Omits empty values (no version in manifest → no label).
     def release_labels
       out = []
-      out += ['--label', "org.carbide.version=#{release_version}"]   if release_version.present?
-      out += ['--label', "org.carbide.codename=#{release_codename}"]  if release_codename.present?
+      out += ['--label', "org.carbide.version=#{release_version}"]   unless release_version.empty?
+      out += ['--label', "org.carbide.codename=#{release_codename}"]  unless release_codename.empty?
       out
     end
 
