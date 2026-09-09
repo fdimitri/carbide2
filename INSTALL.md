@@ -2,7 +2,8 @@
 
 This is the **meta-repo** install guide: it takes a clean host from nothing to a
 running CARB/IDE2 stack (control plane + dashboard, with per-project workspace
-pods) on a local k3d cluster.
+pods) on a local k3d cluster. The same two scripts also drive multi-node k3s and
+a self-hosted image registry — those are covered in `KUBE.md`.
 
 The two tools that do the work:
 
@@ -11,33 +12,45 @@ The two tools that do the work:
 | [`scripts/setmeup.sh`](scripts/setmeup.sh) | Provision a clean host with every dependency `deploy.rb` needs. |
 | [`scripts/deploy.rb`](scripts/deploy.rb) | Build images, bring up the cluster + infra, install the charts, set up TLS, verify. Idempotent — also the redeploy path. |
 
-> Component-specific notes live in [`carbide2-server/DEPLOY-k3d.md`](carbide2-server/DEPLOY-k3d.md).
+> `./scripts/deploy.rb --help` lists every option. All configuration is flags +
+> YAML (`--config`), not environment variables.
 
 ---
 
 ## 0. Requirements
 
-- **Ubuntu 24.04 LTS (Noble), amd64.** `setmeup.sh` hard-gates on this; other
-  Debian-family releases probably work but are untested (`--force` to try).
+- **Ubuntu 24.04 LTS (Noble) or 26.04, amd64.** `setmeup.sh` gates on these;
+  other Debian-family releases probably work but are untested (`--force` to try).
 - A normal (non-root) user with `sudo`. Do **not** run the scripts as root.
-- Outbound network access (pulls Docker, kubectl, helm, k3d, Ruby).
-- **Whatever machine and browser you'll reach the dashboard from** must trust
-  the root CA (§5) — this is independent of the deploy host's OS. The supported
-  cases are Windows, Linux, or macOS with their default browser, or Firefox on
-  any platform. (When the deploy host is WSL2 the browser is almost always the
-  Windows side, but a remote browser on any other box works the same way.)
+- Outbound network access (pulls Docker, kubectl, helm, k3d, Ruby, images).
+- **The machine + browser you'll reach the dashboard from** must trust the root
+  CA (§5) — independent of the deploy host's OS. Supported: Windows, Linux, macOS
+  with the default browser, or Firefox on any platform.
+
+---
 
 ## 1. Provision the host
 
 ```bash
 git clone --recurse-submodules https://github.com/fdimitri/carbide2.git
 cd carbide2
-./scripts/setmeup.sh --mkcert     # add --node for host-side Vite/Playwright; --all for everything
+./scripts/setmeup.sh
 ```
 
-Installs (skipping anything already present at the pinned version): apt build
-deps, Docker + buildx + compose, `kubectl v1.30.0`, helm, `k3d v5.8.3`,
-rbenv + `Ruby 3.4.2` + bundler, and — behind flags — node / socat / mkcert.
+Installs (skipping anything already at the pinned version): apt build deps,
+Docker + buildx + compose, `kubectl`, helm, rbenv + Ruby + bundler, and — for the
+k3d backend — `k3d`. mkcert and the MinIO client (`mcli`) are on by default.
+
+Useful flags:
+
+| Flag | Effect |
+|------|--------|
+| `--k3d` / `--k3s` / `--kube-backend=k3d\|k3s` | Pick the backend up front (otherwise it asks). k3s itself is installed by `deploy.rb` at deploy time, not here. |
+| `--node` | Install Node.js 20 (Vite/Playwright outside containers). |
+| `--socat` | socat (host LM Studio relay for local LLM agents). |
+| `--no-mkcert` | Skip mkcert (then `deploy.rb --no-tls`, or bring your own certs). |
+| `--registry-host=HOST` `--registry-ca=PATH` | Trust a self-hosted registry's CA in the OS store on this node. |
+| `--all` / `--force` | Turn on everything off-by-default / bypass the OS gate. |
 
 **Then log out and back in** (or `newgrp docker && exec $SHELL -l`) so the
 `docker` group membership and rbenv shell wiring take effect. Verify:
@@ -47,63 +60,101 @@ docker ps          # works without sudo
 rbenv version      # 3.4.2
 ```
 
-## 2. Choose what to deploy
+---
 
-The default branch is `main` (the deployable line). To deploy in-progress work
-from `dev`, check it out and refresh submodules:
+## 2. Configuration model
+
+`deploy.rb` reads three layers, last one wins:
+
+1. `scripts/defaults.yaml` — every default lives here.
+2. `--config input.yaml` — an override file (see `scripts/examples/`).
+3. CLI flags — every `--a.b.c` flag sets the `a.b.c` key.
+
+There are **no environment-variable knobs.** The blocks that matter (ADR-028):
+
+- **`node`** — what this box *is*: `backend` (k3d / k3s / none), `role` (k3s init / join).
+- **`images`** — what it *does* with images: `build`, `shell`, `push`, `consume` (auto / import / pull).
+- **`registry`** — where the registry is: `host`, `port`, `ca`, `serve`.
+- **`cluster`** — shared cluster facts: `name`, `http-port`, `https-port`, `server-url`, `token`.
+- **`storage`** — `backend` (local-path / longhorn).
+- **`public`** — browser-facing `host` / `url`.
+- **`jwt`** — signing-key `secret` + host-side `key-dir`.
+
+Emit the fully-resolved config (secrets included) to a file without deploying:
 
 ```bash
-git checkout dev
-git submodule update --init --recursive
+./scripts/deploy.rb --yaml-out cluster.yaml       # secrets included — keep it safe
+./scripts/deploy.rb --yaml-safeout cluster.safe.yaml  # secrets redacted
 ```
 
-`deploy.rb` self-updates to `main` by default (`DEPLOY_REF`/`--ref` overrides);
-pass `--no-pull` to deploy **exactly what you have checked out** (required when
-deploying local/dev work — see §4).
+---
 
-## 3. Deploy
-
-A real box is reached by hostname, so the TLS cert SANs and the Rails host
-allowlist must cover its FQDN. `deploy.rb` refuses to silently guess
-`localhost`:
+## 3. Deploy (single-node k3d, the default)
 
 ```bash
-export PUBLIC_HOST="$(hostname -f)"      # or e.g. carbide-ws3.frankd.local
-export TLS_HOSTS="$PUBLIC_HOST localhost 127.0.0.1 ::1 <box-LAN-IP>"
 ./scripts/deploy.rb
 ```
 
-Pipeline: ensure k3d cluster `carbide-dev` + infra → build the three images
-(`carbide2:dev`, `carbide2-control:dev`, `carbide2-shell:dev`) → import into the
-cluster → apply the Workspace CRD → helm-install the control plane → roll +
-verify. First run is slow (Ruby was source-built; helper gems compile).
+That's the whole thing for a local dev box. `deploy.rb` resolves the
+browser-facing hostname from `--public.host`, falling back to `hostname -f`; it
+**refuses to silently guess `localhost`**, so on a box reachable by name, pass it:
 
-When it finishes, the dashboard serves at **`https://<PUBLIC_HOST>:8443/`**.
+```bash
+./scripts/deploy.rb --public.host carbide-ws3.frankd.local
+```
+
+Pipeline: ensure k3d cluster `carbide-dev` + infra → build images → import into
+the cluster → apply the Workspace CRD → helm-install the control plane → roll +
+verify. First run is slow (Ruby source-built; helper gems compile).
+
+When it finishes, the dashboard serves at
+**`https://<host>:8443/`** (or `--cluster.https-port` if you overrode it).
 
 ### Ports
 
-`HTTP_PORT` / `HTTPS_PORT` are env knobs (defaults `8080` / `8443`). For a
-production-style deploy on the standard HTTPS port:
-
 ```bash
-HTTPS_PORT=443 HTTP_PORT=80 PUBLIC_HOST="$(hostname -f)" ./scripts/deploy.rb
-# dashboard then at https://<PUBLIC_HOST>/  (no port suffix)
+./scripts/deploy.rb --cluster.http-port 80 --cluster.https-port 443
+# dashboard then at https://<host>/  (no port suffix)
 ```
 
-## 4. Iterating / redeploying
+---
 
-`deploy.rb` is idempotent. Useful flags:
+## 4. Multi-node k3s + self-hosted registry
+
+Single-node k3d imports local `:dev` images; a multi-node cluster needs a
+registry every node pulls SHA-tagged images from. This is covered in depth in
+`KUBE.md`; the short version:
+
+```bash
+# one box serves the registry + pushes SHA tags
+./scripts/deploy.rb --node.backend k3s --registry.host <fqdn> --registry.serve --images.push
+# other boxes join as control-plane servers
+./scripts/deploy.rb --config cluster.yaml --node.role join
+```
+
+Replicated storage on multi-node:
+
+```bash
+./scripts/deploy.rb --storage.backend longhorn
+```
+
+---
+
+## 5. Iterating / redeploying
+
+`deploy.rb` is idempotent. Common flags:
 
 | Flag | Effect |
 |------|--------|
-| `--no-pull` | Skip the self-update; deploy exactly what's checked out. **Use this for local/dev work.** |
-| `--no-build` | Skip the image build; re-import + redeploy existing images. |
-| `--no-infra` | Skip cluster/infra bring-up (cluster already exists). |
-| `--no-tls` | Skip mkcert TLS (Traefik's default self-signed cert). |
-| `--ref <branch>` / `DEPLOY_REF` | Which meta-repo ref to deploy (default `main`). |
+| `--ref <branch>` | Meta-repo ref to deploy (default `main`). |
+| `--no-pull` | Skip self-update; deploy **exactly what's checked out** (required for local/dev work). |
+| `--no-images.build` | Skip image build (re-import + redeploy). |
+| `--no-images.shell` | Build everything except the slow `carbide2-shell` image. |
+| `--no-client` | Skip building + uploading the pinned SPA client. |
+| `--no-infra` | Skip cluster/infra bring-up (already exists). |
+| `--no-tls` | Skip mkcert TLS (Traefik default cert). |
 | `--roll-scope all\|control\|none` | Which deployments to restart after deploy. |
-
-Apply only a fresh TLS cert without rebuilding: `./scripts/deploy.rb --no-build --no-infra --no-pull`.
+| `--config FILE` | Merge a YAML config over the defaults. |
 
 Cluster lifecycle:
 
@@ -113,15 +164,17 @@ k3d cluster start carbide-dev
 k3d cluster delete carbide-dev      # full teardown
 ```
 
-## 5. Trust the root CA (the one manual step `wss://` needs)
+---
+
+## 6. Trust the root CA (the one manual step `wss://` needs)
 
 CARB/IDE2 uses WebSockets over TLS (`wss://`). A browser's click-through on an
 untrusted cert does **not** extend to the WS connection, so `wss://` silently
 fails until the signing CA is trusted on the machine running the browser.
 
 `deploy.rb` exports the mkcert root CA to **`carbide-rootCA.pem`** in the repo
-root and prints per-OS import steps at the end of a TLS run. Copy that file to
-the browser machine and import it:
+root and prints per-OS import steps at the end of a TLS run. Copy it to the
+browser machine and import it.
 
 ### Copy it off the deploy host
 
@@ -145,8 +198,7 @@ cp carbide-rootCA.pem /mnt/c/Users/Public/carbide-rootCA.pem
 # then in Windows:  certutil.exe -addstore -user -f Root C:\Users\Public\carbide-rootCA.pem
 ```
 
-Fully restart the browser afterward. **Firefox** keeps its own store — import via
-Settings → Privacy & Security → Certificates → View Certificates → Authorities → Import.
+Fully restart the browser afterward.
 
 ### Linux
 
@@ -173,27 +225,32 @@ sudo security add-trusted-cert -d -r trustRoot \
 ### Firefox (any platform)
 
 Firefox ships its own certificate store and ignores the OS/system trust above,
-so it needs a separate import **even if** you already trusted the CA for the
-system or Chrome:
+so it needs a separate import **even if** you already trusted the CA elsewhere:
 
 - Settings → Privacy & Security → Certificates → **View Certificates…**
 - **Authorities** tab → **Import…** → select `carbide-rootCA.pem`
-- Check **“Trust this CA to identify websites.”** → OK, then restart Firefox.
+- Check **"Trust this CA to identify websites."** → OK, then restart Firefox.
 
-## 6. Verify
+---
 
-- Dashboard loads at `https://<PUBLIC_HOST>:<HTTPS_PORT>/` with no cert warning.
-- Create a project → the workspace pod comes up → a terminal opens and a file
+## 7. Verify
+
+- Dashboard loads at `https://<host>:<https-port>/` with no cert warning.
+- Create a workspace → the workspace pod comes up → a terminal opens and a file
   edit round-trips.
 - Cluster health: `kubectl get pods -A` (control plane in `carbide-system`,
   workspaces in `ws-*`).
 
-## 7. Real (non-mkcert) certificates
+---
+
+## 8. Real (non-mkcert) certificates
 
 For a CA-signed cert instead of mkcert, two standalone steps bracket your CA and
 touch nothing else:
 
 ```bash
-PUBLIC_HOST=host.example.com ./scripts/deploy.rb --csr        # writes tls/<host>.key + .csr — submit the CSR
-./scripts/deploy.rb --import-cert ./tls/<host>.crt            # loads the signed cert into the Traefik default
+./scripts/deploy.rb --public.host host.example.com --csr
+# → writes tls/<host>.key + tls/<host>.csr — submit the CSR to your CA
+./scripts/deploy.rb --import-cert ./tls/<host>.crt
+# → loads the signed cert (+ the .key) as the Traefik default
 ```

@@ -35,133 +35,32 @@ as a *named build context* (`--build-context worker=...`), so the component
 Dockerfiles never clone anything — this repo's checkout supplies the source
 trees.
 
-## Prerequisites
+## Installing
 
-Supported host: **Ubuntu 24.04 LTS** and **26.04** (both tested; other
-Debian-family releases likely work but are untested). You need Docker (with
-`buildx` + `compose`), `k3d`, `kubectl`, `helm`, and a managed Ruby + Bundler.
-On a fresh box, install all of it with the provisioner:
+See **[INSTALL.md](INSTALL.md)** for the full walkthrough: prerequisites,
+`setmeup.sh`, the `deploy.rb` config model (three layers, no ENV knobs), the
+single-node k3d deploy, multi-node k3s + self-hosted registry, the CA-trust step
+`wss://` needs, and real-cert setup. `KUBE.md` covers cluster inspection and the
+multi-node registry in depth.
+
+In short, from a clean box:
 
 ```bash
 git clone --recurse-submodules https://github.com/fdimitri/carbide2.git
 cd carbide2
-./scripts/setmeup.sh            # essentials only
-./scripts/setmeup.sh --all      # + Node (client build/Playwright), socat (LLM relay), mkcert (TLS)
+./scripts/setmeup.sh     # provision the host; log out/in for the docker group
+./scripts/deploy.rb      # k3d single-node baseline
 ```
 
-It's idempotent and skips anything already present. After it runs, **log out
-and back in** (or `newgrp docker`) so the `docker` group and rbenv shell wiring
-take effect. Known-working versions (pinned in `setmeup.sh`):
+The two deploy entry points are:
 
-| Tool | Version |
-|------|---------|
-| Docker engine (+ buildx + compose v2) | 29.x |
-| k3d | v5.8.3 |
-| kubectl | v1.30+ |
-| helm | v3.x |
-| Ruby (via rbenv) | 3.4.2 |
-
-> `setmeup.sh` provisions the **k3d** deploy path used by `scripts/deploy.rb`
-> (below). It is the only deploy path (ADR-031).
-
-Give the box **≥ 80 GB** of root disk — the images are large (`carbide2-shell`
-alone is ~4 GB) and they live on the node's containerd, on the host root disk.
-
-## Stand it up
-
-Two paths. Both end at a serving dashboard; neither needs you to touch the
-submodules by hand.
-
-### Guided: `configure.rb`
-
-```bash
-./scripts/configure.rb
-```
-
-Serves a small HTTPS wizard (default `0.0.0.0:8099`, self-signed cert, minted
-token printed to the terminal). It asks about topology, public URL, registry
-and storage, shows the resolved settings as an editable tree, writes
-`cluster.yaml`, and then runs `deploy.rb` for you with the output streamed back
-to the page. For multi-node it runs the freeze-then-deploy sequence in the right
-order — the step that's easiest to get wrong by hand.
-
-The k3s backend needs root, so `sudo` is primed once in the terminal you
-launched from and kept warm (a browser can't answer a password prompt). Pass
-`--no-sudo` if you're only deploying k3d.
-
-### Direct: `deploy.rb`
-
-One idempotent command from nothing to a serving dashboard. It updates itself
-and the submodules, brings up the cluster and infra (CNPG, Traefik, Postgres,
-MinIO), builds the images, imports them into the cluster, builds and uploads
-the pinned SPA clients to the static tier, installs the Workspace CRD, and
-installs/upgrades the control plane. Re-run it after any code change; it also
-rolls the workspace pods.
-
-**Single node on k3d** — the zero-config baseline; the example matches
-`defaults.yaml`, so bare `./scripts/deploy.rb` does the same thing. Storage is
-node-local `local-path`, and k3d publishes the ingress on host 8080/8443.
-
-```bash
-./scripts/deploy.rb --config examples/k3d-local.yaml
-```
-
-Dashboard at <https://localhost:8443/> (plain-HTTP <http://localhost:8080/>
-redirects there; the dev cert is self-signed, so your browser will warn the
-first time). The seed user is `admin@example.com` / `password`.
-
-**Single node on host-native k3s** — no Docker-in-the-middle; the ingress binds
-the host's real 80/443 via klipper ServiceLB, so the box is reachable at its own
-FQDN with no port mapping.
-
-```bash
-./scripts/deploy.rb --config examples/k3s-single-local.yaml
-```
-
-Set `public.host` in that file if `hostname -f` isn't the name you actually
-browse to — it drives the ingress host rule, the mkcert SAN, and host-based
-auth.
-
-**Multi-node k3s with Longhorn** — a two-step flow, because `cluster.token` must
-be minted once and shared: freeze the resolved config, then deploy every node
-from that one frozen file. Pods can land on any node, so images come from a
-self-hosted registry rather than a per-node import.
-
-```bash
-./scripts/deploy.rb --config examples/k3s-multinode-longhorn.yaml \
-    --cluster.server-url https://<this-node>:6443 --yaml-out cluster.yaml
-./scripts/deploy.rb --config cluster.yaml                      # first node
-./scripts/deploy.rb --config cluster.yaml --cluster.role join  # every other node
-```
-
-Read [KUBE.md](KUBE.md) before running that one
-— the registry CA trust, the join sequence, and the freeze-vs-deploy distinction
-all matter, and the header comment in the example config walks through why each
-override is there.
-
-Useful flags:
-
-| Flag | Effect |
-|------|--------|
-| `--no-build` | Skip the image build; re-import and redeploy only |
-| `--no-client` | Skip building/uploading the SPA client |
-| `--no-shell` | Build everything except the `carbide2-shell` image |
-| `--no-infra` | Skip cluster/infra bring-up |
-| `--no-pull` | Skip the self-update (git pull + submodules) step |
-| `--no-tls` | Skip mkcert TLS setup (Traefik default cert) |
-| `--cluster.backend k3s` | Deploy to host-native k3s instead of k3d |
-| `--storage.backend longhorn` | Replicated RWO storage (multi-node) |
-| `--registry.host HOST` | Push SHA-tagged images to a self-hosted registry every node pulls from |
-
-Configuration is three layers merged last-wins: `scripts/defaults.yaml`, then
-`--config <file>`, then any `--a.b.c` CLI flag. There are no ENV knobs. Freeze
-the fully-resolved config with `--yaml-out FILE` (or `--yaml-safeout FILE` to
-redact secrets); freezing exits without deploying. `--help` lists everything.
-
-The orchestrator is Ruby: it shells out to `docker`/`k3d`/`helm` for the
-build/deploy steps but reads cluster state (pod readiness, Workspace CR phases)
-through `kubeclient` — the same client the operator uses — for its verification
-report. The gems it needs are installed on first run via `bundler/inline`.
+- **`./scripts/configure.rb`** — a small HTTPS wizard (default `:8099`) that asks
+  about topology, registry, and storage, writes `cluster.yaml`, and runs
+  `deploy.rb` for you, streaming output back to the page. `--no-sudo` skips the
+  root prompt when you're only deploying k3d.
+- **`./scripts/deploy.rb`** — the idempotent orchestrator. `--help` lists every
+  option; configuration is `scripts/defaults.yaml` → `--config <file>` →
+  `--a.b.c` flags, with no environment-variable knobs.
 
 ## Building images without deploying
 
