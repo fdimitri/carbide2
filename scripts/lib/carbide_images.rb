@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'fileutils'
+require 'yaml'
 require_relative 'carbide_command'
 require_relative 'carbide_registry'
 
@@ -63,6 +64,23 @@ module Carbide
 
     def registry_host = @registry_obj&.host
     def registry_port = @registry_obj&.port
+
+    # The release manifest (manifest.yaml at the meta root) — authoritative
+    # version + codename, stamped into every image as OCI labels + runtime env.
+    # Returns an empty hash when the file is absent/unreadable so a bare build
+    # still works; the version is then simply unknown/nil.
+    def manifest
+      @manifest ||= begin
+        path = File.join(@root, 'manifest.yaml')
+        File.file?(path) ? (YAML.load_file(path) || {}) : {}
+      rescue StandardError => e
+        log "manifest.yaml unreadable: #{e.class}: #{e.message}"
+        {}
+      end
+    end
+
+    def release_version  = manifest['version'].to_s.strip
+    def release_codename = manifest['codename'].to_s.strip
 
     # 12-char short SHA of the checkout in `dir` (matches build-all.sh).
     def short_sha(dir)
@@ -179,22 +197,27 @@ module Carbide
 
     # Faithfully mirrors build-all.sh's three buildx invocations. Always tags the
     # local :dev ref and additionally the registry SHA ref when a registry is set.
+    # The release version/codename are stamped in as both build args (persisted
+    # as runtime env by the Dockerfiles) and OCI labels (visible in the registry).
     def build_component(component, quiet:)
       tags = ['-t', local_ref(component)]
       tags += ['-t', image_ref(component)] if @registry
       meta = ["META_SHA=#{short_sha(@root)}", "CLIENT_SHA=#{short_sha(@client)}",
-              "BUILD_TIME=#{build_time}"]
+              "BUILD_TIME=#{build_time}",
+              "VERSION=#{release_version}", "CODENAME=#{release_codename}"]
+      labels = release_labels
       case component
       when :workspace
-        run_build(quiet, 'docker', 'buildx', 'build', '--load', *tags,
+        run_build(quiet, 'docker', 'buildx', 'build', '--load', *tags, *labels,
                   *build_args(*meta, "SERVER_SHA=#{short_sha(@server)}",
                               "WORKER_SHA=#{short_sha(@worker)}"),
                   '--build-context', "worker=#{@worker}", @server)
       when :control
-        run_build(quiet, 'docker', 'buildx', 'build', '--load', *tags,
+        run_build(quiet, 'docker', 'buildx', 'build', '--load', *tags, *labels,
                   *build_args(*meta, "CONTROL_SHA=#{short_sha(@control)}"), @control)
       when :shell
-        run_build(quiet, 'docker', 'buildx', 'build', '--load', *tags,
+        run_build(quiet, 'docker', 'buildx', 'build', '--load', *tags, *labels,
+                  *build_args("VERSION=#{release_version}", "CODENAME=#{release_codename}"),
                   '-f', File.join(@server, 'Dockerfile.shell'), @server)
       else
         raise ArgumentError, "unknown component: #{component.inspect}"
@@ -202,6 +225,16 @@ module Carbide
     end
 
     def build_args(*pairs) = pairs.flat_map { |p| ['--build-arg', p] }
+
+    # OCI labels carrying the release version + codename, so the registry's
+    # image manifest (config.Labels) is self-describing without running the
+    # image. Omits empty values (no version in manifest → no label).
+    def release_labels
+      out = []
+      out += ['--label', "org.carbide.version=#{release_version}"]   if release_version.present?
+      out += ['--label', "org.carbide.codename=#{release_codename}"]  if release_codename.present?
+      out
+    end
 
     # Run a build either streaming (build.rb: user watches progress; raises on
     # failure) or captured (deploy.rb: surface output only on failure).
