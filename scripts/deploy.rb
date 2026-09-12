@@ -604,21 +604,22 @@ module Carbide
     # time. Runs after ensure_infra (which brings MinIO up) so the upload target
     # exists. --no-client skips it (e.g. redeploys that don't touch the client).
     def build_and_upload_client
-      %w[workspace control].each do |mode|
-        args = ['--mode', mode]
-        env  = { 'CARBIDE_MINIO_NS' => @control_ns }
-        # With a registry configured, the client bundle is cached there
-        # (<registry-prefix>/carbide2-client:<family>-<sha>): the first deploy
-        # builds + pushes it, every later deploy (on this or any other cluster)
-        # pulls it instead of re-running Vite. Keyed by the pinned client SHA.
-        if @registry&.configured?
-          args += ['--cache', @registry.prefix.chomp('/')]
-          env['REGISTRY_USERNAME'] = @registry.username if @registry.username
-          env['REGISTRY_PASSWORD'] = @registry.password if @registry.password
-        end
-        quiet_run("building + uploading the pinned '#{mode}' SPA client to the MinIO static tier",
-                  File.join(@root, 'scripts', 'build-client'), *args, env: env)
+      # ONE invocation builds BOTH families (workspace + control) from the pinned
+      # client SHA and uploads each to its MinIO family prefix. Splitting the two
+      # modes into separate builds was needless — same source, published together.
+      args = []
+      env  = { 'CARBIDE_MINIO_NS' => @control_ns }
+      # With a registry configured, the bundle is cached there as one artifact per
+      # client SHA (<registry-prefix>/carbide2-client:<sha>): the first deploy
+      # builds + pushes it, every later deploy (on this or any other cluster)
+      # pulls it instead of re-running Vite.
+      if @registry&.configured?
+        args += ['--cache', @registry.prefix.chomp('/')]
+        env['REGISTRY_USERNAME'] = @registry.username if @registry.username
+        env['REGISTRY_PASSWORD'] = @registry.password if @registry.password
       end
+      quiet_run('building + uploading the pinned SPA client (workspace + control) to the MinIO static tier',
+                File.join(@root, 'scripts', 'build-client'), *args, env: env)
     end
 
     # Image tagging, building, and registry lifecycle all live in the shared

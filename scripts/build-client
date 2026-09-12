@@ -1,31 +1,27 @@
 #!/usr/bin/env bash
-# build-client — build a carbide2-client SHA and inject it into the MinIO
-# static tier (the ONLY place a built client lives).
+# build-client — build a carbide2-client SHA and publish it to the MinIO static
+# tier (the ONLY place a built client is served from).
 #
-# Each build is compiled with an ABSOLUTE Vite base of
-#   /clients/<family>/<sha>/
-# so its asset URLs point straight at the static tier regardless of which
-# workspace/control pod's loader serves the index.html. The build (index.html,
-# assets/*, plus a generated manifest.json) is uploaded to the MinIO `clients`
-# bucket under key <family>/<sha>/…, which the tier then serves at the matching
-# /clients/<family>/<sha>/… path.
+# ONE client source, TWO served families. The workspace SPA and the control
+# dashboard are the same carbide2-client source built with different
+# VITE_CARBIDE_MODE and an ABSOLUTE Vite base of /clients/<family>/<sha>/, so:
+#   workspace -> family carbide2-client  (served by workspace pods)
+#   control   -> family carbide2-control (the dashboard, served by control)
+# They are built together and published together; there is no reason to build
+# one without the other (the client recombines them at runtime).
 #
-# Nothing is baked into any image — adding a client at runtime is just this
-# upload. The client picker (GET /api/clients) then offers the new build.
-#
-# Both the workspace SPA and the control dashboard are built from the SAME
-# carbide2-client source; they differ only by VITE_CARBIDE_MODE, which the
-# --mode flag selects. Each mode is a distinct static-tier family:
-#   --mode workspace  -> family carbide2-client   (VITE_CARBIDE_MODE=workspace)
-#   --mode control    -> family carbide2-control  (VITE_CARBIDE_MODE=control)
+# Registry cache (--cache <image-prefix>): the bundle is ALSO pushed to the
+# container registry as ONE artifact per client SHA (carbide2-client:<sha>,
+# /workspace + /control inside), so N deploys across clusters share ONE build —
+# pull if present, else build. The MinIO upload (the serving path) is unchanged.
 #
 # Usage:
-#   scripts/build-client                       # workspace family, pinned HEAD
-#   scripts/build-client <sha|ref>             # workspace family, any client commit
-#   scripts/build-client --mode control        # control family, pinned HEAD
-#   scripts/build-client --mode control <ref>  # control family, any client commit
+#   scripts/build-client                       # pinned HEAD -> both families
+#   scripts/build-client <sha|ref>             # any client commit
 #   CARBIDE_CLIENT_LABEL="rc3" scripts/build-client <ref>
-#   scripts/build-client --cache $CI_REGISTRY_IMAGE   # push/pull the bundle via the registry
+#   scripts/build-client --cache $CI_REGISTRY_IMAGE
+#   scripts/build-client --cache $CI_REGISTRY_IMAGE --no-upload   # CI: push the
+#                       registry artifact only; a deploy later pulls + uploads
 #
 # Env:
 #   CARBIDE_MINIO_NS   (default carbide-system)  namespace of the MinIO service
@@ -40,8 +36,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# The client source is always the carbide2-client submodule; the FAMILY that a
-# build is published under is derived from --mode below.
 SRC="$ROOT/carbide2-client"
 NS="${CARBIDE_MINIO_NS:-carbide-system}"
 MINIO_SVC="${CARBIDE_MINIO_SVC:-minio}"
@@ -50,17 +44,39 @@ NODE_IMAGE="${CARBIDE_NODE_IMAGE:-node:22-alpine}"
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
-# --- registry cache (optional) ---------------------------------------------
-# --cache <image-prefix> uses the container registry as a build cache for the
-# client bundle, so N deploys share ONE build: pull+extract if present (no
-# Vite), else build, then push the tagged bundle with its org.carbide.* labels.
+# Per-step timing. Every build prints how long each step took, so the numbers
+# decide whether to parallelize the mode builds or warm the npm cache.
+since() { printf '%ss' "$((SECONDS - $1))"; }
+T0=$SECONDS
+
+# The two served families, in build order. Mode name -> MinIO family name.
+MODES=(workspace control)
+family_for() { case "$1" in workspace) echo carbide2-client ;; control) echo carbide2-control ;; esac; }
+
+# --- args: [--cache <prefix>] [<ref>] ---------------------------------------
 CACHE=""
+REF=""
+UPLOAD=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --cache) CACHE="${2:?--cache needs a value}"; shift 2 ;;
+    --cache=*) CACHE="${1#--cache=}"; shift ;;
+    --no-upload) UPLOAD=0; shift ;;
+    -h|--help) sed -n '2,/^set -euo/p' "$0" | sed -e '/^set -euo/d' -e 's/^# \{0,1\}//'; exit 0 ;;
+    -*) die "unknown flag: $1" ;;
+    *) [ -z "$REF" ] || die "unexpected extra arg: $1"; REF="$1"; shift ;;
+  esac
+done
+REF="${REF:-HEAD}"
+
 # The client carries its OWN version, independent of the meta manifest: it moves
-# at its own cadence (fast or slow), so stamping it with manifest.yaml would lie.
-# Read it from the pinned client checkout (package.json + src/version.js).
+# at its own cadence (fast or slow), so the meta release version would be a lie.
+# Read it from the pinned checkout (package.json + src/version.js).
 client_version()  { sed -nE 's/.*"version":[[:space:]]*"([^"]+)".*/\1/p' "$1" | head -1; }
 client_codename() { sed -nE "s/.*CODENAME[[:space:]]*=[[:space:]]*'([^']+)'.*/\1/p" "$1" | head -1; }
-cache_ref() { printf '%s/carbide2-client:%s-%s' "$CACHE" "$FAMILY" "$SHORT"; }
+
+# --- registry cache helpers --------------------------------------------------
+cache_ref() { printf '%s/carbide2-client:%s' "$CACHE" "$SHORT"; }
 cache_login() {
   local host="${CACHE%%/*}" user pass
   user="${REGISTRY_USERNAME:-${CI_REGISTRY_USER:-}}"
@@ -69,70 +85,45 @@ cache_login() {
   printf '%s' "$pass" | docker login "$host" -u "$user" --password-stdin >/dev/null 2>&1 \
     || warn "docker login to $host failed (will try pull/push anyway)"
 }
-cache_has()  { docker manifest inspect "$(cache_ref)" >/dev/null 2>&1; }
+cache_has() { docker manifest inspect "$(cache_ref)" >/dev/null 2>&1; }
 cache_pull() {
   local ref cid; ref="$(cache_ref)"
-  log "cache hit — pulling $ref"
+  ref="$(cache_ref)"; log "cache hit — pulling $ref"
   docker pull "$ref" >/dev/null
-  mkdir -p "$DIST"
+  mkdir -p "$DIST_WS" "$DIST_CTL"
   cid="$(docker create "$ref")"
-  docker cp "$cid:/dist/." "$DIST" >/dev/null
+  docker cp "$cid:/workspace/." "$DIST_WS"  >/dev/null
+  docker cp "$cid:/control/."   "$DIST_CTL" >/dev/null
   docker rm "$cid" >/dev/null
 }
 cache_push() {
-  local ref ctx labels; ref="$(cache_ref)"; ctx="$(mktemp -d)"
-  labels="$(client_labels)"
-  printf 'FROM scratch\nCOPY dist /dist\n' > "$ctx/Dockerfile"
-  cp -a "$DIST" "$ctx/dist"
+  local ref ctx; ref="$(cache_ref)"; ctx="$(mktemp -d)"
+  printf 'FROM scratch\nCOPY workspace /workspace\nCOPY control /control\n' > "$ctx/Dockerfile"
+  cp -a "$DIST_WS" "$ctx/workspace"
+  cp -a "$DIST_CTL" "$ctx/control"
   # shellcheck disable=SC2086
-  docker build --quiet -t "$ref" $labels "$ctx" >/dev/null
+  docker build --quiet -t "$ref" $(client_labels) "$ctx" >/dev/null
   docker push "$ref" >/dev/null
   rm -rf "$ctx"
   log "pushed cache artifact $ref"
 }
 
-# OCI labels for the client bundle. Same org.carbide.* namespace the images use
-# (org.carbide.version / codename), so any tool reads one label name regardless
-# of artifact — that the version is the CLIENT's is implied by the image name
-# (carbide2-client), not by the key. Values come from the client's OWN version
-# info (CLIENT_VER/CLIENT_CODENAME, read from the pinned checkout), never the
-# meta manifest; the client versions independently. Empty values are omitted.
+# OCI labels: the SAME org.carbide.* keys the images expose (version, codename,
+# build_time, commit_time), so a reader uses one label name on any artifact. The
+# values are the CLIENT's own version + the client commit's times; that they are
+# the client's is implied by the image name (carbide2-client). No sha/family
+# label — both already live in the tag / the served path. Empty values omitted.
 client_labels() {
   local out=""
   add() { [ -n "$2" ] && out="$out --label $1=$2"; }
   add org.carbide.version    "$CLIENT_VER"
   add org.carbide.codename   "$CLIENT_CODENAME"
-  add org.carbide.sha        "$SHORT"
-  add org.carbide.family     "$FAMILY"
   add org.carbide.build_time "$BUILD_TIME"
+  add org.carbide.commit_time "$COMMIT_TIME"
   printf '%s' "$out"
 }
 
-# --- args: [--mode workspace|control] [<ref>] ------------------------------
-MODE="workspace"
-REF=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --mode) MODE="${2:?--mode needs a value}"; shift 2 ;;
-    --mode=*) MODE="${1#--mode=}"; shift ;;
-    --cache) CACHE="${2:?--cache needs a value}"; shift 2 ;;
-    --cache=*) CACHE="${1#--cache=}"; shift ;;
-    -h|--help) sed -n '2,/^set -euo/p' "$0" | sed -e '/^set -euo/d' -e 's/^# \{0,1\}//'; exit 0 ;;
-    -*) die "unknown flag: $1" ;;
-    *) [ -z "$REF" ] || die "unexpected extra arg: $1"; REF="$1"; shift ;;
-  esac
-done
-REF="${REF:-HEAD}"
-
-case "$MODE" in
-  workspace) FAMILY="carbide2-client" ;;
-  control)   FAMILY="carbide2-control" ;;
-  *) die "invalid --mode '$MODE' (want: workspace | control)" ;;
-esac
-
-# Resolve the MinIO client. Accept an explicit CARBIDE_MC, else probe common
-# names, verifying each is really the MinIO client (its --version mentions
-# "minio") so we never mistake Midnight Commander's `mc` for it.
+# --- resolve the MinIO client ------------------------------------------------
 is_minio_mc() { command -v "$1" >/dev/null 2>&1 && "$1" --version 2>&1 | grep -qi minio; }
 MC=""
 for cand in "${CARBIDE_MC:-}" mcli mc "$HOME/.local/bin/mcli"; do
@@ -142,8 +133,8 @@ done
 [ -n "$MC" ] || die "MinIO client not found (tried mcli, mc). Install it or set CARBIDE_MC. On Debian, 'mc' is Midnight Commander, not MinIO."
 
 [ -d "$SRC" ] || die "client submodule missing: $SRC (git submodule update --init)"
-command -v docker  >/dev/null || die "docker not found"
-command -v kubectl >/dev/null || die "kubectl not found"
+command -v docker >/dev/null || die "docker not found"
+if [ "$UPLOAD" -eq 1 ]; then command -v kubectl >/dev/null || die "kubectl not found (needed to upload to MinIO; use --no-upload to skip)"; fi
 
 # Resolve the ref to a full commit, fetching from origin if it isn't local yet.
 SHA="$(git -C "$SRC" rev-parse --verify --quiet "${REF}^{commit}" || true)"
@@ -155,7 +146,6 @@ fi
 [ -n "$SHA" ] || die "cannot resolve client ref '$REF' to a commit"
 
 SHORT="$(git -C "$SRC" rev-parse --short=12 "$SHA")"
-BASE="/clients/$FAMILY/$SHORT/"
 BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # Git commit time (UTC Zulu) is the ONLY reliable "newness" key: build_time is
 # just when this script ran, so building an OLD commit today makes it look newer
@@ -176,50 +166,76 @@ trap cleanup EXIT
 # submodule's checked-out state.
 git -C "$SRC" worktree add --detach --force "$WORKTREE" "$SHA" >/dev/null
 
-# Build in a container matching the Dockerfile's dashboard-build stage.
-# Run as the host user so everything the build writes (dist/, node_modules,
-# manifest.json below) is owned by us, not root — otherwise the host-side steps
-# that follow can't write into the container-created dist/. HOME=/app keeps
-# npm's cache inside the (host-owned, writable) worktree.
-DIST="$WORKTREE/dist"
+DIST_WS="$WORKTREE/dist-workspace"
+DIST_CTL="$WORKTREE/dist-control"
 # The client's own version, from the pinned checkout (not the meta manifest).
 CLIENT_VER="$(client_version "$WORKTREE/package.json")"
 CLIENT_CODENAME="$(client_codename "$WORKTREE/src/version.js")"
 [ -n "$CLIENT_VER" ] || warn "client package.json has no version; bundle will be unstamped"
+
 PULLED=0
 if [ -n "$CACHE" ]; then
+  # Login BEFORE the manifest check: an authenticated registry (GitLab) 401s an
+  # anonymous `docker manifest inspect`, so checking first would always miss and
+  # rebuild every time.
   cache_login
-  if cache_has; then cache_pull; PULLED=1; fi
+  if cache_has; then t=$SECONDS; cache_pull; log "cache pull ($(since $t))"; PULLED=1; fi
 fi
 
 if [ "$PULLED" -eq 0 ]; then
-  log "building $FAMILY @ $SHORT (mode=$MODE, base=$BASE)"
-  log "npm ci + vite build (node container)"
+  # Install dependencies ONCE. The two mode builds differ only in
+  # VITE_CARBIDE_MODE — not deps — so a second `npm ci` would just wipe and
+  # reinstall node_modules for nothing (npm ci is one of the slowest steps).
+  # Run as the host user so the build writes files owned by us, not root; HOME
+  # keeps npm's cache inside the (writable) worktree.
+  log "npm ci (node container)"
+  t=$SECONDS
   docker run --rm \
     --user "$(id -u):$(id -g)" \
     -e HOME=/app \
     -v "$WORKTREE":/app -w /app \
-    -e VITE_CARBIDE_MODE="$MODE" \
-    -e VITE_APP_CLIENT_SHA="$SHORT" \
-    -e VITE_APP_BUILD_TIME="$BUILD_TIME" \
-    "$NODE_IMAGE" \
-    sh -c "npm ci --no-audit --no-fund && npx vite build --base=$BASE"
-  [ -f "$DIST/index.html" ] || die "build produced no dist/index.html"
-  [ -n "$CACHE" ] && cache_push
-fi
-[ -f "$DIST/index.html" ] || die "no dist/index.html after pull/build"
+    "$NODE_IMAGE" sh -c "npm ci --no-audit --no-fund"
+  log "npm ci ($(since $t))"
 
-# Manifest travels with the build; the registry/loader reads it to label the
-# build in the picker and (later) enforce compatibility floors.
-floors_json() {
-  local out="{}" first=1 add
-  add() { [ -n "$2" ] || return 0; out="${out%\}}"; [ $first -eq 1 ] && first=0 || out="$out,"; out="$out\"$1\":\"$2\"}"; }
-  add protocol "${CARBIDE_FLOOR_PROTOCOL:-}"
-  add server   "${CARBIDE_FLOOR_SERVER:-}"
-  add worker   "${CARBIDE_FLOOR_WORKER:-}"
-  printf '%s' "$out"
-}
-cat > "$DIST/manifest.json" <<JSON
+  for MODE in "${MODES[@]}"; do
+    FAMILY="$(family_for "$MODE")"
+    BASE="/clients/$FAMILY/$SHORT/"
+    DIST="$WORKTREE/dist-$MODE"
+    log "building $FAMILY @ $SHORT (mode=$MODE, base=$BASE)"
+    t=$SECONDS
+    docker run --rm \
+      --user "$(id -u):$(id -g)" \
+      -e HOME=/app \
+      -v "$WORKTREE":/app -w /app \
+      -e VITE_CARBIDE_MODE="$MODE" \
+      -e VITE_APP_CLIENT_SHA="$SHORT" \
+      -e VITE_APP_BUILD_TIME="$BUILD_TIME" \
+      "$NODE_IMAGE" \
+      sh -c "npx vite build --base=$BASE --outDir dist-$MODE"
+    [ -f "$DIST/index.html" ] || die "build produced no dist/index.html ($MODE)"
+    log "vite build $MODE ($(since $t))"
+  done
+  if [ -n "$CACHE" ]; then t=$SECONDS; cache_push; log "cache push ($(since $t))"; fi
+fi
+
+for MODE in "${MODES[@]}"; do
+  FAMILY="$(family_for "$MODE")"
+  BASE="/clients/$FAMILY/$SHORT/"
+  DIST="$WORKTREE/dist-$MODE"
+  [ -f "$DIST/index.html" ] || die "no dist/index.html for $MODE after pull/build"
+
+  # Manifest travels with the build; the loader reads it to label the build in
+  # the picker and (later) enforce compatibility floors. Falls back to build_time
+  # for pre-commit_time manifests; commit_time is the real "newness" key.
+  floors_json() {
+    local out="{}" first=1 add
+    add() { [ -n "$2" ] || return 0; out="${out%\}}"; [ $first -eq 1 ] && first=0 || out="$out,"; out="$out\"$1\":\"$2\"}"; }
+    add protocol "${CARBIDE_FLOOR_PROTOCOL:-}"
+    add server   "${CARBIDE_FLOOR_SERVER:-}"
+    add worker   "${CARBIDE_FLOOR_WORKER:-}"
+    printf '%s' "$out"
+  }
+  cat > "$DIST/manifest.json" <<JSON
 {
   "family": "$FAMILY",
   "mode": "$MODE",
@@ -234,14 +250,15 @@ cat > "$DIST/manifest.json" <<JSON
   "floors": $(floors_json)
 }
 JSON
+done
 
-# Upload to MinIO over a kubectl port-forward. Reads are anonymous (the tier),
-# but uploads use the root credentials from the k8s secret.
-log "uploading to minio://clients/$FAMILY/$SHORT/  (via $MC)"
+# Upload BOTH families to MinIO over a kubectl port-forward. Reads are anonymous
+# (the tier), but uploads use the root credentials from the k8s secret.
+if [ "$UPLOAD" -eq 1 ]; then
+log "uploading to minio://clients/<family>/$SHORT/  (via $MC)"
 MINIO_USER="$(kubectl -n "$NS" get secret minio-credentials -o jsonpath='{.data.root-user}' | base64 -d)"
 MINIO_PASS="$(kubectl -n "$NS" get secret minio-credentials -o jsonpath='{.data.root-password}' | base64 -d)"
 
-# Use a per-run config dir so we never touch the user's real mc aliases.
 MC_CFG="$WORKTREE/.mc"
 mc_run() { "$MC" --config-dir "$MC_CFG" "$@"; }
 
@@ -253,22 +270,25 @@ until mc_run alias set carbide-tier http://127.0.0.1:9000 "$MINIO_USER" "$MINIO_
   n=$((n+1)); [ "$n" -gt 30 ] && die "minio unreachable via port-forward (see /tmp/carbide-minio-pf.log)"
   sleep 1
 done
-mc_run mirror --overwrite --remove "$DIST" "carbide-tier/clients/$FAMILY/$SHORT"
+
+t=$SECONDS
+for MODE in "${MODES[@]}"; do
+  FAMILY="$(family_for "$MODE")"
+  mc_run mirror --overwrite --remove "$WORKTREE/dist-$MODE" "carbide-tier/clients/$FAMILY/$SHORT"
+done
+log "minio upload ($(since $t))"
 
 # Regenerate the registry index. The in-cluster loaders (server + control) can't
 # list the bucket over anonymous GET, so they read this single object to know
-# which builds exist and which is newest per family. It's rebuilt from scratch
-# each upload (authoritative + self-healing) by listing every build's
-# manifest.json with the authenticated client and aggregating with jq.
+# which builds exist and which is newest per family. Rebuilt from scratch each
+# upload (authoritative + self-healing) by listing every build's manifest.json.
 log "regenerating clients/registry.json index"
+t=$SECONDS
 manifest_keys="$(mc_run --json ls --recursive "carbide-tier/clients/" \
   | jq -r 'select(.key | endswith("manifest.json")) | .key')"
 
 registry_tmp="$WORKTREE/registry.json"
 if [ -n "$manifest_keys" ]; then
-  # Cat each manifest, then group by family and sort newest-first by commit_time
-  # (git commit date), falling back to build_time for pre-commit_time manifests.
-  # shellcheck disable=SC2086
   while IFS= read -r key; do
     [ -n "$key" ] || continue
     mc_run cat "carbide-tier/clients/$key"
@@ -286,5 +306,10 @@ else
 fi
 
 mc_run cp "$registry_tmp" "carbide-tier/clients/registry.json" >/dev/null
+log "registry index ($(since $t))"
 
-log "done: $FAMILY @ $SHORT is available at /clients/$FAMILY/$SHORT/ (label: $LABEL)"
+else
+  log "--no-upload: registry artifact only; a deploy pulls it and uploads to MinIO"
+fi
+
+log "done: client @ $SHORT available at /clients/<family>/$SHORT/ for workspace + control (label: $LABEL) — total $(since $T0)"

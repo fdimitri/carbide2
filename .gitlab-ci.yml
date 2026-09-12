@@ -24,38 +24,14 @@ variables:
   GIT_SUBMODULE_STRATEGY: recursive
 
 # ---------------------------------------------------------------------------
-# probe — TEMPORARY, for diagnosing runner scheduling. Remove once CI is green.
-#   probe:untagged — no tags: matches any available runner (tests the scheduler
-#                    path with NO tag filtering).
-#   probe:tagged   — tags: [build-fast]: identical tag requirement as
-#                    build:images. If only one of the two runs, tags are the
-#                    variable; if neither runs, it is not tags.
+# .ci-registry — the CI_ registry variables derived into the REGISTRY_* form the
+# scripts read. Shared (via !reference) by every job that touches the registry.
+# GitLab injects: CI_REGISTRY (host[:port]), CI_REGISTRY_IMAGE (host/ns/proj),
+# CI_REGISTRY_USER + CI_REGISTRY_PASSWORD (or CI_JOB_TOKEN) — the push creds.
+# An explicit REGISTRY_* variable still wins (the generic self-hosted case).
 # ---------------------------------------------------------------------------
-probe:untagged:
-  stage: build
+.ci-registry:
   script:
-    - echo "probe:untagged ran on $(hostname) as $(id -un)"
-
-probe:tagged:
-  stage: build
-  tags: [build-fast]
-  script:
-    - echo "probe:tagged ran on $(hostname) as $(id -un)"
-
-# ---------------------------------------------------------------------------
-# build — control + server-worker (workspace) images to the registry.
-# ---------------------------------------------------------------------------
-build:images:
-  stage: build
-  tags: [build-fast]
-  script:
-    # GitLab injects the registry coordinates into every job as CI_ variables —
-    # use them rather than asking for REGISTRY_* by hand:
-    #   CI_REGISTRY        host[:port]            (the registry endpoint)
-    #   CI_REGISTRY_IMAGE  host[:port]/<ns>/<proj> (the image path prefix)
-    #   CI_REGISTRY_USER / CI_REGISTRY_PASSWORD    (auto-scoped push credentials)
-    # CI_REGISTRY_PASSWORD is a per-job token, or CI_JOB_TOKEN. Anything set
-    # explicitly as a REGISTRY_* variable still wins, for the generic case.
     - |
       REGISTRY_HOST="${REGISTRY_HOST:-$(echo "$CI_REGISTRY" | cut -d: -f1)}"
       REGISTRY_PORT="${REGISTRY_PORT:-$(echo "$CI_REGISTRY" | sed -n 's/^[^:]*:\([0-9]*\)$/\1/p')}"
@@ -66,6 +42,15 @@ build:images:
       [ -n "$REGISTRY_HOST" ] || { echo "no registry: CI_REGISTRY unset"; exit 1; }
       export REGISTRY_HOST REGISTRY_PORT REGISTRY_PATH REGISTRY_MODE REGISTRY_USERNAME REGISTRY_PASSWORD
     - echo "registry $REGISTRY_HOST:$REGISTRY_PORT path=$REGISTRY_PATH mode=$REGISTRY_MODE user=$REGISTRY_USERNAME"
+
+# ---------------------------------------------------------------------------
+# build — control + server-worker (workspace) images to the registry.
+# ---------------------------------------------------------------------------
+build:images:
+  stage: build
+  tags: [build-fast]
+  script:
+    - !reference [.ci-registry, script]
     # build.rb reads REGISTRY_* from the environment (and env wins nothing over
     # flags), so no registry values are passed on argv — the password/token never
     # lands in the job trace. Only the component list and --no-serve-registry
@@ -86,6 +71,22 @@ build:images:
     - scripts/build.rb $ARGS
   rules:
     - if: $CI_PIPELINE_SOURCE == "push"          # every push
+    - if: $CI_COMMIT_TAG
+
+# ---------------------------------------------------------------------------
+# build — the client bundle, ONE artifact per client SHA in the registry
+# (carbide2-client:<sha>, both the workspace + control builds inside). Building
+# it here means a deploy only PULLS it and uploads to MinIO — the build-once
+# the cache exists for. --no-upload: no kubectl/cluster access needed here.
+# ---------------------------------------------------------------------------
+build:client:
+  stage: build
+  tags: [build-fast]
+  script:
+    - !reference [.ci-registry, script]
+    - scripts/build-client --cache "$CI_REGISTRY_IMAGE" --no-upload
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
     - if: $CI_COMMIT_TAG
 
 # ---------------------------------------------------------------------------

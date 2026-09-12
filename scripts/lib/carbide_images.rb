@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'fileutils'
+require 'time'
 require 'yaml'
 require_relative 'carbide_command'
 require_relative 'carbide_release'
@@ -81,6 +82,22 @@ module Carbide
       (out || '').strip
     end
 
+    # Committer date (UTC Zulu) of the last commit in `dir` (optionally limited
+    # to a path). This is the artifact's "when did the source last move" stamp —
+    # unlike build_time it is stable across rebuilds, so a registry reader can
+    # tell which of two builds of the same tag is genuinely newer.
+    def commit_time(dir, path = nil)
+      args = ['git', '-C', dir, 'log', '-1', '--format=%cI']
+      args += ['--', path] if path
+      out, = @cmd.run!(*args)
+      t = begin
+        Time.iso8601((out || '').strip)
+      rescue ArgumentError
+        nil
+      end
+      t&.utc&.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end
+
     # 12-char git blob hash of a single file's contents. Used to tag an image
     # whose only build input is that file, so unrelated repo commits (docs, app
     # code) don't churn its tag and force a needless rebuild.
@@ -99,6 +116,18 @@ module Carbide
         workspace: "#{short_sha(@server)}-#{short_sha(@worker)}",
         control:   short_sha(@control),
         shell:     blob_sha(File.join(@server, 'Dockerfile.shell'))
+      }
+    end
+
+    # Commit time per component. Workspace ships server+worker, so its stamp is
+    # the NEWEST of the two (a change to either is a change to the image). Shell
+    # is built purely from Dockerfile.shell, so it tracks that file's own commit,
+    # matching its content-addressed tag. with_refs resets the memo.
+    def commit_times
+      @commit_times ||= {
+        workspace: [commit_time(@server), commit_time(@worker)].compact.max,
+        control:   commit_time(@control),
+        shell:     commit_time(@server, 'Dockerfile.shell')
       }
     end
 
@@ -202,7 +231,7 @@ module Carbide
       meta = ["META_SHA=#{short_sha(@root)}", "CLIENT_SHA=#{short_sha(@client)}",
               "BUILD_TIME=#{build_time}",
               "VERSION=#{release_version}", "CODENAME=#{release_codename}"]
-      labels = release_labels
+      labels = metadata_labels(component)
       case component
       when :workspace
         run_build(quiet, 'docker', 'buildx', 'build', '--load', *tags, *labels,
@@ -223,13 +252,21 @@ module Carbide
 
     def build_args(*pairs) = pairs.flat_map { |p| ['--build-arg', p] }
 
-    # OCI labels carrying the release version + codename, so the registry's
-    # image manifest (config.Labels) is self-describing without running the
-    # image. Omits empty values (no version in manifest → no label).
-    def release_labels
+    # OCI labels so the registry's image manifest (config.Labels) is
+    # self-describing without running the image: the release version + codename
+    # (from manifest.yaml — the meta release, which the images DO track) plus
+    # this component's build_time and commit_time. Every artifact exposes the
+    # same four keys, so a reader uses one interface regardless of artifact.
+    # Empty values are omitted.
+    def metadata_labels(component)
       out = []
-      out += ['--label', "org.carbide.version=#{release_version}"]   unless release_version.empty?
-      out += ['--label', "org.carbide.codename=#{release_codename}"]  unless release_codename.empty?
+      add = lambda do |key, val|
+        out += ['--label', "org.carbide.#{key}=#{val}"] unless val.to_s.empty?
+      end
+      add.call('version',    release_version)
+      add.call('codename',   release_codename)
+      add.call('build_time', build_time)
+      add.call('commit_time', commit_times[component])
       out
     end
 
@@ -264,6 +301,7 @@ module Carbide
         @cmd.run('git', '-C', dir, 'checkout', ref)
       end
       @image_tags = nil
+      @commit_times = nil
       yield
     ensure
       originals&.each do |dir, sha|
@@ -272,6 +310,7 @@ module Carbide
         @cmd.run!('git', '-C', dir, 'checkout', sha)
       end
       @image_tags = nil
+      @commit_times = nil
     end
 
     def push_one(ref)
