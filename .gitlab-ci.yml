@@ -24,6 +24,25 @@ variables:
   GIT_SUBMODULE_STRATEGY: recursive
 
 # ---------------------------------------------------------------------------
+# probe — TEMPORARY, for diagnosing runner scheduling. Remove once CI is green.
+#   probe:untagged — no tags: matches any available runner (tests the scheduler
+#                    path with NO tag filtering).
+#   probe:tagged   — tags: [build-fast]: identical tag requirement as
+#                    build:images. If only one of the two runs, tags are the
+#                    variable; if neither runs, it is not tags.
+# ---------------------------------------------------------------------------
+probe:untagged:
+  stage: build
+  script:
+    - echo "probe:untagged ran on $(hostname) as $(id -un)"
+
+probe:tagged:
+  stage: build
+  tags: [build-fast]
+  script:
+    - echo "probe:tagged ran on $(hostname) as $(id -un)"
+
+# ---------------------------------------------------------------------------
 # build — control + server-worker (workspace) images to the registry.
 # ---------------------------------------------------------------------------
 build:images:
