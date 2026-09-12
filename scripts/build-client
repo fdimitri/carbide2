@@ -81,9 +81,16 @@ cache_login() {
   local host="${CACHE%%/*}" user pass
   user="${REGISTRY_USERNAME:-${CI_REGISTRY_USER:-}}"
   pass="${REGISTRY_PASSWORD:-${CI_REGISTRY_PASSWORD:-${CI_JOB_TOKEN:-}}}"
-  [ -n "$user" ] && [ -n "$pass" ] || return 0
-  printf '%s' "$pass" | docker login "$host" -u "$user" --password-stdin >/dev/null 2>&1 \
-    || warn "docker login to $host failed (will try pull/push anyway)"
+  if [ -z "$user" ] || [ -z "$pass" ]; then
+    warn "no registry credentials (REGISTRY_USERNAME / REGISTRY_PASSWORD unset) — skipping docker login"
+    return 0
+  fi
+  # Not swallowed: a failed login used to warn and continue, so the failure only
+  # showed as a raw 401 at push time with nothing saying why. Login output is
+  # visible and a failure is fatal — no point building an artifact we can't push.
+  log "docker login $host (user=$user)"
+  printf '%s' "$pass" | docker login "$host" -u "$user" --password-stdin \
+    || die "docker login to $host failed (user=$user)"
 }
 cache_has() { docker manifest inspect "$(cache_ref)" >/dev/null 2>&1; }
 cache_pull() {
