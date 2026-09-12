@@ -68,6 +68,26 @@ destroy. To clean up a kept run later:
 VM_RUN_ID=<id> scripts/ci/cluster-bringup.sh destroy
 ```
 
+## Hosts and storage
+
+- **Hosts** — `VM_HOSTS` is a space list, one entry per VM; blank means all local
+  (single-host). For 3 VMs on 3 physical machines:
+  ```bash
+  VM_HOSTS="carbidium1 carbidium2 carbidium3"   # VM i runs on host i
+  ```
+  The orchestrator SSHes to each host and runs `virsh`/`virt-install` there, so
+  the runner needs SSH to every host (key auth) — not just the local one. VMs on
+  different hosts join one k3s cluster only if they share L2 (or L3 routing) on
+  the fabric, which the passthrough NICs provide.
+- **Storage** — `VM_STORAGE=qcow2` (default: a throwaway qcow2 per VM) or
+  `VM_STORAGE=lv` with `VM_VG=<vg>`: a direct logical volume per VM, created on
+  the owning host and written from the base image once. `VM_LV_SIZE` defaults to
+  `VM_DISK_GB` (GiB). LV mode needs `lvcreate`/`lvremove` on each host.
+
+Where to define these: the pipeline sets defaults under `cluster:bringup.variables`
+in `.gitlab-ci.yml`; override per project in **Settings → CI/CD → Variables**, or
+export them when running `cluster-bringup.sh` by hand.
+
 ## Runner setup (GitLab)
 
 Runners are matched by **capability tag**, never by hostname:

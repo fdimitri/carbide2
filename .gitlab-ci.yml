@@ -69,6 +69,13 @@ cluster:bringup:
     VM_VCPUS: "6"
     VM_NET_MODE: "network"
     VM_NETWORK: "mellanox-p1"
+    # One entry per VM (VM i on host i); blank => all local (single host).
+    # Set in CI/CD Variables, or inline here, e.g.:
+    #   VM_HOSTS: "carbidium1 carbidium2 carbidium3"
+    VM_HOSTS: ""
+    # Storage: qcow2 (throwaway file) or lv (a direct LV per VM in VM_VG).
+    VM_STORAGE: "qcow2"
+    VM_VG: "carbide-vg"
   script:
     - scripts/ci/cluster-bringup.sh up
   after_script:
