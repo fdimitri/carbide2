@@ -130,7 +130,11 @@ for cand in "${CARBIDE_MC:-}" mcli mc "$HOME/.local/bin/mcli"; do
   [ -n "$cand" ] || continue
   if is_minio_mc "$cand"; then MC="$cand"; break; fi
 done
-[ -n "$MC" ] || die "MinIO client not found (tried mcli, mc). Install it or set CARBIDE_MC. On Debian, 'mc' is Midnight Commander, not MinIO."
+# The MinIO client is only needed to UPLOAD to a cluster's MinIO tier, which
+# --no-upload skips. Building + pushing the registry artifact (CI) needs no mc.
+if [ "$UPLOAD" -eq 1 ]; then
+  [ -n "$MC" ] || die "MinIO client not found (tried mcli, mc). Install it or set CARBIDE_MC. On Debian, 'mc' is Midnight Commander, not MinIO."
+fi
 
 [ -d "$SRC" ] || die "client submodule missing: $SRC (git submodule update --init)"
 command -v docker >/dev/null || die "docker not found"
