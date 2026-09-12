@@ -186,11 +186,15 @@ module Carbide
       @registry_obj.serve? ? @registry_obj.ensure! : verify_reachable!
     end
 
+    # Delegate to the registry's own check. The previous inline `curl -sf` treated
+    # HTTP 401 as failure, so an authenticated registry (GitLab, or any registry
+    # that challenges /v2/) was reported as "not reachable" even though it was
+    # answering. check! accepts 200/401/403 (reachable AND TLS validated) and only
+    # fails on a connect/TLS error (000).
     def verify_reachable!
-      return if @registry_obj.curl('-sf', '-o', '/dev/null', "#{@registry_obj.base_url}/v2/").success?
-
-      abort "\e[1;31mxx\e[0m registry #{@registry_obj.endpoint} is not reachable from this host " \
-            '(or its CA is not trusted). Nothing to push to.'
+      @registry_obj.check!
+    rescue StandardError => e
+      abort "\e[1;31mxx\e[0m #{e.message}"
     end
 
     def build_time = Time.now.utc.strftime('%Y-%m-%dT%H:%M:%SZ')
