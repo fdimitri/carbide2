@@ -19,8 +19,9 @@ module Carbide
     def version(root)  = manifest(root)['version'].to_s.strip
     def codename(root) = manifest(root)['codename'].to_s.strip
 
-    # docker --label pairs: the OCI labels the images carry, plus any extras
-    # (e.g. org.carbide.client.sha). Empty values are omitted.
+    # docker --label pairs: the OCI labels the images carry, plus any extras.
+    # Same org.carbide.* namespace every artifact uses (version/codename/sha/…),
+    # so a reader keys on one label name regardless of artifact type.
     def label_args(root, extra = {})
       pairs = { 'org.carbide.version'  => version(root),
                 'org.carbide.codename' => codename(root) }.merge(extra)

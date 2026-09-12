@@ -91,17 +91,20 @@ cache_push() {
   log "pushed cache artifact $ref"
 }
 
-# OCI labels for the client bundle, sourced from the client's OWN version info
-# (CLIENT_VER/CLIENT_CODENAME, read from the pinned checkout), never the meta
-# manifest. Empty values are omitted.
+# OCI labels for the client bundle. Same org.carbide.* namespace the images use
+# (org.carbide.version / codename), so any tool reads one label name regardless
+# of artifact — that the version is the CLIENT's is implied by the image name
+# (carbide2-client), not by the key. Values come from the client's OWN version
+# info (CLIENT_VER/CLIENT_CODENAME, read from the pinned checkout), never the
+# meta manifest; the client versions independently. Empty values are omitted.
 client_labels() {
   local out=""
   add() { [ -n "$2" ] && out="$out --label $1=$2"; }
-  add org.carbide.client.version  "$CLIENT_VER"
-  add org.carbide.client.codename "$CLIENT_CODENAME"
-  add org.carbide.client.sha      "$SHORT"
-  add org.carbide.client.family   "$FAMILY"
-  add org.carbide.build_time      "$BUILD_TIME"
+  add org.carbide.version    "$CLIENT_VER"
+  add org.carbide.codename   "$CLIENT_CODENAME"
+  add org.carbide.sha        "$SHORT"
+  add org.carbide.family     "$FAMILY"
+  add org.carbide.build_time "$BUILD_TIME"
   printf '%s' "$out"
 }
 
