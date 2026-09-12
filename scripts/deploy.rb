@@ -605,9 +605,19 @@ module Carbide
     # exists. --no-client skips it (e.g. redeploys that don't touch the client).
     def build_and_upload_client
       %w[workspace control].each do |mode|
+        args = ['--mode', mode]
+        env  = { 'CARBIDE_MINIO_NS' => @control_ns }
+        # With a registry configured, the client bundle is cached there
+        # (<registry-prefix>/carbide2-client:<family>-<sha>): the first deploy
+        # builds + pushes it, every later deploy (on this or any other cluster)
+        # pulls it instead of re-running Vite. Keyed by the pinned client SHA.
+        if @registry&.configured?
+          args += ['--cache', @registry.prefix.chomp('/')]
+          env['REGISTRY_USERNAME'] = @registry.username if @registry.username
+          env['REGISTRY_PASSWORD'] = @registry.password if @registry.password
+        end
         quiet_run("building + uploading the pinned '#{mode}' SPA client to the MinIO static tier",
-                  File.join(@root, 'scripts', 'build-client'), '--mode', mode,
-                  env: { 'CARBIDE_MINIO_NS' => @control_ns })
+                  File.join(@root, 'scripts', 'build-client'), *args, env: env)
       end
     end
 

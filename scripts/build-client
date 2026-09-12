@@ -25,6 +25,7 @@
 #   scripts/build-client --mode control        # control family, pinned HEAD
 #   scripts/build-client --mode control <ref>  # control family, any client commit
 #   CARBIDE_CLIENT_LABEL="rc3" scripts/build-client <ref>
+#   scripts/build-client --cache $CI_REGISTRY_IMAGE   # push/pull the bundle via the registry
 #
 # Env:
 #   CARBIDE_MINIO_NS   (default carbide-system)  namespace of the MinIO service
@@ -49,6 +50,42 @@ NODE_IMAGE="${CARBIDE_NODE_IMAGE:-node:22-alpine}"
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
+# --- registry cache (optional) ---------------------------------------------
+# --cache <image-prefix> uses the container registry as a build cache for the
+# client bundle, so N deploys share ONE build: pull+extract if present (no
+# Vite), else build, then push the tagged bundle with its org.carbide.* labels.
+CACHE=""
+RELEASE_RB="$ROOT/scripts/lib/carbide_release.rb"
+cache_ref() { printf '%s/carbide2-client:%s-%s' "$CACHE" "$FAMILY" "$SHORT"; }
+cache_login() {
+  local host="${CACHE%%/*}" user pass
+  user="${REGISTRY_USERNAME:-${CI_REGISTRY_USER:-}}"
+  pass="${REGISTRY_PASSWORD:-${CI_REGISTRY_PASSWORD:-${CI_JOB_TOKEN:-}}}"
+  [ -n "$user" ] && [ -n "$pass" ] || return 0
+  printf '%s' "$pass" | docker login "$host" -u "$user" --password-stdin >/dev/null 2>&1 \
+    || warn "docker login to $host failed (will try pull/push anyway)"
+}
+cache_has()  { docker manifest inspect "$(cache_ref)" >/dev/null 2>&1; }
+cache_pull() {
+  local ref cid; ref="$(cache_ref)"
+  log "cache hit — pulling $ref"
+  docker pull "$ref" >/dev/null
+  mkdir -p "$DIST"
+  cid="$(docker create "$ref")"
+  docker cp "$cid:/dist/." "$DIST" >/dev/null
+  docker rm "$cid" >/dev/null
+}
+cache_push() {
+  local ref ctx labels; ref="$(cache_ref)"; ctx="$(mktemp -d)"
+  labels="$(ruby "$RELEASE_RB" "$ROOT" --labels \
+    "org.carbide.client.sha=$SHORT,org.carbide.family=$FAMILY,org.carbide.build_time=$BUILD_TIME")"
+  printf 'FROM scratch\nCOPY dist /dist\n' > "$ctx/Dockerfile"
+  cp -a "$DIST" "$ctx/dist"
+  docker build --quiet -t "$ref" $labels "$ctx" >/dev/null
+  docker push "$ref" >/dev/null
+  rm -rf "$ctx"
+  log "pushed cache artifact $ref"
+}
 
 # --- args: [--mode workspace|control] [<ref>] ------------------------------
 MODE="workspace"
@@ -57,6 +94,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --mode) MODE="${2:?--mode needs a value}"; shift 2 ;;
     --mode=*) MODE="${1#--mode=}"; shift ;;
+    --cache) CACHE="${2:?--cache needs a value}"; shift 2 ;;
+    --cache=*) CACHE="${1#--cache=}"; shift ;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed -e '/^set -euo/d' -e 's/^# \{0,1\}//'; exit 0 ;;
     -*) die "unknown flag: $1" ;;
     *) [ -z "$REF" ] || die "unexpected extra arg: $1"; REF="$1"; shift ;;
@@ -103,8 +142,6 @@ BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 COMMIT_TIME="$(TZ=UTC git -C "$SRC" show -s --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd "$SHA")"
 LABEL="${CARBIDE_CLIENT_LABEL:-$SHORT}"
 
-log "building $FAMILY @ $SHORT (mode=$MODE, base=$BASE)"
-
 WORKTREE="$(mktemp -d /tmp/carbide-client.XXXXXX)"
 PF_PID=""
 cleanup() {
@@ -123,19 +160,29 @@ git -C "$SRC" worktree add --detach --force "$WORKTREE" "$SHA" >/dev/null
 # manifest.json below) is owned by us, not root — otherwise the host-side steps
 # that follow can't write into the container-created dist/. HOME=/app keeps
 # npm's cache inside the (host-owned, writable) worktree.
-log "npm ci + vite build (node container)"
-docker run --rm \
-  --user "$(id -u):$(id -g)" \
-  -e HOME=/app \
-  -v "$WORKTREE":/app -w /app \
-  -e VITE_CARBIDE_MODE="$MODE" \
-  -e VITE_APP_CLIENT_SHA="$SHORT" \
-  -e VITE_APP_BUILD_TIME="$BUILD_TIME" \
-  "$NODE_IMAGE" \
-  sh -c "npm ci --no-audit --no-fund && npx vite build --base=$BASE"
-
 DIST="$WORKTREE/dist"
-[ -f "$DIST/index.html" ] || die "build produced no dist/index.html"
+PULLED=0
+if [ -n "$CACHE" ]; then
+  cache_login
+  if cache_has; then cache_pull; PULLED=1; fi
+fi
+
+if [ "$PULLED" -eq 0 ]; then
+  log "building $FAMILY @ $SHORT (mode=$MODE, base=$BASE)"
+  log "npm ci + vite build (node container)"
+  docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    -e HOME=/app \
+    -v "$WORKTREE":/app -w /app \
+    -e VITE_CARBIDE_MODE="$MODE" \
+    -e VITE_APP_CLIENT_SHA="$SHORT" \
+    -e VITE_APP_BUILD_TIME="$BUILD_TIME" \
+    "$NODE_IMAGE" \
+    sh -c "npm ci --no-audit --no-fund && npx vite build --base=$BASE"
+  [ -f "$DIST/index.html" ] || die "build produced no dist/index.html"
+  [ -n "$CACHE" ] && cache_push
+fi
+[ -f "$DIST/index.html" ] || die "no dist/index.html after pull/build"
 
 # Manifest travels with the build; the registry/loader reads it to label the
 # build in the picker and (later) enforce compatibility floors.
