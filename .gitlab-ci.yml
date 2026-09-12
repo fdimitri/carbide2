@@ -49,17 +49,29 @@ build:images:
   stage: build
   tags: [build-fast]
   script:
+    # GitLab injects the registry coordinates into every job as CI_ variables —
+    # use them rather than asking for REGISTRY_* by hand:
+    #   CI_REGISTRY        host[:port]            (the registry endpoint)
+    #   CI_REGISTRY_IMAGE  host[:port]/<ns>/<proj> (the image path prefix)
+    #   CI_REGISTRY_USER / CI_REGISTRY_PASSWORD    (auto-scoped push credentials)
+    # CI_REGISTRY_PASSWORD is a per-job token, or CI_JOB_TOKEN. Anything set
+    # explicitly as a REGISTRY_* variable still wins, for the generic case.
     - |
-      if [ -z "${REGISTRY_HOST:-}" ]; then
-        echo "REGISTRY_HOST is unset — set it in Settings → CI/CD → Variables"; exit 1
-      fi
-    # --no-serve-registry: the registry lives on the cluster; the build host
-    # must not start its own (build.rb defaults serve=true when no CA is given).
-    - ARGS="workspace control shell --registry-host $REGISTRY_HOST --no-serve-registry"
-    - '[ -n "${REGISTRY_PORT:-}" ] && ARGS="$ARGS --registry-port $REGISTRY_PORT"'
-    - '[ -n "${REGISTRY_MODE:-}" ] && ARGS="$ARGS --registry-mode $REGISTRY_MODE"'   # gitlab | generic
-    - '[ -n "${REGISTRY_PATH:-}" ] && ARGS="$ARGS --registry-path $REGISTRY_PATH"'   # GitLab: $CI_REGISTRY_IMAGE
-    - '[ -n "${REGISTRY_CA:-}" ]   && ARGS="$ARGS --registry-ca $REGISTRY_CA"'
+      REGISTRY_HOST="${REGISTRY_HOST:-$(echo "$CI_REGISTRY" | cut -d: -f1)}"
+      REGISTRY_PORT="${REGISTRY_PORT:-$(echo "$CI_REGISTRY" | sed -n 's/^[^:]*:\([0-9]*\)$/\1/p')}"
+      REGISTRY_PATH="${REGISTRY_PATH:-${CI_REGISTRY_IMAGE#$CI_REGISTRY/}}"
+      REGISTRY_MODE="${REGISTRY_MODE:-gitlab}"
+      REGISTRY_USERNAME="${REGISTRY_USERNAME:-$CI_REGISTRY_USER}"
+      REGISTRY_PASSWORD="${REGISTRY_PASSWORD:-${CI_REGISTRY_PASSWORD:-$CI_JOB_TOKEN}}"
+      [ -n "$REGISTRY_HOST" ] || { echo "no registry: CI_REGISTRY unset"; exit 1; }
+      export REGISTRY_HOST REGISTRY_PORT REGISTRY_PATH REGISTRY_MODE REGISTRY_USERNAME REGISTRY_PASSWORD
+    - echo "registry $REGISTRY_HOST:$REGISTRY_PORT path=$REGISTRY_PATH mode=$REGISTRY_MODE user=$REGISTRY_USERNAME"
+    # build.rb reads REGISTRY_* from the environment (and env wins nothing over
+    # flags), so no registry values are passed on argv — the password/token never
+    # lands in the job trace. Only the component list and --no-serve-registry
+    # (the registry lives on the cluster; the build host must not start its own).
+    - ARGS="workspace control shell --no-serve-registry"
+    - '[ -n "${REGISTRY_CA:-}" ] && ARGS="$ARGS --registry-ca $REGISTRY_CA"'
     - '[ "${FORCE_REBUILD:-0}" = "1" ] && ARGS="$ARGS --force-rebuild"'
     # workspace (server-worker pair), control, and shell.
     #
