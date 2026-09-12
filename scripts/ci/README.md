@@ -83,6 +83,11 @@ VM_RUN_ID=<id> scripts/ci/cluster-bringup.sh destroy
   `VM_STORAGE=lv` with `VM_VG=<vg>`: a direct logical volume per VM, created on
   the owning host and written from the base image once. `VM_LV_SIZE` defaults to
   `VM_DISK_GB` (GiB). LV mode needs `lvcreate`/`lvremove` on each host.
+  - **Safety.** LV mode will only ever remove an LV it created. Every LV it makes
+    carries the tag `carbide-ci`; an LV with the target name that lacks the tag is
+    left untouched and the run aborts with a clear error. It also refuses to run
+    at all unless `VM_LV_ACK=1`, so a stray `VM_STORAGE=lv` cannot reach a shared
+    VG. Point it at a CI-dedicated VG, or leave it on qcow2.
 
 Where to define these: the pipeline sets defaults under `cluster:bringup.variables`
 in `.gitlab-ci.yml`; override per project in **Settings → CI/CD → Variables**, or

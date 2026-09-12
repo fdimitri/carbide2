@@ -35,6 +35,10 @@ VM_SSH_OPTS="${VM_SSH_OPTS:--o StrictHostKeyChecking=no -o UserKnownHostsFile=/d
 VM_STORAGE="${VM_STORAGE:-qcow2}"
 VM_VG="${VM_VG:-carbide-vg}"
 VM_LV_SIZE="${VM_LV_SIZE:-}"           # default: VM_DISK_GB (GiB)
+# LV mode MANAGES logical volumes. It will only ever touch LVs it tagged
+# itself (see lv_is_ours); this must be set to 1 to confirm the VG is
+# CI-dedicated, so an accidental VM_STORAGE=lv cannot touch your own LVs.
+VM_LV_ACK="${VM_LV_ACK:-0}"
 VM_IMG_DIR="${VM_IMG_DIR:-/var/lib/libvirt/images}"
 
 # Networking — attach to fabric you already have (never a libvirt NAT net).
@@ -189,14 +193,31 @@ PYEOF
   echo "$seed"
 }
 
+# Safety: an LV is OURS only if it carries our tag. We never remove (or reuse)
+# any LV that lacks it — that is how this harness avoids touching the user's own
+# volumes in a shared VG.
+LV_TAG="carbide-ci"
+lv_is_ours() {
+  vm_sh "$1" "lvs --noheadings -o lv_tags /dev/${VM_VG}/$2 2>/dev/null" | grep -q "$LV_TAG"
+}
+
 # prepare_disk <host> <name> -> echoes "disk-ref format"
 prepare_disk() {
   local host="$1" name="$2" size
   size="${VM_LV_SIZE:-${VM_DISK_GB}G}"
   if [ "$VM_STORAGE" = "lv" ]; then
+    [ "$VM_LV_ACK" = "1" ] || _vm_die       "VM_STORAGE=lv creates/removes LVs in VG '${VM_VG}'. Set VM_LV_ACK=1 to confirm this VG is CI-dedicated (or use VM_STORAGE=qcow2)."
     local lv="/dev/${VM_VG}/${name}"
-    vm_sh "$host" "lvremove -f ${lv} >/dev/null 2>&1 || true"
-    vm_sh "$host" "lvcreate -y -L ${size} -n ${name} ${VM_VG} >/dev/null"
+    if vm_sh "$host" "lvs ${lv} >/dev/null 2>&1"; then
+      # An LV with this name already exists. Only remove it if it is one we
+      # made (tagged). Never -f an untagged LV: it may be yours.
+      if lv_is_ours "$host" "$name"; then
+        vm_sh "$host" "lvremove -f ${lv}"
+      else
+        _vm_die "LV ${VM_VG}/${name} exists but is not tagged '${LV_TAG}'; refusing to remove it. Pick another VM_PREFIX/VM_VG."
+      fi
+    fi
+    vm_sh "$host" "lvcreate -y -L ${size} -n ${name} --addtag ${LV_TAG} ${VM_VG}"
     vm_sh "$host" "qemu-img convert -O raw ${VM_IMG_DIR}/${VM_IMG_FILE} ${lv}"
     printf '%s %s' "$lv" "raw"
   else
@@ -297,7 +318,12 @@ vm_destroy() {
     virsh_on "$host" "destroy $name"  >/dev/null 2>&1 || true
     virsh_on "$host" "undefine $name --nvram" >/dev/null 2>&1 || true
     if [ "$VM_STORAGE" = "lv" ]; then
-      vm_sh "$host" "lvremove -f /dev/${VM_VG}/${name} >/dev/null 2>&1 || true"
+      # Remove only if it is tagged ours. An untagged LV is left alone.
+      if lv_is_ours "$host" "$name"; then
+        vm_sh "$host" "lvremove -f /dev/${VM_VG}/${name}"
+      else
+        _vm_log "leaving ${VM_VG}/${name}: not tagged '${LV_TAG}' (not ours)"
+      fi
     else
       vm_sh "$host" "rm -f ${VM_IMG_DIR}/${name}.qcow2"
     fi

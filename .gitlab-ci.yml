@@ -76,6 +76,8 @@ cluster:bringup:
     # Storage: qcow2 (throwaway file) or lv (a direct LV per VM in VM_VG).
     VM_STORAGE: "qcow2"
     VM_VG: "carbide-vg"
+    # LV mode only; must be 1 to confirm VM_VG is CI-dedicated (see README).
+    VM_LV_ACK: "0"
   script:
     - scripts/ci/cluster-bringup.sh up
   after_script:
