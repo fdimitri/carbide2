@@ -29,6 +29,10 @@ module Carbide
     # Config option specs owned by the registry (aggregated by deploy.rb).
     def self.options
       [
+        { key: 'registry.mode', arg: 'MODE',
+          desc: 'Registry flavour: generic (self-hosted registry:2) | gitlab (GitLab Container ' \
+                'Registry). gitlab implies a namespace path, credentials, and no _catalog, and ' \
+                'makes the build check the endpoint before pushing.' },
         { key: 'registry.host', arg: 'HOST',
           desc: 'Registry endpoint every node in the fleet pushes to / pulls from (blank => no registry)' },
         { key: 'registry.port', arg: 'PORT',
@@ -60,7 +64,7 @@ module Carbide
       ]
     end
 
-    attr_reader :host, :port, :path, :username, :password, :pull_secret
+    attr_reader :host, :port, :path, :username, :password, :pull_secret, :mode
 
     # cmd/quiet : streaming / capturing TTY::Command.
     # host      : registry hostname; nil/blank => not configured.
@@ -68,7 +72,7 @@ module Carbide
     # ca        : inline PEM (or a file path, from older configs) a consumer trusts.
     # serve     : this box runs the registry.
     def initialize(cmd:, quiet:, host:, port: DEFAULT_PORT, path: nil, ca: nil, serve: false,
-                   username: nil, password: nil, pull_secret: nil,
+                   username: nil, password: nil, pull_secret: nil, mode: 'generic',
                    container: DEFAULT_CONTAINER)
       @cmd   = cmd
       @quiet = quiet
@@ -88,12 +92,45 @@ module Carbide
       @password = pw.empty? ? nil : pw
       ps = pull_secret.to_s.strip
       @pull_secret = ps.empty? ? nil : ps
+      m = mode.to_s.strip.downcase
+      @mode = m.empty? ? 'generic' : m
       @serve = serve ? true : false
       @container = container.to_s.strip.empty? ? DEFAULT_CONTAINER : container.to_s.strip
     end
 
     def configured? = !@host.nil?
     def auth?       = !@username.nil? && !@password.nil?
+
+    def gitlab? = mode == 'gitlab'
+
+    # Preflight: confirm the registry is reachable AND its certificate is
+    # trusted from THIS host, so a build fails with a clear message instead of
+    # mid-push. Deliberately no `-k`: a 200/401/403 means TLS validated; a 000
+    # means connect or trust failed (the exact "not reachable or CA not trusted"
+    # case). Requires registry.username/password to be set when the registry
+    # needs auth, which is why build.rb calls login! first.
+    def check!
+      return nil unless configured?
+
+      out, = @quiet.run!('curl', '-s', '-o', '/dev/null', '-w', '%{http_code}', "#{base_url}/v2/")
+      code = out.to_s.strip
+      return nil if %w[200 401 403].include?(code)
+
+      raise "registry #{endpoint}/v2/ is not reachable from this host, or its CA is not " \
+            "trusted (curl #{code.empty? ? 'failed to connect' : "returned #{code}"}). " \
+            "Import the registry's CA into the system trust store, then retry." if code == '000' || code.empty?
+
+      raise "registry #{endpoint}/v2/ returned #{code}"
+    end
+
+    # GitLab registries always need a namespace (group/project) and credentials;
+    # fail loudly rather than pushing to a wrong repo or getting a bare 401.
+    def validate_mode!
+      return unless gitlab?
+
+      raise 'registry.mode=gitlab requires registry.path (e.g. group/project)' if @path.nil?
+      raise 'registry.mode=gitlab requires registry.username/registry.password (a deploy token)' unless auth?
+    end
 
     # Log docker in to the registry so push and `docker manifest inspect` use
     # the credential store. No-op without credentials (self-hosted). Idempotent.

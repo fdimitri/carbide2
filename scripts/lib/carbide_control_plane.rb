@@ -28,7 +28,7 @@ module Carbide
     def initialize(cmd:, control_root:, namespace:, release:, images:, pull: false,
                    http_port:, https_port:, public_url:, roll_scope:,
                    workspace_storage_class: nil, registry_url: nil,
-                   registry_path: nil, registry_repos: nil, registry_catalog: nil,
+                   registry_path: nil, registry_repos: nil, registry_catalog: nil, registry_mode: nil,
                    registry_user: nil, registry_pass: nil, registry_pull_secret: nil,
                    registry_ca: nil)
       @cmd        = cmd
@@ -46,6 +46,7 @@ module Carbide
       @registry_path    = registry_path.to_s.strip
       @registry_repos   = registry_repos.to_s.strip
       @registry_catalog = registry_catalog.to_s.strip
+      @registry_mode    = registry_mode.to_s.strip
       @registry_user   = registry_user.to_s.strip
       @registry_pass   = registry_pass.to_s
       @registry_pull_secret = registry_pull_secret.to_s.strip
@@ -101,7 +102,11 @@ module Carbide
         # the flat self-hosted shape.
         args.push('--set-string', "registry.path=#{@registry_path}") unless @registry_path.empty?
         args.push('--set-string', "registry.repos=#{@registry_repos}") unless @registry_repos.empty?
-        args.push('--set-string', "registry.catalog=#{@registry_catalog}") unless @registry_catalog.empty?
+        # mode=gitlab: a GitLab registry has no /v2/_catalog. Default the catalog
+        # check off unless it was set explicitly.
+        effective_catalog = @registry_catalog
+        effective_catalog = 'no' if effective_catalog.empty? && @registry_mode == 'gitlab'
+        args.push('--set-string', "registry.catalog=#{effective_catalog}") unless effective_catalog.empty?
         # Auth for the operator's imagePullSecret (GitLab). Sent to helm so the
         # operator process gets them; skipped entirely when unset (self-hosted).
         args.push('--set-string', "registry.username=#{@registry_user}") unless @registry_user.empty?

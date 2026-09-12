@@ -47,6 +47,7 @@ require_relative 'lib/carbide_images'
 COMPONENTS = { 'workspace' => :workspace, 'control' => :control, 'shell' => :shell }.freeze
 
 opts = { registry_host: nil, registry_port: nil, registry_path: nil, registry_ca: nil, serve: nil,
+         registry_mode: nil,
          registry_user: nil, registry_password: nil, registry_pull_secret: nil,
          no_push: false, no_shell: false, force_rebuild: false,
          server_ref: nil, worker_ref: nil, control_ref: nil, client_ref: nil }
@@ -54,6 +55,7 @@ OptionParser.new do |o|
   o.banner = 'Usage: build.rb [components...] [--registry-host HOST] [--no-push] ' \
              '[--server-ref REF] [--no-shell]'
   o.on('--registry-host HOST', 'Registry to push SHA-tagged images to (REGISTRY_HOST env)') { |v| opts[:registry_host] = v }
+  o.on('--registry-mode MODE', 'generic (self-hosted) | gitlab (GitLab registry) (REGISTRY_MODE env)') { |v| opts[:registry_mode] = v }
   o.on('--registry-port PORT', 'Registry port (blank = omit, e.g. implicit 443; REGISTRY_PORT env)') { |v| opts[:registry_port] = v }
   o.on('--registry-path PATH', 'Repo namespace, e.g. group/project for GitLab (REGISTRY_PATH env)') { |v| opts[:registry_path] = v }
   o.on('--registry-user USER', 'Registry username (REGISTRY_USERNAME env)') { |v| opts[:registry_user] = v }
@@ -81,6 +83,7 @@ components -= [:shell] if opts[:no_shell] && selected.empty?
 # Registry coordinates: explicit flags win, then env. REGISTRY ("host:port/")
 # is build-all.sh's old knob — accept it so the shim stays backward compatible.
 registry_host = opts[:registry_host] || ENV['REGISTRY_HOST']
+registry_mode = opts[:registry_mode] || ENV['REGISTRY_MODE']
 registry_port = opts[:registry_port] || ENV['REGISTRY_PORT']
 registry_path = opts[:registry_path] || ENV['REGISTRY_PATH']
 registry_user = opts[:registry_user] || ENV['REGISTRY_USERNAME']
@@ -104,7 +107,7 @@ serve = opts[:serve].nil? ? registry_ca.to_s.strip.empty? : opts[:serve]
 registry = Carbide::Registry.new(
   cmd: cmd, quiet: quiet,
   host: registry_host, port: registry_port || Carbide::Registry::DEFAULT_PORT,
-  path: registry_path, ca: registry_ca, serve: serve,
+  path: registry_path, ca: registry_ca, serve: serve, mode: registry_mode,
   username: registry_user, password: registry_pass
 )
 
@@ -114,7 +117,9 @@ refs = { server: opts[:server_ref], worker: opts[:worker_ref],
          control: opts[:control_ref], client: opts[:client_ref] }
 push = !images.registry.nil? && !opts[:no_push]
 
+registry.validate_mode!
 registry.login! if registry.auth?
+registry.check!     # fail clearly on unreachable/untrusted instead of mid-push
 
 built = images.build(components: components, refs: refs, push: push, force: opts[:force_rebuild], quiet: false)
 

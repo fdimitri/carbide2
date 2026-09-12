@@ -57,6 +57,7 @@ build:images:
     # must not start its own (build.rb defaults serve=true when no CA is given).
     - ARGS="workspace control shell --registry-host $REGISTRY_HOST --no-serve-registry"
     - '[ -n "${REGISTRY_PORT:-}" ] && ARGS="$ARGS --registry-port $REGISTRY_PORT"'
+    - '[ -n "${REGISTRY_MODE:-}" ] && ARGS="$ARGS --registry-mode $REGISTRY_MODE"'   # gitlab | generic
     - '[ -n "${REGISTRY_PATH:-}" ] && ARGS="$ARGS --registry-path $REGISTRY_PATH"'   # GitLab: $CI_REGISTRY_IMAGE
     - '[ -n "${REGISTRY_CA:-}" ]   && ARGS="$ARGS --registry-ca $REGISTRY_CA"'
     - '[ "${FORCE_REBUILD:-0}" = "1" ] && ARGS="$ARGS --force-rebuild"'

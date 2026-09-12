@@ -40,6 +40,8 @@ images:
 
 # --- the image registry: a fact about the fleet (ADR-028 §1) --------------------
 registry:
+  mode: generic      # generic (self-hosted registry:2) | gitlab (GitLab Container Registry).
+                     # gitlab implies a namespace path + credentials and disables catalog listing.
   host: ''           # endpoint every node pushes to / pulls from; "" => no registry anywhere
   port: '5000'       # blank => omit the port (implicit-443 registry, e.g. GitLab)
   path: ''           # repo namespace between host and image, e.g. group/project (GitLab); "" => flat
