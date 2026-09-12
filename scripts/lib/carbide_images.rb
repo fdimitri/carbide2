@@ -3,6 +3,7 @@
 require 'fileutils'
 require 'yaml'
 require_relative 'carbide_command'
+require_relative 'carbide_release'
 require_relative 'carbide_registry'
 
 module Carbide
@@ -67,20 +68,12 @@ module Carbide
 
     # The release manifest (manifest.yaml at the meta root) — authoritative
     # version + codename, stamped into every image as OCI labels + runtime env.
-    # Returns an empty hash when the file is absent/unreadable so a bare build
-    # still works; the version is then simply unknown/nil.
-    def manifest
-      @manifest ||= begin
-        path = File.join(@root, 'manifest.yaml')
-        File.file?(path) ? (YAML.load_file(path) || {}) : {}
-      rescue StandardError => e
-        log "manifest.yaml unreadable: #{e.class}: #{e.message}"
-        {}
-      end
-    end
-
-    def release_version  = manifest['version'].to_s.strip
-    def release_codename = manifest['codename'].to_s.strip
+    # Sourced from Carbide::Release so images and anything else meta-versioned
+    # read one place; the CLIENT, which versions independently, does not use this
+    # (see scripts/build-client).
+    def manifest         = Carbide::Release.manifest(@root)
+    def release_version  = Carbide::Release.version(@root)
+    def release_codename = Carbide::Release.codename(@root)
 
     # 12-char short SHA of the checkout in `dir` (matches build-all.sh).
     def short_sha(dir)

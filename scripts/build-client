@@ -55,7 +55,11 @@ die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
 # client bundle, so N deploys share ONE build: pull+extract if present (no
 # Vite), else build, then push the tagged bundle with its org.carbide.* labels.
 CACHE=""
-RELEASE_RB="$ROOT/scripts/lib/carbide_release.rb"
+# The client carries its OWN version, independent of the meta manifest: it moves
+# at its own cadence (fast or slow), so stamping it with manifest.yaml would lie.
+# Read it from the pinned client checkout (package.json + src/version.js).
+client_version()  { sed -nE 's/.*"version":[[:space:]]*"([^"]+)".*/\1/p' "$1" | head -1; }
+client_codename() { sed -nE "s/.*CODENAME[[:space:]]*=[[:space:]]*'([^']+)'.*/\1/p" "$1" | head -1; }
 cache_ref() { printf '%s/carbide2-client:%s-%s' "$CACHE" "$FAMILY" "$SHORT"; }
 cache_login() {
   local host="${CACHE%%/*}" user pass
@@ -77,14 +81,28 @@ cache_pull() {
 }
 cache_push() {
   local ref ctx labels; ref="$(cache_ref)"; ctx="$(mktemp -d)"
-  labels="$(ruby "$RELEASE_RB" "$ROOT" --labels \
-    "org.carbide.client.sha=$SHORT,org.carbide.family=$FAMILY,org.carbide.build_time=$BUILD_TIME")"
+  labels="$(client_labels)"
   printf 'FROM scratch\nCOPY dist /dist\n' > "$ctx/Dockerfile"
   cp -a "$DIST" "$ctx/dist"
+  # shellcheck disable=SC2086
   docker build --quiet -t "$ref" $labels "$ctx" >/dev/null
   docker push "$ref" >/dev/null
   rm -rf "$ctx"
   log "pushed cache artifact $ref"
+}
+
+# OCI labels for the client bundle, sourced from the client's OWN version info
+# (CLIENT_VER/CLIENT_CODENAME, read from the pinned checkout), never the meta
+# manifest. Empty values are omitted.
+client_labels() {
+  local out=""
+  add() { [ -n "$2" ] && out="$out --label $1=$2"; }
+  add org.carbide.client.version  "$CLIENT_VER"
+  add org.carbide.client.codename "$CLIENT_CODENAME"
+  add org.carbide.client.sha      "$SHORT"
+  add org.carbide.client.family   "$FAMILY"
+  add org.carbide.build_time      "$BUILD_TIME"
+  printf '%s' "$out"
 }
 
 # --- args: [--mode workspace|control] [<ref>] ------------------------------
@@ -161,6 +179,10 @@ git -C "$SRC" worktree add --detach --force "$WORKTREE" "$SHA" >/dev/null
 # that follow can't write into the container-created dist/. HOME=/app keeps
 # npm's cache inside the (host-owned, writable) worktree.
 DIST="$WORKTREE/dist"
+# The client's own version, from the pinned checkout (not the meta manifest).
+CLIENT_VER="$(client_version "$WORKTREE/package.json")"
+CLIENT_CODENAME="$(client_codename "$WORKTREE/src/version.js")"
+[ -n "$CLIENT_VER" ] || warn "client package.json has no version; bundle will be unstamped"
 PULLED=0
 if [ -n "$CACHE" ]; then
   cache_login
@@ -201,6 +223,8 @@ cat > "$DIST/manifest.json" <<JSON
   "sha": "$SHORT",
   "full_sha": "$SHA",
   "label": "$LABEL",
+  "version": "$CLIENT_VER",
+  "codename": "$CLIENT_CODENAME",
   "build_time": "$BUILD_TIME",
   "commit_time": "$COMMIT_TIME",
   "base": "$BASE",
