@@ -223,7 +223,11 @@ module Carbide
       @registry = Carbide::Registry.new(
         cmd: @cmd, quiet: @quiet,
         host: config.present('registry.host'), port: config.present('registry.port'),
-        ca: config.present('registry.ca'), serve: config.bool('registry.serve')
+        path: config.present('registry.path'),
+        ca: config.present('registry.ca'), serve: config.bool('registry.serve'),
+        username: config.present('registry.username'),
+        password: config.present('registry.password'),
+        pull_secret: config.present('registry.pull-secret')
       )
 
       # --- ADR-028: what this box DOES with images --------------------------
@@ -311,6 +315,12 @@ module Carbide
         public_url: @public_url, roll_scope: @roll_scope,
         workspace_storage_class: @storage_class,
         registry_url: @registry.base_url,
+        registry_path: @registry.path,
+        registry_repos: config.present('registry.repos'),
+        registry_catalog: config.present('registry.catalog'),
+        registry_user: config.present('registry.username'),
+        registry_pass: config.present('registry.password'),
+        registry_pull_secret: config.present('registry.pull-secret'),
         registry_ca: @registry.configured? ? @registry.ca_text : nil
       )
     end

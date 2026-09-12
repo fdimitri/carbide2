@@ -41,7 +41,13 @@ images:
 # --- the image registry: a fact about the fleet (ADR-028 §1) --------------------
 registry:
   host: ''           # endpoint every node pushes to / pulls from; "" => no registry anywhere
-  port: '5000'
+  port: '5000'       # blank => omit the port (implicit-443 registry, e.g. GitLab)
+  path: ''           # repo namespace between host and image, e.g. group/project (GitLab); "" => flat
+  repos: ''          # extra repo names to list when the registry has no catalog, comma-sep
+  catalog: auto      # does the registry expose /v2/_catalog? auto (=try+fallback) | yes | no
+  username: ''       # push/pull username (GitLab deploy-token user / robot account); '' = no auth
+  password: ''       # matching password/token. SECRET.
+  pull-secret: ''    # existing docker-registry Secret name to use as imagePullSecret (GitLab)
   ca: ''             # PEM a consumer trusts; "" => system trust store. Ignored (derived from
                      # mkcert) on the box that serves it; --yaml-out fills it in for the fleet.
   serve: false       # this box runs the registry:2 container

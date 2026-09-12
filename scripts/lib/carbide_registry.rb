@@ -31,7 +31,26 @@ module Carbide
       [
         { key: 'registry.host', arg: 'HOST',
           desc: 'Registry endpoint every node in the fleet pushes to / pulls from (blank => no registry)' },
-        { key: 'registry.port', arg: 'PORT', desc: "Registry port (default: #{DEFAULT_PORT})" },
+        { key: 'registry.port', arg: 'PORT',
+          desc: "Registry port. Blank omits it (e.g. an implicit-443 registry like GitLab) " \
+                "(self-hosted default: #{DEFAULT_PORT})." },
+        { key: 'registry.path', arg: 'PATH',
+          desc: 'Repository namespace between host and image name, e.g. group/project for a ' \
+                'GitLab registry. Blank for a flat registry. Becomes part of every repo name.' },
+        { key: 'registry.repos', arg: 'LIST',
+          desc: 'Comma-separated extra repo names control should list when the registry does ' \
+                'not expose a catalog (GitLab). Blank = only the known carbide repos.' },
+        { key: 'registry.catalog', arg: 'WHEN',
+          desc: 'Whether the registry exposes /v2/_catalog: auto (probe, then fall back) | ' \
+                'yes | no.' },
+        { key: 'registry.username', arg: 'USER',
+          desc: 'Registry username for push/pull (a GitLab deploy-token user / robot account). ' \
+                'Blank = no auth (self-hosted) or an ambient docker login.' },
+        { key: 'registry.password', arg: 'SECRET',
+          desc: 'Registry password/token matching registry.username. SECRET.' },
+        { key: 'registry.pull-secret', arg: 'NAME',
+          desc: 'Name of an existing docker-registry Secret to use as imagePullSecret on ' \
+                'workspace pods (GitLab). Alternative to handing control the credentials.' },
         { key: 'registry.ca', arg: 'PEM',
           desc: 'Inline CA PEM a consumer trusts (blank => system trust store; ignored when registry.serve)' },
         { key: 'registry.ca', long: 'registry.ca-file', arg: 'FILE', file: true,
@@ -41,32 +60,60 @@ module Carbide
       ]
     end
 
-    attr_reader :host, :port
+    attr_reader :host, :port, :path, :username, :password, :pull_secret
 
     # cmd/quiet : streaming / capturing TTY::Command.
     # host      : registry hostname; nil/blank => not configured.
     # port      : registry port.
     # ca        : inline PEM (or a file path, from older configs) a consumer trusts.
     # serve     : this box runs the registry.
-    def initialize(cmd:, quiet:, host:, port: DEFAULT_PORT, ca: nil, serve: false,
+    def initialize(cmd:, quiet:, host:, port: DEFAULT_PORT, path: nil, ca: nil, serve: false,
+                   username: nil, password: nil, pull_secret: nil,
                    container: DEFAULT_CONTAINER)
       @cmd   = cmd
       @quiet = quiet
       h = host.to_s.strip
       @host  = h.empty? ? nil : h
-      @port  = (port.to_s.strip.empty? ? DEFAULT_PORT : port.to_s.strip)
+      # Blank port => omit it entirely (a registry with an implicit port, e.g.
+      # GitLab on 443). Callers wanting the self-hosted default pass nothing or
+      # DEFAULT_PORT.
+      @port  = port.to_s.strip.empty? ? nil : port.to_s.strip
+      pa    = path.to_s.strip.gsub(%r{\A/+|/+\z}, '')
+      @path  = pa.empty? ? nil : pa
       c = ca.to_s.strip
       @ca    = c.empty? ? nil : c
+      u = username.to_s.strip
+      @username = u.empty? ? nil : u
+      pw = password.to_s.strip
+      @password = pw.empty? ? nil : pw
+      ps = pull_secret.to_s.strip
+      @pull_secret = ps.empty? ? nil : ps
       @serve = serve ? true : false
       @container = container.to_s.strip.empty? ? DEFAULT_CONTAINER : container.to_s.strip
     end
 
     def configured? = !@host.nil?
+    def auth?       = !@username.nil? && !@password.nil?
+
+    # Log docker in to the registry so push and `docker manifest inspect` use
+    # the credential store. No-op without credentials (self-hosted). Idempotent.
+    def login!
+      return false unless auth?
+
+      @cmd.run('docker', 'login', endpoint,
+               '--username', @username, '--password-stdin',
+               stdin: @password)
+      true
+    end
     def serve?      = @serve
-    def endpoint    = configured? ? "#{@host}:#{@port}" : nil
-    # Image-ref prefix ("host:port/"), or nil when no registry is configured.
-    def prefix      = configured? ? "#{endpoint}/" : nil
+    # "host[:port]" — the :port only when one is configured.
+    def endpoint    = configured? ? (@port ? "#{@host}:#{@port}" : @host) : nil
+    # Image-ref prefix ("host[:port]/[path]/"), or nil when no registry.
+    def prefix      = configured? ? "#{endpoint}/#{@path ? "#{@path}/" : ''}" : nil
     def base_url    = configured? ? "https://#{endpoint}" : nil
+    # Repository name for the v2 API and refs: the namespace is part of the repo
+    # name (GitLab: host/v2/<path>/<repo>/…), NOT the base URL.
+    def repo_name(name) = @path ? "#{@path}/#{name}" : name
 
     # Path to the CA PEM the pull side trusts, or nil for the system store.
     # serve: mkcert's root on this box. Otherwise the configured PEM, written to
@@ -130,9 +177,15 @@ module Carbide
     def has_manifest?(name, tag)
       return false unless configured?
 
-      curl('-sf', '-o', '/dev/null',
-           '-H', 'Accept: application/vnd.docker.distribution.manifest.v2+json',
-           "#{base_url}/v2/#{name}/manifests/#{tag}").success?
+      # Authenticated registries (GitLab) need the docker credential store; a
+      # bare /v2 GET 401s there. `docker manifest inspect` reads ~/.docker/config
+      # (populated by `docker login`), so it works for both auth and no-auth.
+      # The build host already trusts the registry (it pushes to it), so this is
+      # no weaker than the curl it replaces.
+      ref = "#{prefix}#{name}:#{tag}"
+      @quiet.run!('docker', 'manifest', 'inspect', ref).success?
+    rescue StandardError
+      false
     end
 
     # curl against the registry, trusting its CA when one is known.

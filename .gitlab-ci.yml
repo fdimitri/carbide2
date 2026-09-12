@@ -1,0 +1,113 @@
+# Carbide2 meta-repo pipeline.
+#
+#   build   — every push: build + push the control and server-worker images to
+#             the registry. Idempotent: build.rb skips any component whose SHA
+#             tag already exists, so a push that doesn't move a submodule is a
+#             fast no-op. Pass FORCE_REBUILD=1 to rebuild anyway.
+#   cluster — schedule/manual: fresh multi-node k3s bring-up on libvirt VMs.
+#   test    — follows the bring-up.
+#
+# Runners are selected by CAPABILITY tag, never by machine name:
+#   build-fast : docker buildx + reachable registry (desktop / EPYC / ...)
+#   kvm        : libvirt + virt-install + RAM for 3 VMs
+#   gpu        : local-model host for agent-loop tests
+#   m75-live   : the real bare-metal cluster
+#
+# Registry coordinates come from CI variables: REGISTRY_HOST (required),
+# REGISTRY_PORT (optional, default 5000), REGISTRY_CA (optional File var — the
+# self-signed CA so this host trusts the registry).
+
+stages: [build, cluster, test]
+
+variables:
+  DOCKER_BUILDKIT: "1"
+  GIT_SUBMODULE_STRATEGY: recursive
+
+# ---------------------------------------------------------------------------
+# build — control + server-worker (workspace) images to the registry.
+# ---------------------------------------------------------------------------
+build:images:
+  stage: build
+  tags: [build-fast]
+  script:
+    - |
+      if [ -z "${REGISTRY_HOST:-}" ]; then
+        echo "REGISTRY_HOST is unset — set it in Settings → CI/CD → Variables"; exit 1
+      fi
+    # --no-serve-registry: the registry lives on the cluster; the build host
+    # must not start its own (build.rb defaults serve=true when no CA is given).
+    - ARGS="workspace control shell --registry-host $REGISTRY_HOST --no-serve-registry"
+    - '[ -n "${REGISTRY_PORT:-}" ] && ARGS="$ARGS --registry-port $REGISTRY_PORT"'
+    - '[ -n "${REGISTRY_PATH:-}" ] && ARGS="$ARGS --registry-path $REGISTRY_PATH"'   # GitLab: $CI_REGISTRY_IMAGE
+    - '[ -n "${REGISTRY_CA:-}" ]   && ARGS="$ARGS --registry-ca $REGISTRY_CA"'
+    - '[ "${FORCE_REBUILD:-0}" = "1" ] && ARGS="$ARGS --force-rebuild"'
+    # workspace (server-worker pair), control, and shell.
+    #
+    # Each component is checked against the registry individually and skipped
+    # when its tag is already present, so re-pushes are cheap:
+    #   workspace -> <server_sha>-<worker_sha>
+    #   control   -> <control_sha>
+    #   shell     -> content hash of Dockerfile.shell  (so the ~4GB shell image
+    #                rebuilds ONLY when that file changes, never on app commits)
+    # The client is not in the registry, so it is not built here.
+    - echo "scripts/build.rb $ARGS"
+    - scripts/build.rb $ARGS
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"          # every push
+    - if: $CI_COMMIT_TAG
+
+# ---------------------------------------------------------------------------
+# cluster — a fresh 3-VM k3s cluster on whatever [kvm] box is free.
+# ---------------------------------------------------------------------------
+cluster:bringup:
+  stage: cluster
+  tags: [kvm]
+  resource_group: carbide-ci-kvm
+  timeout: 2h
+  variables:
+    VM_MEM_MB: "12288"
+    VM_VCPUS: "6"
+    VM_NET_MODE: "network"
+    VM_NETWORK: "mellanox-p1"
+  script:
+    - scripts/ci/cluster-bringup.sh up
+  after_script:
+    - scripts/ci/cluster-bringup.sh destroy || true   # honors VM_KEEP
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - .vm-state/env
+      - .vm-state/cluster.yaml
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_TAG
+
+# ---------------------------------------------------------------------------
+# test — multi-node substrate test against the bring-up cluster.
+# ---------------------------------------------------------------------------
+test:substrate:
+  stage: test
+  tags: [kvm]
+  needs: [cluster:bringup]
+  script:
+    - set -a; . .vm-state/env; set +a      # NAMESPACE, BASE_URL, CARBIDE_WS_URL, WS_ID
+    - carbide2-server/scripts/test-substrate.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_TAG
+
+# ---------------------------------------------------------------------------
+# test — agent loop against a LOCAL model. Manual / scheduled.
+# ---------------------------------------------------------------------------
+test:agent-local:
+  stage: test
+  tags: [gpu]
+  allow_failure: true
+  script:
+    - echo "wire scripts/ci/agent-local.sh once the model router exists"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - when: manual
