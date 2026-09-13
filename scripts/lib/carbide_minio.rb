@@ -1,6 +1,5 @@
 # frozen_string_literal: true
 
-require 'base64'
 require 'fileutils'
 require 'tmpdir'
 require 'json'
@@ -226,7 +225,12 @@ module Carbide
 
       # Decoding here rather than piping to base64(1) keeps this a single
       # process and works the same on a host whose base64 lacks -d.
-      Base64.decode64(res.out.to_s.strip)
+      #
+      # unpack1('m'), not Base64.decode64: base64 stopped being a default gem in
+      # Ruby 3.4, so requiring it fails outright on a 3.4 host unless the caller
+      # declares it. deploy.rb has to declare it because kubeclient needs it;
+      # nothing here does, and 'm' is the same lenient decoder in core String.
+      res.out.to_s.strip.unpack1('m').to_s
     end
 
     def configure_alias(workdir, port, user, password)

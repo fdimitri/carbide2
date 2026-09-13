@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require 'json'
-require 'base64'
 require_relative 'shell_runner'
 
 module Carbide
@@ -121,7 +120,7 @@ module Carbide
         key = argv.join(' ')[/jsonpath=\{\.data\.([a-z-]+)\}/, 1]
         return Result.new('', 'error: secret not found', 1) if key.nil? || !@secret.key?(key)
 
-        Result.new(Base64.strict_encode64(@secret[key]), '', 0)
+        Result.new([@secret[key]].pack('m0'), '', 0)
       end
     end
 
