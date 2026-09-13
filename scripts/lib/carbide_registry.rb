@@ -210,20 +210,44 @@ module Carbide
       @cmd.run('docker', 'network', 'connect', '--alias', @host, network, @container)
     end
 
-    # True if <name>:<tag> exists in the registry (HEAD/GET of the manifest).
-    def has_manifest?(name, tag)
-      return false unless configured?
+    # Tag lookup, tri-state (ADR-043 §7): :present | :absent | :unreachable.
+    #
+    # Unreachable must never collapse into absent, or a registry that is down
+    # reads as "absent, build it" — and on an authenticated registry it would do
+    # so on every single invocation, because an anonymous `docker manifest
+    # inspect` is answered with 401. That is also why login! has to have run
+    # before this: auth failure is indistinguishable from a network failure here,
+    # and both are correctly NOT absent.
+    #
+    # The classification is by message rather than by exit status because the
+    # docker CLI collapses every failure into exit 1. Anything it does not say is
+    # a missing manifest is treated as unreachable, which is the safe direction:
+    # the cost of a false unreachable is a stopped command, the cost of a false
+    # absent is a needless rebuild or a clobbered store.
+    ABSENT_PATTERNS = [
+      /manifest unknown/i,
+      /MANIFEST_UNKNOWN/,
+      /no such manifest/i,
+      /not found/i,
+      /manifest for .* not found/i
+    ].freeze
 
-      # Authenticated registries (GitLab) need the docker credential store; a
-      # bare /v2 GET 401s there. `docker manifest inspect` reads ~/.docker/config
-      # (populated by `docker login`), so it works for both auth and no-auth.
-      # The build host already trusts the registry (it pushes to it), so this is
-      # no weaker than the curl it replaces.
-      ref = "#{prefix}#{name}:#{tag}"
-      @quiet.run!('docker', 'manifest', 'inspect', ref).success?
+    def detect(name, tag)
+      return :unreachable unless configured?
+
+      res = @quiet.run!('docker', 'manifest', 'inspect', "#{prefix}#{name}:#{tag}")
+      return :present if res.success?
+
+      message = "#{res.err}#{res.out}"
+      ABSENT_PATTERNS.any? { |p| message.match?(p) } ? :absent : :unreachable
     rescue StandardError
-      false
+      :unreachable
     end
+
+    # True only for :present. Kept because Images and the deploy path ask a
+    # boolean question ("may I skip this build?"), where absent and unreachable
+    # both mean "do not skip".
+    def has_manifest?(name, tag) = detect(name, tag) == :present
 
     # curl against the registry, trusting its CA when one is known.
     def curl(*args)

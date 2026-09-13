@@ -384,7 +384,7 @@ module Carbide
     def publish_run
       @registry.ensure! if @registry.serve?
       build_images unless @no_build || skip_build?
-      @images.push if @push
+      @images.push(allow_dirty: true) if @push
       if @push
         log "published — images are in the registry at #{@registry.endpoint}"
         log "next: on each cluster node set registry.host #{@registry.host} and images.consume pull " \
@@ -591,7 +591,13 @@ module Carbide
       components = @no_shell ? %i[workspace control] : Carbide::Images::ALL
       log 'building the container images — on a cold cache this builds Ruby from ' \
           'source, so give it a few minutes (reticulating splines...)'
-      @images.build(components: components, quiet: true)
+      # allow_dirty: deploy.rb builds whatever is checked out, which is what it
+      # has always done and what dogfooding needs. The gate exists so carcli does
+      # not classify a tree silently; here the classification is not silent —
+      # a dirty tree now produces a <sha>-dirty tag instead of a clean tag built
+      # from uncommitted sources, which is the failure this records rather than
+      # introduces.
+      @images.build(components: components, quiet: true, allow_dirty: true)
     end
 
     # Build the PINNED SPA clients (the carbide2-client submodule's checked-out
@@ -630,7 +636,7 @@ module Carbide
     # OWN cluster consume. A dev box that serves the fleet's registry does both:
     # pushes SHA tags for the k3s nodes AND imports :dev into its own k3d.
     def publish_images
-      @images.push if @push
+      @images.push(allow_dirty: true) if @push
       @cluster_iface.import_images if @consume == :import
     end
 

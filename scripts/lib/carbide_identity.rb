@@ -96,6 +96,11 @@ module Carbide
 
     def tag(subject, refs: {}) = state(subject, refs: refs).fetch(:tag)
 
+    # Resolve a ref to the full commit it names, so a caller that has to
+    # materialize it (Carbide::Worktree) names the same commit the identity was
+    # computed from rather than re-resolving and possibly racing a fetch.
+    def resolve(component, ref) = resolve!(checkout!(component), ref)
+
     # True when the subject would build from a dirty tree — the one question both
     # gates in §5 ask (build-dirty and push-dirty). shell has no :dirty key, and
     # nil is correctly falsy here.
