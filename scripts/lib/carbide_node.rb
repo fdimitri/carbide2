@@ -3,6 +3,7 @@
 require 'tempfile'
 require 'fileutils'
 require_relative 'carbide_command'
+require_relative 'carbide_kubeconfig'
 
 module Carbide
   # The local Kubernetes NODE lifecycle — the Ruby replacement for the
@@ -62,8 +63,9 @@ module Carbide
     #                 must be able to resolve it and trust its CA (ADR-028 §5).
     def initialize(cmd:, quiet:, backend:, name:, server_root:, http_port:, https_port:,
                    role: 'init', server_url: nil, token: nil, storage_class: 'local-path',
-                   registry: nil, pull: false)
+                   registry: nil, pull: false, kubeconfig_dir: nil)
       @cmd           = cmd
+      @kubeconfig_dir = kubeconfig_dir
       @quiet         = quiet
       @backend       = backend.to_s.downcase
       @name          = name
@@ -138,6 +140,11 @@ module Carbide
       # silently targets the wrong cluster. Bind it explicitly, failing loudly if
       # the context is missing rather than running against whatever is current.
       @cmd.run!('kubectl', 'config', 'use-context', "k3d-#{@name}")
+      # ...and write this cluster's own kubeconfig, which is what everything
+      # automated addresses from here on. ~/.kube/config is left exactly as k3d
+      # made it: it stays a human convenience pointing at whatever this box
+      # deployed last, and nothing reads it any more (ADR-043 §9).
+      kubeconfig.capture_k3d!
       log 'kubectl context:'
       @cmd.run('kubectl', 'config', 'current-context')
       @cmd.run('kubectl', 'get', 'nodes')
@@ -199,6 +206,10 @@ module Carbide
         run_k3s_installer(init: init)
       end
       sync_kubeconfig
+      # Unchanged above: ~/.kube/config keeps being written. This is the copy
+      # that can actually name the cluster — k3s calls its cluster, user and
+      # context all `default`, on every cluster (ADR-043 §9).
+      kubeconfig.capture_k3s!
       log 'kubectl context:'
       @cmd.run('kubectl', 'config', 'current-context')
       @cmd.run('kubectl', 'get', 'nodes')
@@ -263,6 +274,10 @@ module Carbide
       authority = s.sub(%r{\Ahttps://}i, '')
       s = "#{s}:6443" unless authority.include?(':')
       s
+    end
+
+    def kubeconfig
+      @kubeconfig ||= Carbide::Kubeconfig.new(cmd: @cmd, cluster_name: @name, dir: @kubeconfig_dir)
     end
 
     # k3s writes its kubeconfig (server 127.0.0.1:6443) root-owned; copy it to

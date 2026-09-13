@@ -9,6 +9,7 @@ require_relative 'carbide_images'
 require_relative 'carbide_registry'
 require_relative 'carbide_client'
 require_relative 'carbide_minio'
+require_relative 'carbide_kubeconfig'
 
 module Carbide
   # carcli's grammar, resolution and dispatch (ADR-043 §1-§3, §6, §12).
@@ -175,12 +176,16 @@ module Carbide
         end
       end
       parser.on('--label TEXT', 'Label this client build in the picker (default: the sha)') { |v| @opts[:label] = v }
+      # Per-invocation, never a config key: a frozen cluster.yaml is read by
+      # every node of the cluster, so an absolute path in it would be a per-box
+      # fact in a per-cluster file (ADR-043 §9).
+      parser.on('--kubeconfig PATH', 'Use this kubeconfig instead of the one derived from cluster.name') { |v| @opts[:kubeconfig] = v }
       parser.on('--json', 'Machine-readable output where the verb has a structured form') { @opts[:json] = true }
     end
 
     def specs
       Carbide::Images.options + Carbide::Registry.options + Carbide::Minio.options +
-        Carbide::Client.options
+        Carbide::Client.options + Carbide::Kubeconfig.options
     end
 
     # --- dispatch --------------------------------------------------------------
@@ -529,9 +534,24 @@ module Carbide
       )
     end
 
-    # Step 5 (Carbide::Kubeconfig) fills this in from cluster.name; until then
-    # the ambient context applies, which is the thing ADR-043 §9 exists to stop.
-    def kube_env = {}
+    def kubeconfig
+      @kubeconfig ||= Carbide::Kubeconfig.new(
+        cmd: quiet,
+        cluster_name: @config.present('cluster.name').to_s,
+        dir: @config.present('kubeconfig.dir'),
+        override: @opts[:kubeconfig]
+      )
+    end
+
+    # KUBECONFIG for this cluster. Empty when no per-cluster file has been
+    # written yet, which leaves the ambient context in play — so a MinIO
+    # operation against a cluster this box has never deployed says so rather
+    # than quietly talking to whichever cluster the shell happened to point at.
+    def kube_env
+      env = kubeconfig.env
+      warn_line "no kubeconfig at #{kubeconfig.path} — falling back to the ambient context" if env.empty?
+      env
+    end
 
     # --- output ----------------------------------------------------------------
 
@@ -545,6 +565,7 @@ module Carbide
       state = identity.state(subject, refs: refs_for(subject))
       bits << "dirty=#{state[:dirty] ? 'yes' : 'no'}"
       bits << "cluster=#{@config.present('cluster.name') || '?'}"
+      bits << "kubeconfig=#{kubeconfig.exist? ? kubeconfig.path : 'ambient'}" if target == 'minio' || target == 'both'
       bits << "config=#{@config.sources.join(' < ')}"
       @err.puts "resolved: #{bits.join(' ')}"
     end

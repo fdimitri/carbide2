@@ -20,7 +20,14 @@ csr: false           # generate key + CSR, then exit
 import-cert: ''       # path to a CA-signed cert to load as the Traefik default, then exit
 key: ''               # private key for import-cert (default: the .key from --csr)
 
-kubeconfig: '~/.kube/config'   # read by the verify step (kubeclient)
+# Per-cluster kubeconfigs (ADR-043 §9). Each cluster's is written to
+# <dir>/<cluster.name>.yaml with its cluster, user and context all renamed to
+# cluster.name, so "context == cluster.name" holds on every backend and a fleet
+# is addressed by config rather than by whatever the ambient context happens to
+# be. The dir is a global convention — identical on every box — so it belongs in
+# --yaml-out; only the resolved leaf is per-box, and that is derived.
+kubeconfig:
+  dir: '~/.carbide/kube'
 
 # --- what this box IS (ADR-028 §1–§2) ------------------------------------------
 node:

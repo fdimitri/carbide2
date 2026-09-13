@@ -40,6 +40,8 @@ class CliTest < Minitest::Test
         mc: ''
       client-build:
         node-image: ''
+      kubeconfig:
+        dir: ''
     YAML
     @out = StringIO.new
     @err = StringIO.new
@@ -199,6 +201,38 @@ class CliTest < Minitest::Test
 
     assert_equal Carbide::CLI::EXIT_REFUSED, run_cli('client', 'build')
     assert_match(/--allow-dirty/, stderr)
+  end
+
+  # --- addressing (ADR-043 §9) -----------------------------------------------
+
+  def test_the_kubeconfig_is_derived_from_the_cluster_name
+    dir = File.join(@fixture.root, 'kube')
+    FileUtils.mkdir_p(dir)
+    File.write(File.join(dir, 'test-cluster.yaml'), "apiVersion: v1\n")
+
+    run_cli('client', 'populate', 'minio', '--kubeconfig.dir', dir)
+
+    assert_match(%r{kubeconfig=#{Regexp.escape(File.join(dir, 'test-cluster.yaml'))}}, stderr)
+  end
+
+  # The escape hatch is a flag, because a path is a per-box fact and the config
+  # file is per-cluster.
+  def test_an_explicit_kubeconfig_flag_wins
+    path = File.join(@fixture.root, 'foreign.yaml')
+    File.write(path, "apiVersion: v1\n")
+
+    run_cli('client', 'populate', 'minio', '--kubeconfig', path)
+
+    assert_match(/kubeconfig=#{Regexp.escape(path)}/, stderr)
+  end
+
+  # Falling back to the ambient context is the thing §9 exists to stop, so it is
+  # at least said out loud.
+  def test_a_missing_per_cluster_kubeconfig_warns_before_using_the_ambient_context
+    run_cli('client', 'populate', 'minio')
+
+    assert_match(/kubeconfig=ambient/, stderr)
+    assert_match(/WARN.*falling back to the ambient context/, stderr)
   end
 
   # --- the resolution line ---------------------------------------------------

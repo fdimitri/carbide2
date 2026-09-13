@@ -87,6 +87,7 @@ require 'tempfile'
 require 'fileutils'
 require 'digest'
 require_relative 'lib/carbide_config'
+require_relative 'lib/carbide_kubeconfig'
 require_relative 'lib/carbide_command'
 require_relative 'lib/carbide_registry'
 require_relative 'lib/carbide_images'
@@ -201,7 +202,12 @@ module Carbide
       @cluster    = config.present('cluster.name') || 'carbide-dev'
       @control_ns = config.present('control.namespace') || 'carbide-system'
       @release    = config.present('control.release') || 'carbide-control'
-      @kubeconfig = config.present('kubeconfig') || '~/.kube/config'
+      # This cluster's own kubeconfig (ADR-043 §9). Falls back to ~/.kube/config
+      # until the node has been brought up once under the new scheme, so a box
+      # that has not been re-deployed since keeps working.
+      @kubeconfig_obj = Carbide::Kubeconfig.new(cmd: @cmd, cluster_name: @cluster,
+                                                dir: config.present('kubeconfig.dir'))
+      @kubeconfig = @kubeconfig_obj.readable_path
       # Deploy-flow toggles (defaults live in defaults.yaml; --no-<x> flips them).
       @no_build   = !config.bool('images.build')
       @no_shell   = !config.bool('images.shell')
@@ -285,7 +291,8 @@ module Carbide
         server_url: config.present('cluster.server-url'),
         token: config.present('cluster.token'),
         storage_class: @storage_class,
-        registry: @registry, pull: @consume == :pull
+        registry: @registry, pull: @consume == :pull,
+        kubeconfig_dir: config.present('kubeconfig.dir')
       )
       # Ingress TLS/cert flows (mkcert default cert, CSR/import, CA trust hints)
       # live in the shared Carbide::Tls helper.
@@ -339,7 +346,6 @@ module Carbide
           desc: 'Which deployments to roll after deploy: all (default), control, none' },
         { key: 'public.host', arg: 'HOST', desc: 'Browser-facing FQDN for ingress/cert/host-auth (default: hostname -f)' },
         { key: 'public.url', arg: 'URL', desc: 'Explicit full URL base for the ingress (wins over public.host)' },
-        { key: 'kubeconfig', arg: 'PATH', desc: 'kubeconfig for the verify step (default: ~/.kube/config)' },
         { key: 'csr', desc: 'Generate a private key + CSR (tls-opts.hosts / public.host) in tls-opts.out-dir, then exit' },
         { key: 'import-cert', arg: 'FILE', desc: 'Load a CA-signed cert into the TLS secret as the Traefik default, then exit' },
         { key: 'key', arg: 'FILE', desc: 'Private key for --import-cert (default: the .key from --csr in tls-opts.out-dir)' }
@@ -359,6 +365,11 @@ module Carbide
       # Cluster first, THEN the storage backend (creates its StorageClass), THEN
       # infra — MinIO's PVC is pinned to that class, so it must exist beforehand.
       @node.ensure_cluster! unless @no_infra
+      # The per-cluster kubeconfig exists now. Exporting it here is what makes
+      # every later kubectl/helm/k3d in this process target THIS cluster rather
+      # than whatever ~/.kube/config last pointed at — #113, at the level where
+      # it can no longer recur (ADR-043 §9).
+      pin_kubeconfig!
       @storage.ensure!
       @node.install_infra unless @no_infra
       build_images unless @no_build || skip_build?
@@ -658,6 +669,16 @@ module Carbide
       @node.join!
     end
 
+    # One file, one context named cluster.name, so no --context is needed and
+    # every child process inherits it.
+    def pin_kubeconfig!
+      return unless @kubeconfig_obj.exist?
+
+      ENV['KUBECONFIG'] = @kubeconfig_obj.path
+      @kubeconfig = @kubeconfig_obj.path
+      log "kubeconfig: #{@kubeconfig} (context #{@cluster})"
+    end
+
     def verify
       log "verifying ingress (self-signed cert -> curl -k)"
       http  = curl_code("http://localhost:#{@http_port}/")
@@ -735,6 +756,7 @@ specs = [
   Carbide::JwtKey,
   Carbide::Registry,
   Carbide::Images,
+  Carbide::Kubeconfig,
   Carbide::ControlPlane
 ].flat_map(&:options)
 
