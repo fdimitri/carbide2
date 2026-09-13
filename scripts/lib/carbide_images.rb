@@ -156,12 +156,23 @@ module Carbide
     # cannot leave a submodule detached. A bare build uses the working tree as it
     # stands, dirty and all, because you should not have to commit to build.
     #
-    # force: false skips any component whose registry ref already exists (tags
-    # are immutable, so an existing tag is identical content). A DIRTY tag is
-    # never skipped on presence: <sha>-dirty names a class of tree, not an
+    # TWO forces, because they override two different decisions (ADR-043 §8):
+    #
+    #   force_rebuild:  source-side — build even though the tag already exists.
+    #   force:          destination-side — push even though the tag is already
+    #                   in the registry, overwriting it.
+    #
+    # They are independent and compose. force_rebuild alone rebuilds and then
+    # still skips the push, which is right: pushing an identical immutable tag
+    # is a no-op. force alone pushes whatever is in the local daemon, and the
+    # local-image guard says so plainly when there is nothing there.
+    #
+    # Without either, a component whose registry ref already exists is skipped
+    # (tags are immutable, so an existing tag is identical content). A DIRTY tag
+    # is never skipped on presence: <sha>-dirty names a class of tree, not an
     # instance, so its presence is not information.
-    def build(components: ALL, refs: {}, push: false, force: false, quiet: true,
-              allow_dirty: false)
+    def build(components: ALL, refs: {}, push: false, force_rebuild: false, force: false,
+              quiet: true, allow_dirty: false)
       tags = tags_for(refs)
       guard_dirty!(components, tags, refs, allow_dirty)
       built = {}
@@ -170,14 +181,17 @@ module Carbide
         times = commit_times(sources)
         components.each do |component|
           ref = image_ref(component, tags)
-          if skip_present?(component, ref, tags, force)
+          if skip_present?(component, ref, tags, force_rebuild)
             log "skipping #{component}: #{ref} already in registry (use --force-rebuild)"
             built[component] = ref
             next
           end
           build_component(component, sources: sources, tags: tags, times: times, quiet: quiet)
           built[component] = ref
-          push_one(ref, dirty: dirty_tag?(tags[component]), allow_dirty: allow_dirty) if push && @registry
+          if push && @registry
+            push_one(ref, dirty: dirty_tag?(tags[component]),
+                     allow_dirty: allow_dirty, force: force)
+          end
         end
       end
       built
@@ -185,7 +199,7 @@ module Carbide
 
     # Push already-built components to the registry (no build). Used by deploy.rb
     # when it built earlier in the same process (no ref override in play).
-    def push(components: ALL, allow_dirty: false)
+    def push(components: ALL, allow_dirty: false, force: false)
       raise Error, 'push called without a registry' unless @registry
 
       # Gate before touching the network: a push that is going to be refused
@@ -194,8 +208,8 @@ module Carbide
       guard_dirty!(components, tags, {}, allow_dirty)
       ensure_registry!
       components.each do |component|
-        push_one(image_ref(component, tags),
-                 dirty: dirty_tag?(tags[component]), allow_dirty: allow_dirty)
+        push_one(image_ref(component, tags), dirty: dirty_tag?(tags[component]),
+                 allow_dirty: allow_dirty, force: force)
       end
     end
 
@@ -241,8 +255,8 @@ module Carbide
     def split_ref(ref) = ref.sub(@registry, '').split(':', 2)
 
     # Presence is only a trustworthy skip signal for a content-addressed tag.
-    def skip_present?(component, ref, tags, force)
-      return false if force || !@registry || dirty_tag?(tags[component])
+    def skip_present?(component, ref, tags, force_rebuild)
+      return false if force_rebuild || !@registry || dirty_tag?(tags[component])
 
       in_registry?(ref)
     end
@@ -403,7 +417,7 @@ module Carbide
       raise Error, "build failed (output above): #{args.last}"
     end
 
-    def push_one(ref, dirty: false, allow_dirty: false)
+    def push_one(ref, dirty: false, allow_dirty: false, force: false)
       # The push-dirty gate lives HERE rather than only in the CLI, so a caller
       # that bypasses the wrapper cannot seed a shared store with an artifact
       # nobody can identify.
@@ -412,7 +426,12 @@ module Carbide
                             'working tree, not a build. Pass --allow-dirty if you mean it.'
       end
 
-      if !dirty && in_registry?(ref)
+      # force is the ONLY way past this. Before it existed, a present tag could
+      # not be re-pushed at all: --force-rebuild bypassed the build skip and then
+      # this check silently dropped the push, so "rebuild and push it again"
+      # was unreachable — and a registry that had the tag was never written to,
+      # which is exactly the case you want when testing whether you CAN write.
+      if !dirty && !force && in_registry?(ref)
         log "  skip #{ref} (already in registry)"
         return
       end

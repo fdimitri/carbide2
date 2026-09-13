@@ -238,6 +238,60 @@ class ImagesTest < Minitest::Test
     assert_equal 1, docker.docker_commands('buildx', 'build').length
   end
 
+  # ADR-043 §8: two forces, overriding two different decisions.
+  #
+  # Before the split there was one, wired to the build skip only — so a tag
+  # already in the registry could not be re-pushed by any combination of flags,
+  # because push_one had its own presence check that nothing reached.
+  def test_force_rebuild_alone_rebuilds_but_still_skips_the_push
+    docker = Carbide::TestSupport::FakeDocker.new
+    subject, = images(docker, registry: registry(docker))
+    docker.registry_tags[subject.image_ref(:control)] = true
+    docker.present_images << subject.image_ref(:control)
+
+    subject.build(components: [:control], push: true, force_rebuild: true, quiet: true)
+
+    assert_equal 1, docker.docker_commands('buildx', 'build').length, 'rebuilt'
+    assert_empty docker.docker_commands('push'), 'an identical immutable tag is a no-op'
+  end
+
+  def test_force_alone_pushes_a_tag_that_is_already_present
+    docker = Carbide::TestSupport::FakeDocker.new
+    subject, = images(docker, registry: registry(docker))
+    docker.registry_tags[subject.image_ref(:control)] = true
+    docker.present_images << subject.image_ref(:control)
+
+    subject.push(components: [:control], force: true)
+
+    assert_equal [subject.image_ref(:control)], docker.docker_commands('push').map { |r| r.argv.last }
+  end
+
+  def test_the_two_forces_compose_into_rebuild_and_push
+    docker = Carbide::TestSupport::FakeDocker.new
+    subject, = images(docker, registry: registry(docker))
+    docker.registry_tags[subject.image_ref(:control)] = true
+    docker.present_images << subject.image_ref(:control)
+
+    subject.build(components: [:control], push: true,
+                  force_rebuild: true, force: true, quiet: true)
+
+    assert_equal 1, docker.docker_commands('buildx', 'build').length
+    assert_equal 1, docker.docker_commands('push').length
+  end
+
+  # force overrides the presence check, not the local-image guard: pushing a tag
+  # the daemon does not have is an ImagePullBackOff with no local evidence why.
+  def test_force_does_not_override_the_local_image_guard
+    docker = Carbide::TestSupport::FakeDocker.new
+    subject, = images(docker, registry: registry(docker))
+    docker.registry_tags[subject.image_ref(:control)] = true
+
+    err = assert_raises(Carbide::Images::Error) { subject.push(components: [:control], force: true) }
+
+    assert_match(/not present locally/, err.message)
+    assert_empty docker.docker_commands('push')
+  end
+
   def test_all_present_is_false_while_anything_is_dirty
     docker = Carbide::TestSupport::FakeDocker.new
     subject, = images(docker, registry: registry(docker))

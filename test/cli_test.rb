@@ -203,6 +203,15 @@ class CliTest < Minitest::Test
     assert_match(/--allow-dirty/, stderr)
   end
 
+  # --- the two forces (ADR-043 §8) -------------------------------------------
+
+  def test_force_and_force_rebuild_are_separate_flags
+    run_cli('--help')
+
+    assert_match(/--force\b.*Destination-side/, stdout)
+    assert_match(/--force-rebuild.*Source-side/, stdout)
+  end
+
   # --- addressing (ADR-043 §9) -----------------------------------------------
 
   def test_the_kubeconfig_is_derived_from_the_cluster_name
@@ -277,6 +286,21 @@ class CliTest < Minitest::Test
     assert_match(/client\) echo 'state build populate detect list rm'/, stdout)
     assert_match(/client\) echo 'registry minio both'/, stdout)
     assert_match(/workspace\) echo 'registry'/, stdout)
+  end
+
+  # TAB listing files is what an unregistered command looks like, so the script
+  # says how to check and how to load it into the shell you are in.
+  def test_bash_completion_documents_how_to_load_it
+    run_cli('--completion', 'bash')
+
+    assert_match(/eval "\$\(carcli --completion bash\)"/, stdout)
+    assert_match(/complete -p carcli/, stdout)
+  end
+
+  def test_bash_completion_registers_the_path_spellings_too
+    run_cli('--completion', 'bash')
+
+    assert_match(/^complete -F _carcli carcli \.\/carcli scripts\/carcli \.\/scripts\/carcli$/, stdout)
   end
 
   def test_zsh_completion_is_a_compdef_script
