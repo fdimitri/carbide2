@@ -1,0 +1,49 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# carcli — the carbide command line interface (ADR-043).
+#
+#   carcli [global options] <subject> <verb> [store] [options]
+#
+# Subjects are things you operate on: the artifacts this project produces
+# (workspace, control, shell, client) and the registry it depends on. Subject
+# first, not store first, because `build` and `state` have no store.
+#
+#   carcli client state
+#   carcli client build --allow-dirty
+#   carcli client populate minio --config prod-a.yaml
+#   carcli client populate both
+#   carcli workspace populate registry
+#   carcli client detect minio            # 0 present / 1 absent / 2 unreachable
+#   carcli client list minio
+#   carcli client rm minio <sha> -y
+#   carcli registry serve
+#   carcli registry check
+#
+# The context set is subject-dependent and enforced at parse: images are
+# registry-only, so `carcli workspace populate minio` is a usage error rather
+# than a runtime failure. MinIO is per-cluster and is addressed by the cluster
+# named in the resolved config, so a fan-out is N invocations with N --config
+# files, not N shells with different ambient state.
+#
+# Config layers, last wins:
+#   flags > explicit --config > env (registry.* only, for CI) > ./cluster.yaml > defaults.yaml
+#
+# Exit codes: 0 ok/present, 1 generic failure (for detect: absent),
+#             2 a store was unreachable, 3 usage, 4 config, 5 refused by a gate.
+#
+# This file is deliberately a shim: everything lives in Carbide::CLI so it can
+# be tested. Gems are installed on first run via bundler/inline, as deploy.rb
+# does.
+
+require 'bundler/inline'
+
+gemfile(true) do
+  source 'https://rubygems.org'
+  gem 'tty-command', '~> 0.10'
+end
+
+require_relative 'lib/carbide_cli'
+
+root = File.expand_path('..', __dir__)
+exit Carbide::CLI.run(ARGV, root: root, defaults_path: File.join(__dir__, 'defaults.yaml'))

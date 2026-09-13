@@ -34,7 +34,11 @@ module Carbide
 
     def self.options
       [
-        { key: 'client.node-image', arg: 'IMAGE',
+        # Not `client.node-image`: defaults.yaml already has a top-level
+        # `client:` BOOLEAN (deploy.rb's build-and-upload toggle), and a scalar
+        # cannot also be a mapping. Renaming that toggle belongs with the
+        # deploy.rb absorption, not here.
+        { key: 'client-build.node-image', arg: 'IMAGE',
           desc: "Node image the SPA is built in (default: #{DEFAULT_NODE_IMAGE})" }
       ]
     end

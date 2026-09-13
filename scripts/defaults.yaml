@@ -67,6 +67,19 @@ control:
   namespace: carbide-system
   release: carbide-control
 
+# --- the MinIO static tier (per cluster) ---------------------------------------
+minio:
+  namespace: ''      # "" => control.namespace
+  service: minio
+  secret: minio-credentials
+  mc: ''             # path to the MinIO client; "" probes for mcli then mc.
+                     # On Debian `mc` is Midnight Commander, so the probe checks
+                     # that --version says minio before believing a candidate.
+
+# --- the client SPA ------------------------------------------------------------
+client-build:
+  node-image: ''     # "" => node:22-alpine
+
 # --- browser-facing endpoint -------------------------------------------------
 public:
   host: ''           # browser FQDN for ingress/cert/host-auth ("" => hostname -f)

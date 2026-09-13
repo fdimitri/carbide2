@@ -2,6 +2,7 @@
 
 require 'fileutils'
 require 'tempfile'
+require 'json'
 require_relative 'carbide_command'
 
 module Carbide
@@ -249,6 +250,70 @@ module Carbide
     # both mean "do not skip".
     def has_manifest?(name, tag) = detect(name, tag) == :present
 
+    # Tags of one repository, newest-listing-order as the registry returns them.
+    #
+    # There is no /v2/_catalog call anywhere in carcli, and no need for the
+    # registry.repos fallback that exists for control's image picker: the
+    # grammar is subject-first, so the subject already names the repository.
+    # Listing repositories is a question carcli never asks.
+    #
+    # The bearer dance is the standard one and is why this is not a one-liner:
+    # an authenticated registry answers /v2/<repo>/tags/list with 401 and a
+    # WWW-Authenticate header naming a token endpoint; you fetch a token from
+    # there with basic auth and retry. A registry that needs no auth answers the
+    # first request.
+    def tags(name)
+      repo = repo_name(name)
+      res = curl_with_headers("#{base_url}/v2/#{repo}/tags/list")
+      if res[:status] == 401 && (challenge = bearer_challenge(res[:headers]))
+        token = fetch_token(challenge, repo)
+        raise "registry #{endpoint}: could not obtain a token for #{repo}" if token.nil?
+
+        res = curl_with_headers("#{base_url}/v2/#{repo}/tags/list",
+                                '-H', "Authorization: Bearer #{token}")
+      end
+      return [] if res[:status] == 404
+
+      raise "registry #{endpoint}: GET /v2/#{repo}/tags/list returned #{res[:status]}" unless res[:status] == 200
+
+      parsed = JSON.parse(res[:body]) rescue {}
+      Array(parsed['tags'])
+    end
+
+    # status + headers + body from one request. -i keeps it to a single call,
+    # which matters because the 401 path needs the header and the 200 path needs
+    # the body.
+    def curl_with_headers(url, *extra)
+      args = ['-s', '-i']
+      args += ['-u', "#{@username}:#{@password}"] if auth?
+      res = curl(*args, *extra, url)
+      split_response(res.out.to_s)
+    end
+
+    def bearer_challenge(headers)
+      line = headers.find { |h| h.downcase.start_with?('www-authenticate:') }
+      return nil unless line && line.downcase.include?('bearer')
+
+      line.split(':', 2).last.to_s.scan(/(\w+)="([^"]*)"/).to_h
+    end
+
+    def fetch_token(challenge, repo)
+      realm = challenge['realm']
+      return nil if realm.to_s.empty?
+
+      query = { 'service' => challenge['service'],
+                'scope' => challenge['scope'] || "repository:#{repo}:pull" }
+              .reject { |_, v| v.to_s.empty? }
+              .map { |k, v| "#{k}=#{v}" }.join('&')
+      args = ['-s']
+      args += ['-u', "#{@username}:#{@password}"] if auth?
+      res = curl(*args, query.empty? ? realm : "#{realm}?#{query}")
+      return nil unless res.success?
+
+      body = JSON.parse(res.out.to_s) rescue {}
+      body['token'] || body['access_token']
+    end
+
     # curl against the registry, trusting its CA when one is known.
     def curl(*args)
       cmd = ['curl']
@@ -257,6 +322,16 @@ module Carbide
     end
 
     private
+
+    def split_response(raw)
+      # Proxies and 100-continue can produce more than one header block; the
+      # last one is the response that actually answered.
+      head, _, body = raw.rpartition("\r\n\r\n")
+      head, _, body = raw.rpartition("\n\n") if head.empty?
+      lines = head.split(/\r?\n/)
+      status = lines.reverse.find { |l| l.start_with?('HTTP/') }.to_s[/\s(\d{3})\s?/, 1].to_i
+      { status: status, headers: lines, body: body }
+    end
 
     def mkcert_root
       out, = @cmd.run!('mkcert', '-CAROOT')

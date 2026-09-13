@@ -40,7 +40,8 @@ module Carbide
       [
         { key: 'minio.namespace', arg: 'NS',   desc: 'Namespace of the MinIO service (default: the control namespace)' },
         { key: 'minio.service',   arg: 'NAME', desc: 'MinIO service name (default: minio)' },
-        { key: 'minio.secret',    arg: 'NAME', desc: 'Secret holding root-user/root-password (default: minio-credentials)' }
+        { key: 'minio.secret',    arg: 'NAME', desc: 'Secret holding root-user/root-password (default: minio-credentials)' },
+        { key: 'minio.mc',        arg: 'PATH', desc: "Path to the MinIO client (blank probes mcli then mc; Debian's mc is Midnight Commander)" }
       ]
     end
 
