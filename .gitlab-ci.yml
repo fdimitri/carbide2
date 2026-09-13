@@ -42,6 +42,28 @@ variables:
       [ -n "$REGISTRY_HOST" ] || { echo "no registry: CI_REGISTRY unset"; exit 1; }
       export REGISTRY_HOST REGISTRY_PORT REGISTRY_PATH REGISTRY_MODE REGISTRY_USERNAME REGISTRY_PASSWORD
     - echo "registry $REGISTRY_HOST:$REGISTRY_PORT path=$REGISTRY_PATH mode=$REGISTRY_MODE user=$REGISTRY_USERNAME"
+    # What each script will actually WRITE to. The two are derived differently —
+    # build.rb reassembles REGISTRY_HOST + REGISTRY_PORT + REGISTRY_PATH, while
+    # build-client takes $CI_REGISTRY_IMAGE verbatim — so when a push is denied,
+    # the first question is whether they even agree. No secrets: usernames only,
+    # same as the line above.
+    - |
+      echo "CI_REGISTRY=$CI_REGISTRY"
+      echo "CI_REGISTRY_IMAGE=$CI_REGISTRY_IMAGE"
+      echo "build.rb     -> ${REGISTRY_HOST}${REGISTRY_PORT:+:$REGISTRY_PORT}/${REGISTRY_PATH}/<image>:<tag>"
+      echo "build-client -> ${CI_REGISTRY_IMAGE}/carbide2-client:<sha>"
+      # REGISTRY_PATH is $CI_REGISTRY_IMAGE with $CI_REGISTRY stripped off the
+      # front, which only works when the two agree character for character. If
+      # they differ at all — a port in one and not the other — the strip is a
+      # no-op and REGISTRY_PATH keeps the host, so build.rb pushes to
+      # host:port/host:port/group/project/... and GitLab routes it somewhere
+      # that is not the registry.
+      case "$CI_REGISTRY_IMAGE" in
+        "$CI_REGISTRY"/*) : ;;
+        *)
+          echo "WARN CI_REGISTRY_IMAGE does not start with CI_REGISTRY/, so the prefix strip did nothing"
+          echo "WARN REGISTRY_PATH kept a host: $REGISTRY_PATH" ;;
+      esac
 
 # ---------------------------------------------------------------------------
 # build — control + server-worker (workspace) images to the registry.
