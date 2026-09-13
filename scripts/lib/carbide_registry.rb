@@ -133,6 +133,27 @@ module Carbide
       raise 'registry.mode=gitlab requires registry.username/registry.password (a deploy token)' unless auth?
     end
 
+    # Log in ONCE per process, lazily, before anything that needs the credential
+    # store. Every read path calls this rather than trusting a caller to have
+    # done it: an anonymous `docker manifest inspect` against an authenticated
+    # registry is answered 401, which detect must report as :unreachable — so a
+    # detect that runs before login does not merely fail, it reports the WRONG
+    # ANSWER, and `populate --source=auto` stops on a registry that is fine.
+    #
+    # A failed login is recorded rather than raised, so detect can turn it into
+    # :unreachable instead of an exception escaping a read.
+    def ensure_login!
+      return @logged_in if defined?(@logged_in)
+
+      @logged_in =
+        begin
+          auth? ? login! : false
+        rescue StandardError => e
+          log "docker login to #{endpoint} failed: #{e.message}"
+          nil
+        end
+    end
+
     # Log docker in to the registry so push and `docker manifest inspect` use
     # the credential store. No-op without credentials (self-hosted). Idempotent.
     def login!
@@ -236,6 +257,7 @@ module Carbide
     def detect(name, tag)
       return :unreachable unless configured?
 
+      ensure_login!
       res = @quiet.run!('docker', 'manifest', 'inspect', "#{prefix}#{name}:#{tag}")
       return :present if res.success?
 
@@ -263,6 +285,7 @@ module Carbide
     # there with basic auth and retry. A registry that needs no auth answers the
     # first request.
     def tags(name)
+      ensure_login!
       repo = repo_name(name)
       res = curl_with_headers("#{base_url}/v2/#{repo}/tags/list")
       if res[:status] == 401 && (challenge = bearer_challenge(res[:headers]))

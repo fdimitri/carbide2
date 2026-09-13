@@ -348,7 +348,6 @@ module Carbide
         end
       end
 
-      registry.login! if registry.auth?
       images.build(components: [subject], refs: refs_for(subject), push: true,
                    force_rebuild: @opts[:force_rebuild], force: @opts[:force],
                    quiet: false, allow_dirty: @opts[:allow_dirty])
@@ -368,7 +367,6 @@ module Carbide
         end
       end
 
-      registry.login! if registry.auth?
       client.build(refs: refs_for(:client), allow_dirty: @opts[:allow_dirty]) do |built|
         client.cache_push(built, allow_dirty: @opts[:allow_dirty])
       end
@@ -398,7 +396,6 @@ module Carbide
       resolution(subject: :client, source: @opts[:source], target: 'both')
       raise ConfigError, 'populate both needs registry.host' unless registry.configured?
 
-      registry.login! if registry.auth?
       # One obtain, two writes. Not two sequential populates — that would build,
       # push the registry, then pull back what it just pushed.
       obtain(tag_for(:client), seed_registry: true) do |built|

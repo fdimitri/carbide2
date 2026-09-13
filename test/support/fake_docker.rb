@@ -18,9 +18,16 @@ module Carbide
         def flag_values(flag) = argv.each_cons(2).select { |f, _| f == flag }.map(&:last)
       end
 
+      # requires_login: model an authenticated registry — `docker manifest
+      # inspect` is answered 401 until a `docker login` has been recorded. This
+      # is what GitLab does, and it is why a detect that runs before login
+      # reports the wrong answer rather than simply failing.
       def initialize(present_images: [], registry_tags: {}, push_fails: false,
-                     manifest_error: 'manifest unknown', http_code: '200')
+                     manifest_error: 'manifest unknown', http_code: '200',
+                     requires_login: false)
         super()
+        @requires_login = requires_login
+        @logged_in = false
         @present_images = present_images   # refs `docker image inspect` finds
         @registry_tags  = registry_tags    # ref => true when the registry has it
         @push_fails     = push_fails
@@ -30,6 +37,8 @@ module Carbide
       end
 
       attr_reader :docker, :present_images, :registry_tags
+
+      def logged_in? = @logged_in
 
       def docker_commands(*prefix)
         @docker.select { |r| r.argv[1, prefix.length] == prefix }
@@ -63,15 +72,24 @@ module Carbide
       def fake_docker_rest(argv)
         case argv[1]
         when 'create' then Result.new("deadbeefcafe\n", '', 0)
+        when 'login'  then login_result
         when 'push'   then push_result(argv.last)
         else ok
         end
       end
 
       def manifest_result(ref)
+        if @requires_login && !@logged_in
+          return Result.new('', 'unauthorized: authentication required', 1)
+        end
         return ok if @registry_tags[ref]
 
         Result.new('', @manifest_error, 1)
+      end
+
+      def login_result
+        @logged_in = true
+        ok
       end
 
       def image_result(ref)

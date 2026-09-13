@@ -334,6 +334,43 @@ class ImagesTest < Minitest::Test
 
   # --- detect ----------------------------------------------------------------
 
+  # An authenticated registry answers an anonymous `docker manifest inspect`
+  # with 401, which detect must call :unreachable — so a detect that runs before
+  # login does not merely fail, it returns the WRONG ANSWER and stops a populate
+  # against a registry that is perfectly fine. Login therefore belongs to the
+  # store, not to whoever remembered to call it.
+  def test_detect_logs_in_first_against_an_authenticated_registry
+    docker = Carbide::TestSupport::FakeDocker.new(requires_login: true)
+    reg = Carbide::Registry.new(cmd: docker, quiet: docker, host: 'registry.test',
+                                port: '5000', username: 'ci', password: 'token')
+    subject, = images(docker, registry: reg)
+    docker.registry_tags[subject.image_ref(:control)] = true
+
+    assert_equal :present, subject.detect(:control)
+    assert docker.logged_in?, 'the store logged itself in'
+  end
+
+  def test_login_happens_once_across_several_detects
+    docker = Carbide::TestSupport::FakeDocker.new(requires_login: true)
+    reg = Carbide::Registry.new(cmd: docker, quiet: docker, host: 'registry.test',
+                                port: '5000', username: 'ci', password: 'token')
+    subject, = images(docker, registry: reg)
+
+    Carbide::Images::ALL.each { |c| subject.detect(c) }
+
+    assert_equal 1, docker.docker_commands('login').length
+  end
+
+  # No credentials configured (a self-hosted registry) must not attempt a login.
+  def test_detect_does_not_log_in_without_credentials
+    docker = Carbide::TestSupport::FakeDocker.new
+    subject, = images(docker, registry: registry(docker))
+
+    subject.detect(:control)
+
+    assert_empty docker.docker_commands('login')
+  end
+
   def test_detect_is_tri_state
     docker = Carbide::TestSupport::FakeDocker.new
     subject, = images(docker, registry: registry(docker))
