@@ -56,7 +56,15 @@ module Carbide
         when %w[image inspect]    then image_result(argv.last)
         when %w[buildx build]     then ok
         else
-          argv[1] == 'push' ? push_result(argv.last) : ok
+          fake_docker_rest(argv)
+        end
+      end
+
+      def fake_docker_rest(argv)
+        case argv[1]
+        when 'create' then Result.new("deadbeefcafe\n", '', 0)
+        when 'push'   then push_result(argv.last)
+        else ok
         end
       end
 
