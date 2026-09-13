@@ -32,6 +32,11 @@
 # Exit codes: 0 ok/present, 1 generic failure (for detect: absent),
 #             2 a store was unreachable, 3 usage, 4 config, 5 refused by a gate.
 #
+# Shell completion (static; nothing calls carcli at tab time):
+#   carcli --completion bash | sudo tee /etc/bash_completion.d/carcli
+#   carcli --completion zsh  > ~/.zsh/completions/_carcli
+# Regenerate after a grammar change.
+#
 # This file is deliberately a shim: everything lives in Carbide::CLI so it can
 # be tested. Gems are installed on first run via bundler/inline, as deploy.rb
 # does.

@@ -72,8 +72,14 @@ module Carbide
     #             a library that aborts cannot give its caller either.
     # discover  : look for ./cluster.yaml when no --config is given.
     # env_layer : read the CI registry variables (see ENV_LAYER).
+    # banner  : the Usage: line. deploy.rb's default is wrong for any other
+    #           caller, and a CLI whose --help describes a different program is
+    #           worse than no --help.
+    # on_help  : what -h does. The default prints and exits the process, which a
+    #           library should not do to a caller that wants an exit code.
     def initialize(defaults_path:, specs:, before_emit: nil, fail_with: nil,
-                   fail_usage: nil, discover: false, env_layer: false, env: ENV)
+                   fail_usage: nil, discover: false, env_layer: false, env: ENV,
+                   banner: nil, on_help: nil)
       @defaults_path = defaults_path
       @specs         = specs
       @secret_keys   = specs.select { |s| s[:secret] }.map { |s| s[:key] }
@@ -90,6 +96,8 @@ module Carbide
       @discover      = discover
       @env_layer     = env_layer
       @env           = env
+      @banner        = banner
+      @on_help       = on_help
       @sources       = []
     end
 
@@ -206,7 +214,7 @@ module Carbide
 
     def build_parser
       OptionParser.new do |o|
-        o.banner = "Usage: deploy.rb [options]\n" \
+        o.banner = @banner || "Usage: deploy.rb [options]\n" \
                    "  Config layers (last wins): defaults.yaml -> --config input.yaml -> CLI flags.\n" \
                    "  Every --a.b.c flag sets the a.b.c key; emit the resolved set with --yaml-out.\n\n"
 
@@ -218,7 +226,9 @@ module Carbide
         o.on('--yaml-out PATH', 'FREEZE the fully-resolved config (secrets included) to PATH and exit; does NOT deploy — deploy from it with --config PATH') { |v| @emit = [:full, v] }
         o.on('--yaml-safeout PATH', 'Like --yaml-out but redact secrets (not usable by joiners); then exit') { |v| @emit = [:safe, v] }
         o.on('--schema-out PATH', 'Dump the option specs + resolved defaults as JSON to PATH and exit (drives scripts/configure.rb)') { |v| @emit = [:schema, v] }
-        o.on('-h', '--help', 'Show this help') { puts o; exit 0 }
+        o.on('-h', '--help', 'Show this help') do
+          @on_help ? @on_help.call(o.to_s) : (puts o; exit 0)
+        end
       end
     end
 

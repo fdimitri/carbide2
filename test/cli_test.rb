@@ -235,6 +235,74 @@ class CliTest < Minitest::Test
     assert_match(/WARN.*falling back to the ambient context/, stderr)
   end
 
+  # --- help and completion ---------------------------------------------------
+
+  # Config's default banner describes deploy.rb, which on another tool is worse
+  # than no banner at all.
+  def test_help_describes_carcli_not_deploy_rb
+    assert_equal Carbide::CLI::EXIT_OK, run_cli('--help')
+    assert_match(/Usage: carcli/, stdout)
+    refute_match(/deploy\.rb/, stdout)
+  end
+
+  # Asking for help is not an error: stdout, exit 0, so `carcli --help | less`
+  # works and a script can tell it from a failure.
+  def test_help_goes_to_stdout_and_exits_zero
+    run_cli('--help')
+
+    assert_empty stderr
+    assert_match(/--allow-dirty/, stdout)
+    assert_match(/--source/, stdout)
+  end
+
+  def test_help_lists_the_config_keys_too
+    run_cli('--help')
+
+    assert_match(/--registry\.host/, stdout)
+    assert_match(/--kubeconfig\.dir/, stdout)
+  end
+
+  def test_completion_requires_a_known_shell
+    assert_equal Carbide::CLI::EXIT_USAGE, run_cli('--completion', 'fish')
+    assert_match(/takes bash \| zsh/, stderr)
+  end
+
+  # Generated from the same GRAMMAR the parser uses, so the completion cannot
+  # offer a verb the CLI does not have.
+  def test_bash_completion_carries_the_grammar
+    assert_equal Carbide::CLI::EXIT_OK, run_cli('--completion', 'bash')
+
+    assert_match(/complete -F _carcli carcli/, stdout)
+    assert_match(/workspace control shell client registry/, stdout)
+    assert_match(/client\) echo 'state build populate detect list rm'/, stdout)
+    assert_match(/client\) echo 'registry minio both'/, stdout)
+    assert_match(/workspace\) echo 'registry'/, stdout)
+  end
+
+  def test_zsh_completion_is_a_compdef_script
+    assert_equal Carbide::CLI::EXIT_OK, run_cli('--completion', 'zsh')
+
+    assert_match(/\A#compdef carcli/, stdout)
+    assert_match(/stores=\(registry minio both\)/, stdout)
+  end
+
+  def test_completion_offers_every_flag_the_parser_accepts
+    run_cli('--completion', 'bash')
+
+    %w[--allow-dirty --force --force-rebuild --server-ref --kubeconfig --config
+       --registry.host --no-images.shell].each do |flag|
+      assert_includes stdout, flag
+    end
+  end
+
+  # A flag's VALUE must not shift the grammar position, or
+  # `carcli --config x.yaml <TAB>` completes verbs instead of subjects.
+  def test_completion_skips_the_values_of_value_taking_flags
+    run_cli('--completion', 'bash')
+
+    assert_match(/--source\|--ref\|--server-ref.*--config\) \(\(i\+\+\)\)/, stdout)
+  end
+
   # --- the resolution line ---------------------------------------------------
 
   def test_every_run_prints_one_resolution_line_before_any_work

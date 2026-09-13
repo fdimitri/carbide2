@@ -33,6 +33,7 @@ module Carbide
 
     UsageError  = Class.new(StandardError)
     ConfigError = Class.new(StandardError)
+    HelpRequested = Class.new(StandardError)
 
     ARTIFACTS = %i[workspace control shell client].freeze
     IMAGES    = %i[workspace control shell].freeze
@@ -56,6 +57,33 @@ module Carbide
 
     SOURCES = %w[auto registry build].freeze
 
+    # Behaviour flags — the ones with no config home. Held as data because three
+    # things read them: the parser, --help, and the completion script. A flag
+    # that exists in one and not the others is the drift this avoids.
+    BEHAVIOR = [
+      ['--source', 'SOURCE', :source,
+       "Where the artifact comes from: #{SOURCES.join(' | ')} (default: auto). " \
+       'An explicit source is STRICT — it never falls back to a build.'],
+      ['--allow-dirty', nil, :allow_dirty,
+       'Permit a dirty tree to be built, and a -dirty tag to be written'],
+      ['--force', nil, :force,
+       'Destination-side: overwrite a tag that is already present'],
+      ['--force-rebuild', nil, :force_rebuild,
+       'Source-side: build even though the tag exists'],
+      ['--ref', 'REF', :ref, 'Build this ref of a single-source subject'],
+      ['--server-ref', 'REF', :server_ref, 'Build from this carbide2-server ref'],
+      ['--worker-ref', 'REF', :worker_ref, 'Build from this carbide2-worker ref'],
+      ['--control-ref', 'REF', :control_ref, 'Build from this carbide2-control ref'],
+      ['--client-ref', 'REF', :client_ref, 'Build from this carbide2-client ref'],
+      ['--label', 'TEXT', :label, 'Label this client build in the picker (default: the sha)'],
+      ['--kubeconfig', 'PATH', :kubeconfig,
+       'Use this kubeconfig instead of the one derived from cluster.name'],
+      ['--json', nil, :json, 'Machine-readable output where the verb has a structured form'],
+      ['--completion', 'SHELL', :completion, 'Print a shell completion script (bash | zsh) and exit']
+    ].freeze
+
+    COMPLETION_SHELLS = %w[bash zsh].freeze
+
     def self.run(argv, root:, defaults_path:, out: $stdout, err: $stderr, cmd: nil, quiet: nil)
       new(root: root, defaults_path: defaults_path, out: out, err: err,
           cmd: cmd, quiet: quiet).run(argv)
@@ -75,7 +103,14 @@ module Carbide
 
     def run(argv)
       subject, verb, context = parse!(argv.dup)
+      return completion(@opts[:completion]) if @opts[:completion]
+
       dispatch(subject, verb, context)
+    rescue HelpRequested => e
+      # Asking for help is not an error: it goes to stdout and exits 0, so
+      # `carcli --help | less` works and a script can tell it from a failure.
+      @out.puts e.message
+      EXIT_OK
     rescue UsageError => e
       error(e.message)
       EXIT_USAGE
@@ -108,6 +143,8 @@ module Carbide
     # on a leading dash instead would read `--ref main` as the store `main`.
     def parse!(argv)
       positional = parse_options!(argv)
+      return [nil, nil, nil] if @opts[:completion]
+
       subject = positional[0]
       raise UsageError, usage if subject.nil?
 
@@ -154,7 +191,9 @@ module Carbide
         fail_with: ->(msg) { raise ConfigError, msg },
         fail_usage: ->(msg) { raise UsageError, msg },
         discover: true,
-        env_layer: true
+        env_layer: true,
+        banner: banner,
+        on_help: ->(text) { raise HelpRequested, text }
       )
       @config.parse!(argv) { |parser| behavior_options(parser) }
       argv
@@ -163,24 +202,19 @@ module Carbide
     def behavior_options(parser)
       parser.separator ''
       parser.separator 'carcli:'
-      parser.on('--source SOURCE', SOURCES,
-                "Where the artifact comes from: #{SOURCES.join(' | ')} (default: auto). " \
-                'An explicit source is STRICT — it never falls back to a build.') { |v| @opts[:source] = v }
-      parser.on('--allow-dirty', 'Permit a dirty tree to be built, and a -dirty tag to be written') { @opts[:allow_dirty] = true }
-      parser.on('--force', 'Destination-side: overwrite a tag that is already present') { @opts[:force] = true }
-      parser.on('--force-rebuild', 'Source-side: build even though the tag exists') { @opts[:force_rebuild] = true }
-      parser.on('--ref REF', 'Build this ref of a single-source subject') { |v| @opts[:ref] = v }
-      %w[server worker control client].each do |component|
-        parser.on("--#{component}-ref REF", "Build from this carbide2-#{component} ref") do |v|
-          @opts[:refs][component.to_sym] = v
+      BEHAVIOR.each do |flag, arg, key, desc|
+        spec = arg ? "#{flag} #{arg}" : flag
+        if key == :source
+          parser.on(spec, SOURCES, desc) { |v| @opts[:source] = v }
+        elsif key.to_s.end_with?('_ref') && key != :ref
+          component = key.to_s.sub('_ref', '').to_sym
+          parser.on(spec, desc) { |v| @opts[:refs][component] = v }
+        elsif arg
+          parser.on(spec, desc) { |v| @opts[key] = v }
+        else
+          parser.on(spec, desc) { @opts[key] = true }
         end
       end
-      parser.on('--label TEXT', 'Label this client build in the picker (default: the sha)') { |v| @opts[:label] = v }
-      # Per-invocation, never a config key: a frozen cluster.yaml is read by
-      # every node of the cluster, so an absolute path in it would be a per-box
-      # fact in a per-cluster file (ADR-043 §9).
-      parser.on('--kubeconfig PATH', 'Use this kubeconfig instead of the one derived from cluster.name') { |v| @opts[:kubeconfig] = v }
-      parser.on('--json', 'Machine-readable output where the verb has a structured form') { @opts[:json] = true }
     end
 
     def specs
@@ -573,6 +607,122 @@ module Carbide
     def info(message)  = @err.puts("INFO  #{message}")
     def warn_line(msg) = @err.puts("WARN  #{msg}")
     def error(message) = @err.puts("ERROR #{message}")
+
+    # The Usage: block Config puts at the top of --help. deploy.rb's default
+    # describes deploy.rb, which is worse than no banner at all on another tool.
+    def banner
+      "#{usage}\n"
+    end
+
+    # --- completion ------------------------------------------------------------
+
+    # A STATIC script, generated from the same GRAMMAR the parser uses, rather
+    # than a script that shells out to carcli on every tab press: the shim runs
+    # bundler/inline on each invocation, which is far too slow to sit behind a
+    # keystroke. Regenerate it when the grammar changes:
+    #
+    #   carcli --completion bash > /etc/bash_completion.d/carcli
+    #   carcli --completion zsh  > ~/.zsh/completions/_carcli
+    def completion(shell)
+      unless COMPLETION_SHELLS.include?(shell)
+        raise UsageError, "--completion takes #{COMPLETION_SHELLS.join(' | ')}, got '#{shell}'"
+      end
+
+      @out.puts(shell == 'bash' ? bash_completion : zsh_completion)
+      EXIT_OK
+    end
+
+    def completion_flags
+      config_flags = specs.flat_map do |spec|
+        long = spec[:long] || spec[:key]
+        spec[:negatable] ? ["--#{long}", "--no-#{long}"] : ["--#{long}"]
+      end
+      (BEHAVIOR.map(&:first) + config_flags + ['--config', '--help']).uniq.sort
+    end
+
+    def bash_completion
+      subject_verbs = GRAMMAR.map { |s, g| "    #{s}) echo '#{g[:verbs].join(' ')}' ;;" }.join("\n")
+      subject_stores = GRAMMAR.reject { |_, g| g[:stores].empty? }
+                              .map { |s, g| "    #{s}) echo '#{g[:stores].join(' ')}' ;;" }.join("\n")
+      <<~BASH
+        # carcli bash completion — generated by `carcli --completion bash`.
+        # Regenerate after a grammar change; nothing here calls carcli at runtime.
+        _carcli_verbs() {
+          case "$1" in
+        #{subject_verbs}
+          esac
+        }
+        _carcli_stores() {
+          case "$1" in
+        #{subject_stores}
+          esac
+        }
+        _carcli() {
+          local cur prev words=() i
+          cur="${COMP_WORDS[COMP_CWORD]}"
+          # Positionals only: a flag or its value must not shift the grammar
+          # position, or `carcli --config x.yaml <TAB>` completes verbs.
+          for ((i=1; i<COMP_CWORD; i++)); do
+            case "${COMP_WORDS[i]}" in
+              -*) case "${COMP_WORDS[i]}" in
+                    #{BEHAVIOR.select { |_, arg, _, _| arg }.map(&:first).join('|')}|--config) ((i++)) ;;
+                  esac ;;
+              *) words+=("${COMP_WORDS[i]}") ;;
+            esac
+          done
+          if [[ "$cur" == -* ]]; then
+            COMPREPLY=($(compgen -W '#{completion_flags.join(' ')}' -- "$cur"))
+            return
+          fi
+          case "${#words[@]}" in
+            0) COMPREPLY=($(compgen -W '#{GRAMMAR.keys.join(' ')}' -- "$cur")) ;;
+            1) COMPREPLY=($(compgen -W "$(_carcli_verbs "${words[0]}")" -- "$cur")) ;;
+            2) COMPREPLY=($(compgen -W "$(_carcli_stores "${words[0]}")" -- "$cur")) ;;
+            *) COMPREPLY=() ;;
+          esac
+        }
+        complete -F _carcli carcli
+      BASH
+    end
+
+    def zsh_completion
+      verbs = GRAMMAR.map { |s, g| "    #{s}) verbs=(#{g[:verbs].join(' ')}) ;;" }.join("\n")
+      stores = GRAMMAR.reject { |_, g| g[:stores].empty? }
+                      .map { |s, g| "    #{s}) stores=(#{g[:stores].join(' ')}) ;;" }.join("\n")
+      <<~ZSH
+        #compdef carcli
+        # carcli zsh completion — generated by `carcli --completion zsh`.
+        # Regenerate after a grammar change; nothing here calls carcli at runtime.
+        _carcli() {
+          local -a words_only verbs stores
+          local w skip=0
+          for w in ${words[2,$((CURRENT-1))]}; do
+            if (( skip )); then skip=0; continue; fi
+            case $w in
+              #{BEHAVIOR.select { |_, arg, _, _| arg }.map(&:first).join('|')}|--config) skip=1 ;;
+              -*) ;;
+              *) words_only+=$w ;;
+            esac
+          done
+          if [[ $words[CURRENT] == -* ]]; then
+            compadd -- #{completion_flags.join(' ')}
+            return
+          fi
+          case ${#words_only} in
+            0) compadd -- #{GRAMMAR.keys.join(' ')} ;;
+            1) case $words_only[1] in
+        #{verbs}
+               esac
+               compadd -- $verbs ;;
+            2) case $words_only[1] in
+        #{stores}
+               esac
+               compadd -- $stores ;;
+          esac
+        }
+        _carcli "$@"
+      ZSH
+    end
 
     def usage
       <<~USAGE
