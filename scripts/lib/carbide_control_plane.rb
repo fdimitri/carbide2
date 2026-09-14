@@ -97,21 +97,22 @@ module Carbide
         # list available tags. The CA PEM is the mkcert rootCA that signs the
         # registry's cert — multi-line, so it must be a YAML block scalar in a
         # values file, never a --set-string (newlines would break helm).
-        args.push('--set-string', "registry.url=#{@registry_url}")
+        push_set_string(args, 'registry.url', @registry_url)
         # Namespace between host and image (GitLab: group/project). Empty keeps
         # the flat self-hosted shape.
-        args.push('--set-string', "registry.path=#{@registry_path}") unless @registry_path.empty?
-        args.push('--set-string', "registry.repos=#{@registry_repos}") unless @registry_repos.empty?
+        push_set_string(args, 'registry.path', @registry_path) unless @registry_path.empty?
+        push_set_string(args, 'registry.repos', @registry_repos) unless @registry_repos.empty?
         # mode=gitlab: a GitLab registry has no /v2/_catalog. Default the catalog
         # check off unless it was set explicitly.
         effective_catalog = @registry_catalog
         effective_catalog = 'no' if effective_catalog.empty? && @registry_mode == 'gitlab'
-        args.push('--set-string', "registry.catalog=#{effective_catalog}") unless effective_catalog.empty?
-        # Auth for the operator's imagePullSecret (GitLab). Sent to helm so the
-        # operator process gets them; skipped entirely when unset (self-hosted).
-        args.push('--set-string', "registry.username=#{@registry_user}") unless @registry_user.empty?
-        args.push('--set-string', "registry.password=#{@registry_pass}") unless @registry_pass.empty?
-        args.push('--set-string', "registry.pullSecret=#{@registry_pull_secret}") unless @registry_pull_secret.empty?
+        push_set_string(args, 'registry.catalog', effective_catalog) unless effective_catalog.empty?
+        # Auth for the imagePullSecret the chart renders for its own pods and the
+        # operator builds per workspace namespace. Sent to helm so both get them;
+        # skipped entirely when unset (self-hosted, where trust is the CA).
+        push_set_string(args, 'registry.username', @registry_user) unless @registry_user.empty?
+        push_set_string(args, 'registry.password', @registry_pass) unless @registry_pass.empty?
+        push_set_string(args, 'registry.pullSecret', @registry_pull_secret) unless @registry_pull_secret.empty?
         if @registry_ca && !@registry_ca.empty?
           ca_file = write_registry_ca_values(@registry_ca)
           args.push('--values', ca_file)
@@ -173,6 +174,22 @@ module Carbide
     end
 
     private
+
+    # helm's --set-string takes a comma-separated list of key=value pairs, so a
+    # comma INSIDE a value ends the pair and the next fragment is read as a key
+    # with no value: `registry.repos=a,b,c` fails with
+    # `key "b" has no value (cannot end with ,)`. Braces open helm's own list
+    # literal and a backslash is its escape character, so all three are escaped,
+    # backslash first or the escapes would escape each other.
+    #
+    # Every --set-string goes through here rather than only the values known to
+    # contain commas today: a registry token or a password is opaque, and the
+    # failure mode is a deploy that dies mid-helm with a message naming a
+    # fragment of a credential.
+    def push_set_string(args, key, value)
+      escaped = value.to_s.gsub('\\', '\\\\\\\\').gsub(',', '\\,').gsub('{', '\\{').gsub('}', '\\}')
+      args.push('--set-string', "#{key}=#{escaped}")
+    end
 
     # Write the CA PEM as a YAML block scalar so helm can consume it without the
     # multi-line --set-string shell-mangling problem. Content must be indented
