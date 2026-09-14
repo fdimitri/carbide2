@@ -161,9 +161,11 @@ module Carbide
       return [] unless @pull
 
       ca = @registry.ca_path
-      args = ['--registry-config', write_tempfile('k3d-registries', k3d_registries_yaml(ca))]
-      args += ['--volume', "#{ca}:#{K3D_REGISTRY_CA}@server:*"] if ca
-      args
+      content = k3d_registries_yaml(ca)
+      return [] if content.empty?
+
+      ['--registry-config', write_tempfile('k3d-registries', content),
+       '--volume', "#{ca}:#{K3D_REGISTRY_CA}@server:*"]
     end
 
     # An existing k3d cluster has no create-time hook, so write the same files
@@ -173,6 +175,11 @@ module Carbide
       ca   = @registry.ca_path
       cur, = @quiet.run!('docker', 'exec', node, 'cat', K3D_REGISTRIES_YAML)
       desired = k3d_registries_yaml(ca)
+      # Nothing to configure and nothing stale to clear: say so rather than
+      # restarting the node to write a file with no settings in it.
+      if desired.empty? && cur.to_s.strip.empty?
+        return log "registry #{@registry.endpoint} has no private CA — the node uses its system trust store"
+      end
       return log "registry #{@registry.endpoint} already trusted in node #{node}" if cur.to_s == desired
 
       log "trusting registry #{@registry.endpoint} in node #{node} (registries.yaml + restart)"
@@ -183,10 +190,24 @@ module Carbide
       @cmd.run('kubectl', 'wait', '--for=condition=Ready', "node/#{node}", '--timeout=120s')
     end
 
+    # containerd's registries.yaml, or EMPTY when there is nothing to say.
+    #
+    # The endpoint alone is not configuration. Emitting the key with no body
+    # produced
+    #
+    #   configs:
+    #     "10.250.0.54:5009":
+    #
+    # — a mapping key whose value is null, which configures nothing and is not a
+    # valid registry config. It also made every deploy look like it was doing
+    # something: the file "changed", so the node was restarted, and the
+    # cur == desired comparison below was comparing two strings that carried no
+    # settings either way. The k3s path (trust_registry!) already returns early
+    # in this case; this is the same rule for k3d.
     def k3d_registries_yaml(ca)
-      ep = @registry.endpoint
-      tls = ca ? "    tls:\n      ca_file: \"#{K3D_REGISTRY_CA}\"\n" : ''
-      "configs:\n  \"#{ep}\":\n#{tls}"
+      return '' unless ca
+
+      "configs:\n  \"#{@registry.endpoint}\":\n    tls:\n      ca_file: \"#{K3D_REGISTRY_CA}\"\n"
     end
 
     def write_tempfile(prefix, content)

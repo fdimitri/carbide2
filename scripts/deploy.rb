@@ -377,7 +377,7 @@ module Carbide
       build_and_upload_client unless @no_client
       # After any build/push this run could have done, before anything is
       # installed: the refs handed to helm below are the ones checked here.
-      verify_images_present!
+      verify_images_pullable!
       @control_plane.apply_crd
       @jwt.ensure_signing_key!
       @control_plane.install
@@ -601,46 +601,34 @@ module Carbide
       end
     end
 
-    # Every image ref this deploy is about to hand helm must actually be in the
-    # registry, checked BEFORE the control plane is installed.
+    # Pull the refs on the NODE before installing anything.
     #
-    # Presence was previously asked only by skip_build?, which returns early
-    # unless images.push — so a pulling box that neither builds nor pushes never
-    # asked at all. It handed helm three refs it had never verified, and the
-    # first evidence of a missing one was `helm --wait` expiring five minutes
-    # later with a timeout that names nothing. A build-time question that the
-    # deploy path also needs is not a build-time question.
+    # This REPLACES a host-side presence check rather than adding to one. Asking
+    # `docker manifest inspect` from here answers "can THIS BOX see it", which is
+    # not the question: the host has its own resolver, its own trust store and a
+    # docker credential store the node does not have. A host-side check passes
+    # while the node cannot resolve the name, does not trust the certificate, or
+    # is refused the credential — and each of those then surfaces as
+    # `helm --wait` expiring five minutes later naming nothing.
     #
-    # detect/1 rather than all_present?, because the answer has to name the ref
-    # AND distinguish absent from unreachable (ADR-043 §7): "build it" and "the
-    # registry is down" are different failures with different fixes, and
-    # collapsing them is what turned a 401 into "not there" earlier.
+    # Presence was also only ever asked by skip_build?, which returns early
+    # unless images.push, so a pulling box that neither builds nor pushes never
+    # asked at all.
     #
-    # Only for a PULLING cluster. An importing one runs its images out of the
-    # node's containerd, and import_images already refuses to proceed on a
-    # missing local image.
-    def verify_images_present!
+    # Only for a PULLING cluster. An importing one runs out of the node's own
+    # containerd, and import_images already refuses on a missing local image.
+    def verify_images_pullable!
       return unless @consume == :pull && @registry.configured?
 
       components = @no_shell ? %i[workspace control] : Carbide::Images::ALL
-      verdicts = @images.missing(components)
-      return if verdicts.empty?
-
       tags = @images.image_tags
-      unreachable = verdicts.select { |_, v| v == :unreachable }.keys
-      absent      = verdicts.select { |_, v| v == :absent }.keys
-      detail = ->(list) { list.map { |c| "  #{c}: #{@images.image_ref(c, tags)}" }.join("\n") }
-
-      unless unreachable.empty?
-        abort "\e[1;31mxx\e[0m registry #{@registry.endpoint} is unreachable; cannot confirm:\n" \
-              "#{detail.call(unreachable)}\n" \
-              'Refusing to deploy refs that cannot be checked — fix the registry, do not retry blind.'
-      end
-
-      abort "\e[1;31mxx\e[0m not in registry #{@registry.endpoint}:\n#{detail.call(absent)}\n" \
-            'The cluster would ImagePullBackOff and helm would time out with no reason. ' \
-            'Build and push them (images.build + images.push, or carcli <subject> populate registry) ' \
-            'and re-run.'
+      refs = components.map { |c| @images.image_ref(c, tags) }
+      log "checking the node can pull #{refs.size} image#{'s' if refs.size != 1}"
+      @cluster_iface.verify_pull!(refs, username: @registry.username,
+                                        password: @registry.password)
+    rescue Carbide::Cluster::PullRefused => e
+      abort "\e[1;31mxx\e[0m the cluster cannot pull an image this deploy would install:\n  " \
+            "#{e.message}\nRefusing to install a release whose pods would ImagePullBackOff."
     end
 
     def build_images

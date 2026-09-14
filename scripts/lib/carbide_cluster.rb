@@ -89,7 +89,72 @@ module Carbide
       end
     end
 
+    # Pull every ref ON THE NODE, before anything is installed.
+    #
+    # The host proving an image exists proves nothing about the cluster.
+    # `docker manifest inspect` uses the host's DNS, the host's trust store and
+    # ~/.docker/config.json; containerd inside the node has its own resolver, its
+    # own CA set from registries.yaml, and no docker credential store. Every
+    # cluster-side failure this project has hit lives in that gap — a 401 read as
+    # "absent", a name the host resolves and the node does not, a CA the host
+    # trusts and the node does not — and each surfaced as `helm --wait` expiring
+    # five minutes later naming nothing.
+    #
+    # crictl pull is the kubelet's own path, so it answers the question that
+    # actually matters, in seconds. It is not wasted work: on success the layers
+    # are in the node's containerd and the pods that follow start warm.
+    #
+    # Returns nil on success; raises PullRefused naming the ref and quoting
+    # containerd. The classification is a hint in front of the real message, not
+    # a replacement for it — a paraphrase is what went wrong the last three times.
+    PullRefused = Class.new(StandardError)
+
+    PULL_FAILURES = {
+      dns: [/no such host/i, /server misbehaving/i, /temporary failure in name resolution/i],
+      tls: [/x509/i, /certificate signed by unknown authority/i, /tls: /i],
+      auth: [/401/, /unauthorized/i, /authentication required/i, /denied/i, /no basic auth/i],
+      absent: [/not found/i, /404/, /manifest unknown/i]
+    }.freeze
+
+    def verify_pull!(refs, username: nil, password: nil)
+      return if none?
+
+      creds = username.to_s.empty? ? [] : ['--creds', "#{username}:#{password}"]
+      refs.each do |ref|
+        res = @quiet.run!(*pull_argv(ref, creds))
+        next if res.success?
+
+        message = "#{res.err}#{res.out}".strip
+        raise PullRefused, "#{ref}\n  #{classify_pull(message)}\n  #{message.lines.last.to_s.strip}"
+      end
+      nil
+    end
+
     private
+
+    # k3d runs containerd inside the node container; k3s runs it on this host.
+    # Either way crictl is the kubelet's client, not docker's.
+    def pull_argv(ref, creds)
+      return ['sudo', 'k3s', 'crictl', 'pull', *creds, ref] if k3s?
+
+      ['docker', 'exec', "k3d-#{@name}-server-0", 'crictl', 'pull', *creds, ref]
+    end
+
+    def classify_pull(message)
+      kind, = PULL_FAILURES.find { |_, patterns| patterns.any? { |p| message.match?(p) } }
+      case kind
+      when :dns
+        'the NODE cannot resolve the registry host (the host resolving it is not the same thing)'
+      when :tls
+        'the NODE does not trust the registry certificate — check registries.yaml and the cert SANs'
+      when :auth
+        'the NODE was refused credentials — check registry.username/password'
+      when :absent
+        'the registry answered and does not have this tag — build and push it'
+      else
+        'containerd refused the pull'
+      end
+    end
 
     # k3d: `k3d image import` copies the local docker image into the node
     # container's containerd. @quiet — its progress is noise on success; surface
