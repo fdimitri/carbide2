@@ -236,6 +236,17 @@ module Carbide
       @registry_obj.detect(name, tag)
     end
 
+    # Every component whose ref is NOT in the registry, as { component => verdict }
+    # with detect's tri-state preserved. Empty means all present.
+    #
+    # The caller deciding to deploy needs more than all_present?'s boolean: it has
+    # to name which refs are wrong and say whether they are absent (build them) or
+    # unverifiable (fix the registry), because those have opposite fixes. Nothing
+    # here decides anything — the exit code belongs to the caller (ADR-043 §3).
+    def missing(components = ALL)
+      components.to_h { |c| [c, detect(c)] }.reject { |_, verdict| verdict == :present }
+    end
+
     # True if <name>:<tag> already exists in the registry.
     def in_registry?(ref)
       return false unless @registry

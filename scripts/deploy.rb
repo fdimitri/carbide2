@@ -375,6 +375,9 @@ module Carbide
       build_images unless @no_build || skip_build?
       publish_images
       build_and_upload_client unless @no_client
+      # After any build/push this run could have done, before anything is
+      # installed: the refs handed to helm below are the ones checked here.
+      verify_images_present!
       @control_plane.apply_crd
       @jwt.ensure_signing_key!
       @control_plane.install
@@ -596,6 +599,48 @@ module Carbide
         abort "\e[1;31mxx\e[0m the k3s backend needs sudo (k3s install + containerd " \
               "image import). Grant sudo, or use the default --node.backend k3d."
       end
+    end
+
+    # Every image ref this deploy is about to hand helm must actually be in the
+    # registry, checked BEFORE the control plane is installed.
+    #
+    # Presence was previously asked only by skip_build?, which returns early
+    # unless images.push — so a pulling box that neither builds nor pushes never
+    # asked at all. It handed helm three refs it had never verified, and the
+    # first evidence of a missing one was `helm --wait` expiring five minutes
+    # later with a timeout that names nothing. A build-time question that the
+    # deploy path also needs is not a build-time question.
+    #
+    # detect/1 rather than all_present?, because the answer has to name the ref
+    # AND distinguish absent from unreachable (ADR-043 §7): "build it" and "the
+    # registry is down" are different failures with different fixes, and
+    # collapsing them is what turned a 401 into "not there" earlier.
+    #
+    # Only for a PULLING cluster. An importing one runs its images out of the
+    # node's containerd, and import_images already refuses to proceed on a
+    # missing local image.
+    def verify_images_present!
+      return unless @consume == :pull && @registry.configured?
+
+      components = @no_shell ? %i[workspace control] : Carbide::Images::ALL
+      verdicts = @images.missing(components)
+      return if verdicts.empty?
+
+      tags = @images.image_tags
+      unreachable = verdicts.select { |_, v| v == :unreachable }.keys
+      absent      = verdicts.select { |_, v| v == :absent }.keys
+      detail = ->(list) { list.map { |c| "  #{c}: #{@images.image_ref(c, tags)}" }.join("\n") }
+
+      unless unreachable.empty?
+        abort "\e[1;31mxx\e[0m registry #{@registry.endpoint} is unreachable; cannot confirm:\n" \
+              "#{detail.call(unreachable)}\n" \
+              'Refusing to deploy refs that cannot be checked — fix the registry, do not retry blind.'
+      end
+
+      abort "\e[1;31mxx\e[0m not in registry #{@registry.endpoint}:\n#{detail.call(absent)}\n" \
+            'The cluster would ImagePullBackOff and helm would time out with no reason. ' \
+            'Build and push them (images.build + images.push, or carcli <subject> populate registry) ' \
+            'and re-run.'
     end
 
     def build_images
