@@ -33,9 +33,11 @@
 #             2 a store was unreachable, 3 usage, 4 config, 5 refused by a gate.
 #
 # Shell completion (static; nothing calls carcli at tab time):
-#   carcli --completion bash | sudo tee /etc/bash_completion.d/carcli
-#   carcli --completion zsh  > ~/.zsh/completions/_carcli
-# Regenerate after a grammar change.
+#   eval "$(carcli --completion bash)"      # this shell, right now
+#   carcli --completion bash >> ~/.bashrc   # every new shell
+#   carcli --completion zsh > ~/.zsh/completions/_carcli   # then compinit
+# Regenerate after a grammar change. TAB listing files rather than subjects
+# means nothing is registered: `complete -p carcli` says so.
 #
 # This file is deliberately a shim: everything lives in Carbide::CLI so it can
 # be tested. Gems are installed on first run via bundler/inline, as deploy.rb

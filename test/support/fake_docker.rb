@@ -71,7 +71,7 @@ module Carbide
 
       def fake_docker_rest(argv)
         case argv[1]
-        when 'create' then Result.new("deadbeefcafe\n", '', 0)
+        when 'create' then create_result(argv)
         when 'login'  then login_result
         when 'push'   then push_result(argv.last)
         else ok
@@ -85,6 +85,16 @@ module Carbide
         return ok if @registry_tags[ref]
 
         Result.new('', @manifest_error, 1)
+      end
+
+      # The cache artifact is FROM scratch with no CMD, and `docker create` on
+      # such an image refuses unless a command is supplied. The fake enforces it
+      # because the real daemon does, and a fake that did not is how this shipped
+      # broken in the first place.
+      def create_result(argv)
+        return Result.new('', 'Error response from daemon: no command specified', 1) if argv.length <= 3
+
+        Result.new("deadbeefcafe\n", '', 0)
       end
 
       def login_result

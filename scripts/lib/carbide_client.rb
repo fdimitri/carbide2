@@ -179,7 +179,16 @@ module Carbide
       ref = cache_ref(sha)
       log "  cache hit — pulling #{ref}"
       run!('docker', 'pull', ref)
-      container = run!('docker', 'create', ref).out.to_s.strip
+      # The trailing command argument is load-bearing. The cache artifact is
+      # FROM scratch with nothing but COPY lines, so it carries no CMD and no
+      # ENTRYPOINT, and `docker create` on such an image fails outright with
+      # "no command specified". Supplying any command satisfies that check;
+      # docker does not verify the binary exists, and this container is never
+      # started — it exists only to be `docker cp`'d out of.
+      #
+      # Fixing it here rather than by adding a CMD to the image keeps the
+      # artifacts already in the registry usable.
+      container = run!('docker', 'create', ref, '/').out.to_s.strip
       begin
         FAMILIES.to_h do |f|
           dest = File.join(into, "dist-#{f[:mode]}")

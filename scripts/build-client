@@ -98,7 +98,10 @@ cache_pull() {
   ref="$(cache_ref)"; log "cache hit — pulling $ref"
   docker pull "$ref" >/dev/null
   mkdir -p "$DIST_WS" "$DIST_CTL"
-  cid="$(docker create "$ref")"
+  # A trailing command is required: the artifact is FROM scratch and has no
+  # CMD, so a bare `docker create` fails with "no command specified". The
+  # container is only ever `docker cp`'d from, never started.
+  cid="$(docker create "$ref" /)"
   docker cp "$cid:/workspace/." "$DIST_WS"  >/dev/null
   docker cp "$cid:/control/."   "$DIST_CTL" >/dev/null
   docker rm "$cid" >/dev/null
