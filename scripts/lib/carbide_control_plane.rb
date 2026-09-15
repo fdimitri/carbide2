@@ -118,7 +118,8 @@ module Carbide
           args.push('--values', ca_file)
         end
       end
-      args.push('--wait', '--timeout', '5m')
+      # Do NOT --wait on initial install, deadlock from 96853e9
+      #args.push('--wait', '--timeout', '5m')
       @cmd.run(*args)
     end
 
