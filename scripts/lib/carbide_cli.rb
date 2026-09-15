@@ -57,29 +57,82 @@ module Carbide
 
     SOURCES = %w[auto registry build].freeze
 
-    # Behaviour flags — the ones with no config home. Held as data because three
-    # things read them: the parser, --help, and the completion script. A flag
-    # that exists in one and not the others is the drift this avoids.
+    # Which (subject, verb, store) a behaviour flag actually does anything for.
+    #
+    # Derived from the call sites, not from what sounds plausible: --json is
+    # honored by show_state and nowhere else, --label only reaches
+    # Client#stamp_manifests on the MinIO publish path, and --ref is refused for
+    # a multi-source subject by refs_for. A flag listed for a command it does
+    # not reach is a lie the user acts on, so the predicates below are the same
+    # ones the applicability error uses.
+    #
+    # Ref flags derive from Identity::SOURCES rather than repeating it, so a
+    # subject that gains or loses a component cannot leave this table stale.
+    ANY = ->(_subject, _verb, _store) { true }
+    REF_VERBS = %i[state build populate detect].freeze
+
+    def self.single_source?(subject)
+      Carbide::Identity::SOURCES.fetch(subject, []).length == 1
+    end
+
+    def self.built_from?(subject, component)
+      Carbide::Identity::SOURCES.fetch(subject, []).include?(component)
+    end
+
+    def self.for_verbs(*verbs)
+      ->(_subject, verb, _store) { verbs.include?(verb) }
+    end
+
+    def self.for_component_ref(component)
+      lambda do |subject, verb, _store|
+        REF_VERBS.include?(verb) && built_from?(subject, component)
+      end
+    end
+
+    # MinIO is only reached for the client subject on a minio-bearing store, so
+    # the kubeconfig that addresses the cluster is meaningless anywhere else.
+    MINIO_STORE = lambda do |subject, _verb, store|
+      subject == :client && %w[minio both].include?(store.to_s)
+    end
+
+    # Behaviour flags — the ones with no config home. Held as data because four
+    # things read them: the parser, --help, the applicability check, and the
+    # completion script. A flag that exists in one and not the others is the
+    # drift this avoids.
     BEHAVIOR = [
       ['--source', 'SOURCE', :source,
        "Where the artifact comes from: #{SOURCES.join(' | ')} (default: auto). " \
-       'An explicit source is STRICT — it never falls back to a build.'],
+       'An explicit source is STRICT — it never falls back to a build.',
+       for_verbs(:populate)],
       ['--allow-dirty', nil, :allow_dirty,
-       'Permit a dirty tree to be built, and a -dirty tag to be written'],
+       'Permit a dirty tree to be built, and a -dirty tag to be written',
+       for_verbs(:build, :populate)],
       ['--force', nil, :force,
-       'Destination-side: overwrite a tag that is already present'],
+       'Destination-side: overwrite a tag that is already present',
+       for_verbs(:populate)],
       ['--force-rebuild', nil, :force_rebuild,
-       'Source-side: build even though the tag exists'],
-      ['--ref', 'REF', :ref, 'Build this ref of a single-source subject'],
-      ['--server-ref', 'REF', :server_ref, 'Build from this carbide2-server ref'],
-      ['--worker-ref', 'REF', :worker_ref, 'Build from this carbide2-worker ref'],
-      ['--control-ref', 'REF', :control_ref, 'Build from this carbide2-control ref'],
-      ['--client-ref', 'REF', :client_ref, 'Build from this carbide2-client ref'],
-      ['--label', 'TEXT', :label, 'Label this client build in the picker (default: the sha)'],
+       'Source-side: build even though the tag exists',
+       for_verbs(:build, :populate)],
+      ['--ref', 'REF', :ref, 'Build this ref of a single-source subject',
+       ->(subject, verb, _store) { REF_VERBS.include?(verb) && single_source?(subject) }],
+      ['--server-ref', 'REF', :server_ref, 'Build from this carbide2-server ref',
+       for_component_ref(:server)],
+      ['--worker-ref', 'REF', :worker_ref, 'Build from this carbide2-worker ref',
+       for_component_ref(:worker)],
+      ['--control-ref', 'REF', :control_ref, 'Build from this carbide2-control ref',
+       for_component_ref(:control)],
+      ['--client-ref', 'REF', :client_ref, 'Build from this carbide2-client ref',
+       for_component_ref(:client)],
+      ['--label', 'TEXT', :label, 'Label this client build in the picker (default: the sha)',
+       ->(subject, verb, store) { verb == :populate && MINIO_STORE.call(subject, verb, store) }],
       ['--kubeconfig', 'PATH', :kubeconfig,
-       'Use this kubeconfig instead of the one derived from cluster.name'],
-      ['--json', nil, :json, 'Machine-readable output where the verb has a structured form'],
-      ['--completion', 'SHELL', :completion, 'Print a shell completion script (bash | zsh) and exit']
+       'Use this kubeconfig instead of the one derived from cluster.name',
+       MINIO_STORE],
+      ['--json', nil, :json,
+       'Machine-readable output where the verb has a structured form',
+       for_verbs(:state)],
+      ['--completion', 'SHELL', :completion, 'Print a shell completion script (bash | zsh) and exit',
+       ANY]
     ].freeze
 
     COMPLETION_SHELLS = %w[bash zsh].freeze
@@ -141,7 +194,20 @@ module Carbide
     # Options are parsed FIRST. OptionParser removes each recognized flag AND
     # its value from argv, so what is left is genuinely positional — filtering
     # on a leading dash instead would read `--ref main` as the store `main`.
+    # A '?' in a positional slot asks what belongs there. It is a question, not
+    # an error: `carcli client populate ?` should say `registry | minio | both`
+    # rather than "unexpected argument '?'".
+    HELP_TOKEN = '?'
+
     def parse!(argv)
+      # Peek BEFORE OptionParser consumes anything, so --help and '?' can answer
+      # for the command being typed rather than for carcli in general. Peeking
+      # has to know which flags take a value or `--ref main` would read `main`
+      # as the subject — the same table the parser uses, which is why it is one
+      # table.
+      @peeked = peek_positionals(argv)
+      answer_help_token!(@peeked)
+      scoped_help!(argv, @peeked)
       positional = parse_options!(argv)
       return [nil, nil, nil] if @opts[:completion]
 
@@ -165,7 +231,149 @@ module Carbide
       @opts[:shas] = extra
       raise UsageError, "#{subject} #{verb}: unexpected argument '#{extra.first}'" if !extra.empty? && verb != :rm
 
+      reject_inapplicable_flags!(subject, verb, context)
       [subject, verb, context]
+    end
+
+    # Flags that take a value, for peeking only. Config's specs carry their own
+    # ARG markers; BEHAVIOR carries them in field 1.
+    def valued_flags
+      @valued_flags ||= BEHAVIOR.select { |_, arg, _, _, _| arg }.map(&:first) +
+                        specs.select { |s| s[:arg] }.map { |s| "--#{s[:key]}" } +
+                        ['--config', '--yaml-out', '--yaml-safeout', '--schema-out']
+    end
+
+    def peek_positionals(argv)
+      out = []
+      skip = false
+      argv.each do |token|
+        if skip
+          skip = false
+          next
+        end
+        next if token == '--'
+
+        if token.start_with?('-')
+          # --flag=value carries its own value; --flag VALUE eats the next token.
+          skip = valued_flags.include?(token) && !token.include?('=')
+          next
+        end
+        out << token
+      end
+      out
+    end
+
+    # `?` in a slot prints what that slot accepts. Answered against the tokens
+    # BEFORE it, so `carcli client populate ?` knows the subject is client.
+    def answer_help_token!(peeked)
+      index = peeked.index(HELP_TOKEN)
+      return if index.nil?
+
+      raise HelpRequested, slot_help(peeked.first(index))
+    end
+
+    # `carcli client populate minio --help` describes THAT command. Rendered
+    # here rather than by OptionParser because OptionParser's summary is every
+    # registered flag, and "every flag carcli has" is what made --help useless
+    # for the command in front of you. Bare --help still lists everything.
+    def scoped_help!(argv, peeked)
+      return unless argv.include?('--help') || argv.include?('-h')
+
+      subject = peeked[0]&.to_sym
+      grammar = GRAMMAR[subject]
+      return if grammar.nil?
+
+      verb = peeked[1]&.to_sym
+      return raise(HelpRequested, "#{subject} verbs: #{grammar[:verbs].join(' ')}") if verb.nil?
+      return if !grammar[:verbs].include?(verb)
+
+      store = peeked[2]
+      raise HelpRequested, command_help(subject, verb, store, grammar)
+    end
+
+    def command_help(subject, verb, store, grammar)
+      lines = ["Usage: carcli [options] #{subject} #{verb}#{store_slot(verb, grammar)}"]
+      if CONTEXT_VERBS.include?(verb) && store.nil?
+        stores = grammar[:stores] - (NO_BOTH.include?(verb) ? ['both'] : [])
+        lines << "  stores  #{stores.join(' | ')}"
+      end
+      lines << ''
+      flags = applicable_flags(subject, verb, store).reject { |_, _, key, _, _| key == :completion }
+      if flags.empty?
+        lines << "No carcli flags apply to #{subject} #{verb}."
+      else
+        lines << "Flags for #{subject} #{verb}#{store ? " #{store}" : ''}:"
+        width = flags.map { |flag, arg, _, _, _| "#{flag}#{arg ? " #{arg}" : ''}".length }.max
+        flags.each do |flag, arg, _key, desc, _applies|
+          lines << format("  %-#{width}s  %s", "#{flag}#{arg ? " #{arg}" : ''}", desc)
+        end
+      end
+      lines << ''
+      lines << 'Config options and --config/--yaml-out: carcli --help'
+      lines.join("\n")
+    end
+
+    def store_slot(verb, grammar)
+      return '' unless CONTEXT_VERBS.include?(verb)
+
+      stores = grammar[:stores] - (NO_BOTH.include?(verb) ? ['both'] : [])
+      " <#{stores.join('|')}>#{verb == :rm ? ' <sha>' : ''}"
+    end
+
+    def slot_help(before)
+      subject = before[0]&.to_sym
+      grammar = GRAMMAR[subject]
+      return "subjects: #{GRAMMAR.keys.join(' ')}" if before.empty?
+      return "unknown subject '#{before[0]}' — subjects: #{GRAMMAR.keys.join(' ')}" if grammar.nil?
+      return "#{subject} verbs: #{grammar[:verbs].join(' ')}" if before.length == 1
+
+      verb = before[1].to_sym
+      return "#{subject} #{verb}: takes no store" unless CONTEXT_VERBS.include?(verb)
+
+      stores = grammar[:stores]
+      stores -= ['both'] if NO_BOTH.include?(verb)
+      "#{subject} #{verb} stores: #{stores.join(' ')}"
+    end
+
+    # A flag the command cannot reach is refused rather than ignored. Silently
+    # accepting --force-rebuild on `client populate minio` and then not rebuilding
+    # is the failure mode this exists to prevent: the user believes the flag did
+    # something.
+    def reject_inapplicable_flags!(subject, verb, store)
+      set = BEHAVIOR.reject { |_, _, key, _, _| key == :completion }.select do |_flag, _arg, key, _desc, _applies|
+        # --ref on a composite subject is left to refs_for, which names the
+        # components and the flags that do address them. A generic "does not
+        # apply" would be true and less useful.
+        next false if key == :ref && !self.class.single_source?(subject) && REF_VERBS.include?(verb)
+
+        flag_given?(key) && !applicable?(key, subject, verb, store)
+      end
+      return if set.empty?
+
+      names = set.map(&:first).join(', ')
+      ok = applicable_flags(subject, verb, store)
+           .reject { |_, _, key, _, _| key == :completion }.map(&:first)
+      raise UsageError,
+            "#{subject} #{verb}#{store ? " #{store}" : ''}: #{names} " \
+            "#{set.length == 1 ? 'does' : 'do'} not apply here.\n" \
+            "#{ok.empty? ? 'No carcli flags apply to it.' : "Applies to: #{ok.join(' ')}"}"
+    end
+
+    # Explicitly typed, not merely present: @opts[:source] defaults to 'auto',
+    # so a value check would report --source on every invocation.
+    def flag_given?(key) = given.include?(key)
+
+    def given = (@given ||= [])
+
+    def applicable?(key, subject, verb, store)
+      entry = BEHAVIOR.find { |_, _, k, _, _| k == key }
+      return true if entry.nil?
+
+      entry[4].call(subject, verb, store)
+    end
+
+    def applicable_flags(subject, verb, store)
+      BEHAVIOR.select { |_, _, _, _, applies| applies.call(subject, verb, store) }
     end
 
     def validate_context!(subject, verb, context, grammar)
@@ -202,17 +410,17 @@ module Carbide
     def behavior_options(parser)
       parser.separator ''
       parser.separator 'carcli:'
-      BEHAVIOR.each do |flag, arg, key, desc|
+      BEHAVIOR.each do |flag, arg, key, desc, _applies|
         spec = arg ? "#{flag} #{arg}" : flag
         if key == :source
-          parser.on(spec, SOURCES, desc) { |v| @opts[:source] = v }
+          parser.on(spec, SOURCES, desc) { |v| given << key; @opts[:source] = v }
         elsif key.to_s.end_with?('_ref') && key != :ref
           component = key.to_s.sub('_ref', '').to_sym
-          parser.on(spec, desc) { |v| @opts[:refs][component] = v }
+          parser.on(spec, desc) { |v| given << key; @opts[:refs][component] = v }
         elsif arg
-          parser.on(spec, desc) { |v| @opts[key] = v }
+          parser.on(spec, desc) { |v| given << key; @opts[key] = v }
         else
-          parser.on(spec, desc) { @opts[key] = true }
+          parser.on(spec, desc) { given << key; @opts[key] = true }
         end
       end
     end

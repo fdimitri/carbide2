@@ -60,6 +60,100 @@ class CliTest < Minitest::Test
   def stderr = @err.string
   def stdout = @out.string
 
+  # --- help answers for the command in front of you ---------------------------
+  #
+  # `carcli client populate minio --help` used to print every flag carcli has,
+  # which does not answer "what can I give THIS". And a '?' in a slot was
+  # "unexpected argument" rather than a list of what belongs there.
+
+  def test_scoped_help_lists_only_the_flags_that_apply
+    assert_equal Carbide::CLI::EXIT_OK, run_cli('client', 'populate', 'minio', '--help')
+
+    assert_match(/Flags for client populate minio/, stdout)
+    assert_match(/--label/, stdout, 'label reaches stamp_manifests on this path')
+    assert_match(/--kubeconfig/, stdout, 'minio needs the cluster')
+    refute_match(/--json/, stdout, 'only show_state honors --json')
+  end
+
+  def test_scoped_help_drops_minio_only_flags_on_the_registry_store
+    assert_equal Carbide::CLI::EXIT_OK, run_cli('client', 'populate', 'registry', '--help')
+
+    refute_match(/--kubeconfig/, stdout)
+    refute_match(/--label/, stdout)
+  end
+
+  def test_scoped_help_offers_only_the_component_refs_the_subject_has
+    assert_equal Carbide::CLI::EXIT_OK, run_cli('workspace', 'build', '--help')
+
+    assert_match(/--server-ref/, stdout)
+    assert_match(/--worker-ref/, stdout)
+    refute_match(/--client-ref/, stdout)
+    refute_match(/^\s+--ref /, stdout, 'workspace is composite; --ref cannot address it')
+  end
+
+  def test_bare_help_still_lists_everything
+    assert_equal Carbide::CLI::EXIT_OK, run_cli('--help')
+
+    assert_match(/--json/, stdout)
+    assert_match(/--label/, stdout)
+    assert_match(/--registry.host/, stdout)
+  end
+
+  def test_help_before_a_verb_lists_the_verbs
+    assert_equal Carbide::CLI::EXIT_OK, run_cli('client', '--help')
+
+    assert_match(/client verbs: state build populate/, stdout)
+  end
+
+  def test_a_question_mark_lists_the_stores_for_that_command
+    assert_equal Carbide::CLI::EXIT_OK, run_cli('client', 'populate', '?')
+
+    assert_match(/client populate stores: registry minio both/, stdout)
+  end
+
+  def test_a_question_mark_omits_both_where_the_verb_acts_on_one_store
+    assert_equal Carbide::CLI::EXIT_OK, run_cli('client', 'detect', '?')
+
+    assert_match(/registry minio/, stdout)
+    refute_match(/both/, stdout)
+  end
+
+  def test_a_question_mark_in_the_subject_slot_lists_subjects
+    assert_equal Carbide::CLI::EXIT_OK, run_cli('?')
+
+    assert_match(/subjects: workspace control shell client registry/, stdout)
+  end
+
+  # --- a flag the command cannot reach is refused, not ignored ----------------
+
+  def test_a_flag_that_does_nothing_here_is_a_usage_error
+    assert_equal Carbide::CLI::EXIT_USAGE, run_cli('client', 'populate', 'minio', '--json')
+
+    assert_match(/--json does not apply here/, stderr)
+    assert_match(/Applies to:/, stderr)
+  end
+
+  def test_the_refusal_names_the_flags_that_do_apply
+    assert_equal Carbide::CLI::EXIT_USAGE, run_cli('client', 'build', '--label', 'x')
+
+    assert_match(/--label does not apply here/, stderr)
+    assert_match(/--allow-dirty/, stderr)
+  end
+
+  def test_a_verb_with_no_applicable_flags_says_so
+    assert_equal Carbide::CLI::EXIT_USAGE, run_cli('client', 'list', 'registry', '--label', 'x')
+
+    assert_match(/No carcli flags apply to it/, stderr)
+  end
+
+  # Peeking has to use the same arg table the parser does, or `--ref main`
+  # reads `main` as the subject — the bug this file already caught once.
+  def test_a_valued_flag_before_the_subject_does_not_eat_the_grammar
+    assert_equal Carbide::CLI::EXIT_OK, run_cli('--ref', 'main', 'control', 'build', '--help')
+
+    assert_match(/Usage: carcli \[options\] control build/, stdout)
+  end
+
   # --- the grammar is enforced at parse --------------------------------------
 
   def test_no_arguments_prints_usage_as_a_usage_error
