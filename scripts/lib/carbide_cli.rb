@@ -113,15 +113,21 @@ module Carbide
       ['--force-rebuild', nil, :force_rebuild,
        'Source-side: build even though the tag exists',
        for_verbs(:build, :populate)],
-      ['--ref', 'REF', :ref, 'Build this ref of a single-source subject',
+      # "Build this ref" was wrong and cost an afternoon: the ref selects WHICH
+      # artifact, and populate resolves it to a sha, finds that sha in the
+      # registry and publishes it without building anything. Any git rev works,
+      # a bare sha included, and a commit missing locally is fetched.
+      ['--ref', 'REF', :ref,
+       'Which commit to act on (any git rev, a bare sha included) for a single-source subject. ' \
+       'populate pulls it from the registry if it is there; build is the fallback, not the meaning.',
        ->(subject, verb, _store) { REF_VERBS.include?(verb) && single_source?(subject) }],
-      ['--server-ref', 'REF', :server_ref, 'Build from this carbide2-server ref',
+      ['--server-ref', 'REF', :server_ref, 'Which carbide2-server commit to act on',
        for_component_ref(:server)],
-      ['--worker-ref', 'REF', :worker_ref, 'Build from this carbide2-worker ref',
+      ['--worker-ref', 'REF', :worker_ref, 'Which carbide2-worker commit to act on',
        for_component_ref(:worker)],
-      ['--control-ref', 'REF', :control_ref, 'Build from this carbide2-control ref',
+      ['--control-ref', 'REF', :control_ref, 'Which carbide2-control commit to act on',
        for_component_ref(:control)],
-      ['--client-ref', 'REF', :client_ref, 'Build from this carbide2-client ref',
+      ['--client-ref', 'REF', :client_ref, 'Which carbide2-client commit to act on',
        for_component_ref(:client)],
       ['--label', 'TEXT', :label, 'Label this client build in the picker (default: the sha)',
        ->(subject, verb, store) { verb == :populate && MINIO_STORE.call(subject, verb, store) }],

@@ -154,6 +154,25 @@ class CliTest < Minitest::Test
     assert_match(/Usage: carcli \[options\] control build/, stdout)
   end
 
+  # --ref is how you name a commit, and for populate it is not a build
+  # instruction: obtain/2 resolves it to a sha, finds that sha in the registry
+  # and publishes it. The description used to say "Build this ref", which is why
+  # nobody found the flag that does this.
+  def test_ref_is_described_as_selecting_a_commit_not_as_building
+    entry = Carbide::CLI::BEHAVIOR.find { |_, _, key, _, _| key == :ref }
+
+    refute_match(/\ABuild this ref/, entry[3])
+    assert_match(/commit/i, entry[3])
+    assert_match(/sha/i, entry[3], 'a bare sha is a valid rev and the common case')
+  end
+
+  def test_ref_applies_to_populate_not_only_build
+    applies = Carbide::CLI::BEHAVIOR.find { |_, _, key, _, _| key == :ref }[4]
+
+    assert applies.call(:client, :populate, 'minio')
+    assert applies.call(:client, :build, nil)
+  end
+
   # --- the grammar is enforced at parse --------------------------------------
 
   def test_no_arguments_prints_usage_as_a_usage_error
