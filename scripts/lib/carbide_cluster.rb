@@ -18,7 +18,7 @@ module Carbide
   class Cluster
     include Carbide::CommandRunner
 
-    BACKENDS = %w[k3d k3s].freeze
+    BACKENDS = %w[k3d k3s none].freeze
     # The local images the single-node path imports into the node's containerd.
     IMPORT_IMAGES = %w[carbide2:dev carbide2-control:dev carbide2-shell:dev].freeze
 
@@ -32,7 +32,7 @@ module Carbide
       @quiet   = quiet
       @backend = backend.to_s.downcase
       unless BACKENDS.include?(@backend)
-        abort "\e[1;31mxx\e[0m unknown cluster.backend '#{@backend}' (expected k3d or k3s)"
+        abort "\e[1;31mxx\e[0m unknown node.backend '#{@backend}' (expected k3d, k3s or none)"
       end
       @name        = name
       @server_root = server_root
@@ -43,11 +43,10 @@ module Carbide
       @https_port = blank?(https_port) ? default_https : https_port.to_s.strip
     end
 
-    # Config option specs owned by the cluster backend (aggregated by deploy.rb).
+    # Config option specs owned by the cluster (aggregated by deploy.rb).
+    # node.backend lives with Carbide::Node (ADR-028: what this box IS).
     def self.options
       [
-        { key: 'cluster.backend', arg: 'BACKEND', values: %w[k3d k3s],
-          desc: 'Local Kubernetes backend: k3d (default, k3s-in-Docker) or k3s (host-native)' },
         { key: 'cluster.name', arg: 'NAME', desc: 'Cluster name (default: carbide-dev)' },
         { key: 'cluster.http-port', arg: 'PORT', desc: 'Ingress HTTP port (blank => backend default: k3d 8080 / k3s 80)' },
         { key: 'cluster.https-port', arg: 'PORT', desc: 'Ingress HTTPS port (blank => backend default: k3d 8443 / k3s 443)' }
@@ -56,8 +55,9 @@ module Carbide
 
     attr_reader :backend, :name, :http_port, :https_port
 
-    def k3d? = @backend == 'k3d'
-    def k3s? = @backend == 'k3s'
+    def k3d?  = @backend == 'k3d'
+    def k3s?  = @backend == 'k3s'
+    def none? = @backend == 'none'
 
     # CLI tools this backend needs on top of the always-required docker/kubectl/helm.
     def extra_tools = k3d? ? %w[k3d] : []
@@ -65,10 +65,12 @@ module Carbide
     # k3s installs itself and imports into host containerd — both need root.
     def needs_sudo? = k3s?
 
-    # Single-node path (no registry): import the local :dev images straight into
+    # Single-node path: import the local :dev images straight into
     # the backend's containerd, failing loudly if an image is missing or the
     # import silently no-ops — both would ImagePullBackOff later.
     def import_images
+      abort "\e[1;31mxx\e[0m import_images on node.backend none: nothing to import into" if none?
+
       log "importing images into #{@backend} cluster '#{@name}'"
       IMPORT_IMAGES.each do |img|
         # Every image here is required. A missing local image used to only warn
@@ -87,7 +89,72 @@ module Carbide
       end
     end
 
+    # Pull every ref ON THE NODE, before anything is installed.
+    #
+    # The host proving an image exists proves nothing about the cluster.
+    # `docker manifest inspect` uses the host's DNS, the host's trust store and
+    # ~/.docker/config.json; containerd inside the node has its own resolver, its
+    # own CA set from registries.yaml, and no docker credential store. Every
+    # cluster-side failure this project has hit lives in that gap — a 401 read as
+    # "absent", a name the host resolves and the node does not, a CA the host
+    # trusts and the node does not — and each surfaced as `helm --wait` expiring
+    # five minutes later naming nothing.
+    #
+    # crictl pull is the kubelet's own path, so it answers the question that
+    # actually matters, in seconds. It is not wasted work: on success the layers
+    # are in the node's containerd and the pods that follow start warm.
+    #
+    # Returns nil on success; raises PullRefused naming the ref and quoting
+    # containerd. The classification is a hint in front of the real message, not
+    # a replacement for it — a paraphrase is what went wrong the last three times.
+    PullRefused = Class.new(StandardError)
+
+    PULL_FAILURES = {
+      dns: [/no such host/i, /server misbehaving/i, /temporary failure in name resolution/i],
+      tls: [/x509/i, /certificate signed by unknown authority/i, /tls: /i],
+      auth: [/401/, /unauthorized/i, /authentication required/i, /denied/i, /no basic auth/i],
+      absent: [/not found/i, /404/, /manifest unknown/i]
+    }.freeze
+
+    def verify_pull!(refs, username: nil, password: nil)
+      return if none?
+
+      creds = username.to_s.empty? ? [] : ['--creds', "#{username}:#{password}"]
+      refs.each do |ref|
+        res = @quiet.run!(*pull_argv(ref, creds))
+        next if res.success?
+
+        message = "#{res.err}#{res.out}".strip
+        raise PullRefused, "#{ref}\n  #{classify_pull(message)}\n  #{message.lines.last.to_s.strip}"
+      end
+      nil
+    end
+
     private
+
+    # k3d runs containerd inside the node container; k3s runs it on this host.
+    # Either way crictl is the kubelet's client, not docker's.
+    def pull_argv(ref, creds)
+      return ['sudo', 'k3s', 'crictl', 'pull', *creds, ref] if k3s?
+
+      ['docker', 'exec', "k3d-#{@name}-server-0", 'crictl', 'pull', *creds, ref]
+    end
+
+    def classify_pull(message)
+      kind, = PULL_FAILURES.find { |_, patterns| patterns.any? { |p| message.match?(p) } }
+      case kind
+      when :dns
+        'the NODE cannot resolve the registry host (the host resolving it is not the same thing)'
+      when :tls
+        'the NODE does not trust the registry certificate — check registries.yaml and the cert SANs'
+      when :auth
+        'the NODE was refused credentials — check registry.username/password'
+      when :absent
+        'the registry answered and does not have this tag — build and push it'
+      else
+        'containerd refused the pull'
+      end
+    end
 
     # k3d: `k3d image import` copies the local docker image into the node
     # container's containerd. @quiet — its progress is noise on success; surface

@@ -1,0 +1,199 @@
+# Carbide2 meta-repo pipeline.
+#
+#   build   — every push: build + push the control and server-worker images to
+#             the registry. Idempotent: build.rb skips any component whose SHA
+#             tag already exists, so a push that doesn't move a submodule is a
+#             fast no-op. Pass FORCE_REBUILD=1 to rebuild anyway.
+#   cluster — schedule/manual: fresh multi-node k3s bring-up on libvirt VMs.
+#   test    — follows the bring-up.
+#
+# Runners are selected by CAPABILITY tag, never by machine name:
+#   build-fast : docker buildx + reachable registry (desktop / EPYC / ...)
+#   kvm        : libvirt + virt-install + RAM for 3 VMs
+#   gpu        : local-model host for agent-loop tests
+#   m75-live   : the real bare-metal cluster
+#
+# Registry coordinates come from CI variables: REGISTRY_HOST (required),
+# REGISTRY_PORT (optional, default 5000), REGISTRY_CA (optional File var — the
+# self-signed CA so this host trusts the registry).
+
+stages: [build, cluster, test]
+
+variables:
+  DOCKER_BUILDKIT: "1"
+  GIT_SUBMODULE_STRATEGY: recursive
+
+# ---------------------------------------------------------------------------
+# .ci-registry — the CI_ registry variables derived into the REGISTRY_* form the
+# scripts read. Shared (via !reference) by every job that touches the registry.
+# GitLab injects: CI_REGISTRY (host[:port]), CI_REGISTRY_IMAGE (host/ns/proj),
+# CI_REGISTRY_USER + CI_REGISTRY_PASSWORD (or CI_JOB_TOKEN) — the push creds.
+# An explicit REGISTRY_* variable still wins (the generic self-hosted case).
+# ---------------------------------------------------------------------------
+.ci-registry:
+  script:
+    - |
+      REGISTRY_HOST="${REGISTRY_HOST:-$(echo "$CI_REGISTRY" | cut -d: -f1)}"
+      REGISTRY_PORT="${REGISTRY_PORT:-$(echo "$CI_REGISTRY" | sed -n 's/^[^:]*:\([0-9]*\)$/\1/p')}"
+      REGISTRY_PATH="${REGISTRY_PATH:-${CI_REGISTRY_IMAGE#$CI_REGISTRY/}}"
+      REGISTRY_MODE="${REGISTRY_MODE:-gitlab}"
+      REGISTRY_USERNAME="${REGISTRY_USERNAME:-$CI_REGISTRY_USER}"
+      REGISTRY_PASSWORD="${REGISTRY_PASSWORD:-${CI_REGISTRY_PASSWORD:-$CI_JOB_TOKEN}}"
+      [ -n "$REGISTRY_HOST" ] || { echo "no registry: CI_REGISTRY unset"; exit 1; }
+      export REGISTRY_HOST REGISTRY_PORT REGISTRY_PATH REGISTRY_MODE REGISTRY_USERNAME REGISTRY_PASSWORD
+    - echo "registry $REGISTRY_HOST:$REGISTRY_PORT path=$REGISTRY_PATH mode=$REGISTRY_MODE user=$REGISTRY_USERNAME"
+    # What each script will actually WRITE to. The two are derived differently —
+    # build.rb reassembles REGISTRY_HOST + REGISTRY_PORT + REGISTRY_PATH, while
+    # build-client takes $CI_REGISTRY_IMAGE verbatim — so when a push is denied,
+    # the first question is whether they even agree. No secrets: usernames only,
+    # same as the line above.
+    - |
+      echo "CI_REGISTRY=$CI_REGISTRY"
+      echo "CI_REGISTRY_IMAGE=$CI_REGISTRY_IMAGE"
+      echo "build.rb     -> ${REGISTRY_HOST}${REGISTRY_PORT:+:$REGISTRY_PORT}/${REGISTRY_PATH}/<image>:<tag>"
+      echo "build-client -> ${CI_REGISTRY_IMAGE}/carbide2-client:<sha>"
+      # REGISTRY_PATH is $CI_REGISTRY_IMAGE with $CI_REGISTRY stripped off the
+      # front, which only works when the two agree character for character. If
+      # they differ at all — a port in one and not the other — the strip is a
+      # no-op and REGISTRY_PATH keeps the host, so build.rb pushes to
+      # host:port/host:port/group/project/... and GitLab routes it somewhere
+      # that is not the registry.
+      case "$CI_REGISTRY_IMAGE" in
+        "$CI_REGISTRY"/*) : ;;
+        *)
+          echo "WARN CI_REGISTRY_IMAGE does not start with CI_REGISTRY/, so the prefix strip did nothing"
+          echo "WARN REGISTRY_PATH kept a host: $REGISTRY_PATH" ;;
+      esac
+
+# ---------------------------------------------------------------------------
+# build — control + server-worker (workspace) images to the registry.
+# ---------------------------------------------------------------------------
+build:images-old:
+  stage: build
+  tags: [build-fast]
+  script:
+    - !reference [.ci-registry, script]
+    # build.rb reads REGISTRY_* from the environment (and env wins nothing over
+    # flags), so no registry values are passed on argv — the password/token never
+    # lands in the job trace. Only the component list and --no-serve-registry
+    # (the registry lives on the cluster; the build host must not start its own).
+    - ARGS="workspace control shell --no-serve-registry"
+    - '[ -n "${REGISTRY_CA:-}" ] && ARGS="$ARGS --registry-ca $REGISTRY_CA"'
+    - '[ "${FORCE_REBUILD:-0}" = "1" ] && ARGS="$ARGS --force-rebuild"'
+    # workspace (server-worker pair), control, and shell.
+    #
+    # Each component is checked against the registry individually and skipped
+    # when its tag is already present, so re-pushes are cheap:
+    #   workspace -> <server_sha>-<worker_sha>
+    #   control   -> <control_sha>
+    #   shell     -> content hash of Dockerfile.shell  (so the ~4GB shell image
+    #                rebuilds ONLY when that file changes, never on app commits)
+    # The client is not in the registry, so it is not built here.
+    - echo "scripts/build.rb $ARGS"
+    - scripts/build.rb $ARGS
+  # Kept in the file on purpose, but no longer scheduled: carcli supersedes it.
+  # when: never rather than deletion so the old argv is still here to compare
+  # against (and to restore in one line if the new path misbehaves).
+  rules:
+    - when: never
+build:images-new:
+  stage: build
+  tags: [build-fast]
+  script:
+    - !reference [.ci-registry, script]
+    - scripts/carcli workspace populate registry --no-registry.serve
+    - scripts/carcli control   populate registry --no-registry.serve
+    - scripts/carcli shell     populate registry --no-registry.serve
+
+
+# ---------------------------------------------------------------------------
+# build — the client bundle, ONE artifact per client SHA in the registry
+# (carbide2-client:<sha>, both the workspace + control builds inside). Building
+# it here means a deploy only PULLS it and uploads to MinIO — the build-once
+# the cache exists for. --no-upload: no kubectl/cluster access needed here.
+# ---------------------------------------------------------------------------
+build:client-old:
+  stage: build
+  tags: [build-fast]
+  script:
+    - !reference [.ci-registry, script]
+    - scripts/build-client --cache "$CI_REGISTRY_IMAGE" --no-upload
+  # Superseded by build:client; see build:images-old.
+  rules:
+    - when: never
+
+build:client:
+  stage: build
+  tags: [build-fast]
+  script:
+    - !reference [.ci-registry, script]
+    - scripts/carcli client populate registry --no-registry.serve
+
+# ---------------------------------------------------------------------------
+# cluster — a fresh 3-VM k3s cluster on whatever [kvm] box is free.
+# ---------------------------------------------------------------------------
+cluster:bringup:
+  stage: cluster
+  tags: [kvm]
+  resource_group: carbide-ci-kvm
+  timeout: 2h
+  variables:
+    VM_MEM_MB: "12288"
+    VM_VCPUS: "6"
+    VM_NET_MODE: "network"
+    VM_NETWORK: "mellanox-p1"
+    # One entry per VM (VM i on host i); blank => all local (single host).
+    # Set in CI/CD Variables, or inline here, e.g.:
+    #   VM_HOSTS: "carbidium1 carbidium2 carbidium3"
+    VM_HOSTS: ""
+    # Storage: qcow2 (throwaway file) or lv (a direct LV per VM in VM_VG).
+    VM_STORAGE: "qcow2"
+    VM_VG: "carbide-vg"
+    # LV mode only; must be 1 to confirm VM_VG is CI-dedicated (see README).
+    VM_LV_ACK: "0"
+    # What the VMs clone + check out. Without this the guests clone main and
+    # deploy.rb self-updates to main, so the pipeline would test main rather
+    # than the commit it is running for.
+    CARBIDE_REPO_REF: "$CI_COMMIT_SHA"
+  script:
+    - scripts/ci/cluster-bringup.sh up
+  after_script:
+    - scripts/ci/cluster-bringup.sh destroy || true   # honors VM_KEEP
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - .vm-state/env
+      - .vm-state/cluster.yaml
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_TAG
+
+# ---------------------------------------------------------------------------
+# test — multi-node substrate test against the bring-up cluster.
+# ---------------------------------------------------------------------------
+test:substrate:
+  stage: test
+  tags: [kvm]
+  needs: [cluster:bringup]
+  script:
+    - set -a; . .vm-state/env; set +a      # NAMESPACE, BASE_URL, CARBIDE_WS_URL, WS_ID
+    - carbide2-server/scripts/test-substrate.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_TAG
+
+# ---------------------------------------------------------------------------
+# test — agent loop against a LOCAL model. Manual / scheduled.
+# ---------------------------------------------------------------------------
+test:agent-local:
+  stage: test
+  tags: [gpu]
+  allow_failure: true
+  script:
+    - echo "wire scripts/ci/agent-local.sh once the model router exists"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - when: manual

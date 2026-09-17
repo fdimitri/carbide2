@@ -9,8 +9,6 @@
 
 # --- orchestration toggles ---------------------------------------------------
 ref: main            # meta-repo branch/ref to check out + fast-forward before build
-build: true          # build the container images
-shell: true          # include the carbide2-shell image in the build
 client: true         # build + upload the pinned SPA client to the MinIO static tier
 infra: true          # bring the cluster + infra up
 tls: true            # mkcert TLS setup for the ingress
@@ -22,17 +20,52 @@ csr: false           # generate key + CSR, then exit
 import-cert: ''       # path to a CA-signed cert to load as the Traefik default, then exit
 key: ''               # private key for import-cert (default: the .key from --csr)
 
-kubeconfig: '~/.kube/config'   # read by the verify step (kubeclient)
+# Per-cluster kubeconfigs (ADR-043 §9). Each cluster's is written to
+# <dir>/<cluster.name>.yaml with its cluster, user and context all renamed to
+# cluster.name, so "context == cluster.name" holds on every backend and a fleet
+# is addressed by config rather than by whatever the ambient context happens to
+# be. The dir is a global convention — identical on every box — so it belongs in
+# --yaml-out; only the resolved leaf is per-box, and that is derived.
+kubeconfig:
+  dir: '~/.carbide/kube'
 
-# --- local Kubernetes backend ------------------------------------------------
+# --- what this box IS (ADR-028 §1–§2) ------------------------------------------
+node:
+  backend: k3d       # k3d (k3s-in-Docker, single node) | k3s (host-native) | none (no cluster here)
+  role: ''           # k3s only: init (first server) | join (additional server) | agent (unimplemented).
+                     # "" => init for k3s, none otherwise.
+
+# --- what this box DOES with images (ADR-028 §1, §3) -----------------------------
+images:
+  build: true        # docker buildx the images
+  shell: true        # include carbide2-shell in the build (slow, large)
+  push: false        # push SHA-tagged images to registry.host (implies build)
+  consume: auto      # how this box's OWN cluster gets images:
+                     #   auto   => k3d / single-node k3s import :dev; k3s with a registry pulls SHA tags
+                     #   import => k3d/k3s containerd import of the local :dev images
+                     #   pull   => pull SHA tags from registry.host (k3d needs node trust; see Node)
+
+# --- the image registry: a fact about the fleet (ADR-028 §1) --------------------
+registry:
+  mode: generic      # generic (self-hosted registry:2) | gitlab (GitLab Container Registry).
+                     # gitlab implies a namespace path + credentials and disables catalog listing.
+  host: ''           # endpoint every node pushes to / pulls from; "" => no registry anywhere
+  port: '5000'       # blank => omit the port (implicit-443 registry, e.g. GitLab)
+  path: ''           # repo namespace between host and image, e.g. group/project (GitLab); "" => flat
+  repos: ''          # extra repo names to list when the registry has no catalog, comma-sep
+  catalog: auto      # does the registry expose /v2/_catalog? auto (=try+fallback) | yes | no
+  username: ''       # push/pull username (GitLab deploy-token user / robot account); '' = no auth
+  password: ''       # matching password/token. SECRET.
+  pull-secret: ''    # existing docker-registry Secret name to use as imagePullSecret (GitLab)
+  ca: ''             # PEM a consumer trusts; "" => system trust store. Ignored (derived from
+                     # mkcert) on the box that serves it; --yaml-out fills it in for the fleet.
+  serve: false       # this box runs the registry:2 container
+
+# --- the cluster: facts shared by every node in it -------------------------------
 cluster:
-  backend: k3d       # k3d (k3s-in-Docker) | k3s (host-native)
   name: carbide-dev
   http-port: ''      # "" => backend default (k3d 8080 / k3s 80)
   https-port: ''     # "" => backend default (k3d 8443 / k3s 443)
-  # Multi-node k3s (host-native only). Every node consumes the same emitted YAML:
-  # the first runs --role init (mints token if blank); the rest --role join.
-  role: init         # init (first server) | join (additional control-plane server)
   server-url: ''     # https://<first-node>:6443 — join: required; init: extra API-cert SAN
   token: ''          # k3s shared join secret; init mints one if blank. SECRET.
 
@@ -41,14 +74,18 @@ control:
   namespace: carbide-system
   release: carbide-control
 
-# --- self-hosted image registry (multi-node) ---------------------------------
-registry:
-  host: ''           # "" => single-node containerd import (:dev tags); set => push SHA tags
-  port: '5000'
-  ca: ''             # inline PEM of an externally-run registry's CA (--registry.ca-file to load)
-  container: carbide-registry
-  publish-only: false   # build + push images then exit (dedicated build/registry host)
-  external: false       # this node pulls from a registry run elsewhere (skip local registry + build)
+# --- the MinIO static tier (per cluster) ---------------------------------------
+minio:
+  namespace: ''      # "" => control.namespace
+  service: minio
+  secret: minio-credentials
+  mc: ''             # path to the MinIO client; "" probes for mcli then mc.
+                     # On Debian `mc` is Midnight Commander, so the probe checks
+                     # that --version says minio before believing a candidate.
+
+# --- the client SPA ------------------------------------------------------------
+client-build:
+  node-image: ''     # "" => node:22-alpine
 
 # --- browser-facing endpoint -------------------------------------------------
 public:

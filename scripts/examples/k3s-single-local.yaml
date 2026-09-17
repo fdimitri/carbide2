@@ -9,8 +9,12 @@
 # Set public.host if `hostname -f` doesn't return the name you actually browse
 # to (it drives the ingress host rule, the mkcert SAN, and host-based auth).
 
-cluster:
+node:
   backend: k3s
+  role: init
+images:
+  build: true
+  consume: auto     # single node, no registry -> containerd import
 
 storage:
   backend: local-path

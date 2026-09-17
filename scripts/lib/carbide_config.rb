@@ -41,6 +41,23 @@ module Carbide
     # covers anything the naming misses. A bare `secret` leaf is deliberately
     # NOT here: it names a Kubernetes Secret (tls-opts.secret) rather than
     # holding one. Keys that really do hold a credential carry secret: true.
+    # The ONE environment layer (ADR-043 §10). There are no ENV knobs for
+    # anything we control; this exists because the CI job passes registry
+    # coordinates through the environment specifically so the token never
+    # appears in the job trace, and a flag cannot do that. Nothing outside
+    # registry.* is read from the environment, ever.
+    ENV_LAYER = {
+      'REGISTRY_HOST'     => 'registry.host',
+      'REGISTRY_PORT'     => 'registry.port',
+      'REGISTRY_PATH'     => 'registry.path',
+      'REGISTRY_MODE'     => 'registry.mode',
+      'REGISTRY_USERNAME' => 'registry.username',
+      'REGISTRY_PASSWORD' => 'registry.password',
+      'REGISTRY_CA'       => 'registry.ca'
+    }.freeze
+
+    DISCOVERED_CONFIG = 'cluster.yaml'
+
     SECRET_NAME  = /token|password|private[-_]?key|key[-_]?string/i
     # Explicit dotted paths to redact regardless of their leaf name.
     SECRET_PATHS = %w[].freeze
@@ -48,7 +65,21 @@ module Carbide
 
     # defaults_path : scripts/defaults.yaml (checked in).
     # specs         : aggregated option specs from every module.
-    def initialize(defaults_path:, specs:)
+    # before_emit   : optional callable(data) run just before --yaml-out writes,
+    #                 so a serving box can embed its registry CA for the fleet.
+    # fail_with : how a config error is reported. deploy.rb wants abort; carcli
+    #             wants an exception it can map to exit code 4 (ADR-043 §3), and
+    #             a library that aborts cannot give its caller either.
+    # discover  : look for ./cluster.yaml when no --config is given.
+    # env_layer : read the CI registry variables (see ENV_LAYER).
+    # banner  : the Usage: line. deploy.rb's default is wrong for any other
+    #           caller, and a CLI whose --help describes a different program is
+    #           worse than no --help.
+    # on_help  : what -h does. The default prints and exits the process, which a
+    #           library should not do to a caller that wants an exit code.
+    def initialize(defaults_path:, specs:, before_emit: nil, fail_with: nil,
+                   fail_usage: nil, discover: false, env_layer: false, env: ENV,
+                   banner: nil, on_help: nil)
       @defaults_path = defaults_path
       @specs         = specs
       @secret_keys   = specs.select { |s| s[:secret] }.map { |s| s[:key] }
@@ -56,21 +87,45 @@ module Carbide
       @overrides     = {}   # dotted-key => value, applied as the last layer
       @input_path    = nil
       @emit          = nil  # [:full | :safe, path]
+      @before_emit   = before_emit
+      @fail_with     = fail_with || ->(msg) { abort "\e[1;31mxx\e[0m #{msg}" }
+      # A bad FLAG and a bad CONFIG VALUE are different errors with different
+      # exit codes (ADR-043 §3: usage is 3, config is 4), so they get separate
+      # hooks rather than one abort.
+      @fail_usage    = fail_usage || @fail_with
+      @discover      = discover
+      @env_layer     = env_layer
+      @env           = env
+      @banner        = banner
+      @on_help       = on_help
+      @sources       = []
     end
+
+    # Which layers actually contributed, for the resolution line.
+    attr_reader :sources
 
     # Build the parser, parse argv (mutates it), then resolve the three layers.
     # Handles --yaml-out/--yaml-safeout (dump + exit) itself. Returns self.
-    def parse!(argv)
-      build_parser.parse!(argv)
+    # Layers, last wins (ADR-043 §10):
+    #
+    #   flags > explicit --config > env > discovered ./cluster.yaml > defaults
+    #
+    # A config file you NAMED outranks ambient environment; one merely found in
+    # the working directory does not — otherwise a stale CI_REGISTRY_PASSWORD in
+    # a shell silently overrides the file you pointed at on purpose.
+    def parse!(argv, &extra_options)
+      parser = build_parser
+      extra_options&.call(parser)
+      parser.parse!(argv)
     rescue OptionParser::ParseError => e
-      abort "\e[1;31mxx\e[0m #{e.message}"
+      @fail_usage.call(e.message)
     else
-      if @input_path
-        merged = load_yaml_file(@input_path)
-        abort "\e[1;31mxx\e[0m --config #{@input_path}: expected a YAML mapping" unless merged.is_a?(Hash)
-        deep_merge!(@data, merged)
-      end
+      @sources << File.basename(@defaults_path)
+      merge_file!(discovered_path, 'discovered') if @discover && @input_path.nil?
+      merge_env!
+      merge_file!(@input_path, '--config') if @input_path
       @overrides.each { |dotted, val| set(dotted, val) }
+      @sources << 'flags' unless @overrides.empty?
 
       apply_generators!
       emit_and_exit! if @emit
@@ -101,11 +156,65 @@ module Carbide
 
     def to_h = @data
 
+    # Public setter for before_emit callables.
+    def set!(dotted, val) = set(dotted, val)
+
     private
+
+    def discovered_path
+      path = File.expand_path(DISCOVERED_CONFIG)
+      File.file?(path) ? path : nil
+    end
+
+    def merge_file!(path, label)
+      return if path.nil?
+
+      merged = load_yaml_file(path)
+      return @fail_with.call("#{label} #{path}: expected a YAML mapping") unless merged.is_a?(Hash)
+
+      reject_unknown_keys!(merged, path)
+      deep_merge!(@data, merged)
+      @sources << "#{label} #{path}"
+    end
+
+    # Only the keys in ENV_LAYER, and only when they are actually set. A blank
+    # variable is not a value: exporting REGISTRY_CA='' in a shell must not wipe
+    # a CA that the config file supplied.
+    def merge_env!
+      return unless @env_layer
+
+      applied = ENV_LAYER.filter_map do |var, key|
+        value = @env[var]
+        next if value.nil? || value.to_s.strip.empty?
+
+        set(key, value)
+        var
+      end
+      @sources << "env (#{applied.join(', ')})" unless applied.empty?
+    end
+
+    # defaults.yaml is the whole schema: a key that is not in it is not read by
+    # anything, so accepting it would silently do nothing. No legacy mapping
+    # (ADR-028): old shapes fail here, by name, with the file that carried them.
+    def reject_unknown_keys!(merged, path = @input_path)
+      known   = dotted_leaves(@data)
+      unknown = dotted_leaves(merged) - known
+      return if unknown.empty?
+
+      @fail_with.call("#{path}: unknown key#{'s' if unknown.size > 1} " \
+                      "(not in defaults.yaml): #{unknown.join(', ')}")
+    end
+
+    def dotted_leaves(hash, prefix = '')
+      hash.flat_map do |k, v|
+        path = prefix.empty? ? k.to_s : "#{prefix}.#{k}"
+        v.is_a?(Hash) && !v.empty? ? dotted_leaves(v, path) : [path]
+      end
+    end
 
     def build_parser
       OptionParser.new do |o|
-        o.banner = "Usage: deploy.rb [options]\n" \
+        o.banner = @banner || "Usage: deploy.rb [options]\n" \
                    "  Config layers (last wins): defaults.yaml -> --config input.yaml -> CLI flags.\n" \
                    "  Every --a.b.c flag sets the a.b.c key; emit the resolved set with --yaml-out.\n\n"
 
@@ -117,7 +226,9 @@ module Carbide
         o.on('--yaml-out PATH', 'FREEZE the fully-resolved config (secrets included) to PATH and exit; does NOT deploy — deploy from it with --config PATH') { |v| @emit = [:full, v] }
         o.on('--yaml-safeout PATH', 'Like --yaml-out but redact secrets (not usable by joiners); then exit') { |v| @emit = [:safe, v] }
         o.on('--schema-out PATH', 'Dump the option specs + resolved defaults as JSON to PATH and exit (drives scripts/configure.rb)') { |v| @emit = [:schema, v] }
-        o.on('-h', '--help', 'Show this help') { puts o; exit 0 }
+        o.on('-h', '--help', 'Show this help') do
+          @on_help ? @on_help.call(o.to_s) : (puts o; exit 0)
+        end
       end
     end
 
@@ -144,7 +255,8 @@ module Carbide
     # the resolved config (and any YAML we emit) is self-contained.
     def read_file_arg(path)
       abs = File.expand_path(path)
-      abort "\e[1;31mxx\e[0m file not found: #{path}" unless File.file?(abs)
+      return @fail_with.call("file not found: #{path}") unless File.file?(abs)
+
       File.read(abs)
     end
 
@@ -178,12 +290,12 @@ module Carbide
     end
 
     def load_yaml_file(path)
-      return {} unless File.file?(path)
+      return @fail_with.call("config file not found: #{path}") unless File.file?(path)
 
       data = YAML.safe_load_file(path)
       data.is_a?(Hash) ? data : {}
     rescue StandardError => e
-      abort "\e[1;31mxx\e[0m failed to read config #{path}: #{e.message}"
+      @fail_with.call("failed to read config #{path}: #{e.message}")
     end
 
     # Recursively merge `src` into `dst`: hashes deep-merge, scalars and arrays
@@ -210,6 +322,7 @@ module Carbide
       mode, path = @emit
       return emit_schema_and_exit!(path) if mode == :schema
 
+      @before_emit&.call(self)
       out = mode == :safe ? redacted(@data) : @data
       File.write(File.expand_path(path), YAML.dump(out))
       warn "wrote #{mode == :safe ? 'redacted ' : ''}config to #{path}"

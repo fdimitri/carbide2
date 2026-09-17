@@ -230,18 +230,18 @@ module Carbide
       end
     end
 
-    # Hostnames/IPs the cert is valid for. Set tls-opts.hosts="a b c" to override;
-    # otherwise auto-detect this host's FQDN, short name, and IPs plus loopback.
+    # Hostnames/IPs the cert is valid for. Set tls-opts.hosts="a b c" to override.
+    #
+    # Otherwise: public.host, loopback, and this host's interface IPs. NOT
+    # `hostname -f`/`-s`: deploy.rb's resolve_public_endpoint already validates
+    # that source and makes the user set public.host when it is unusable (WSL
+    # returns "NAME.", many boxes return a bare short name). Re-reading it here
+    # would hand mkcert exactly the value that step rejected.
     def tls_hosts
       return @hosts.split unless @hosts.empty?
 
       hosts = %w[localhost 127.0.0.1 ::1]
       hosts << @public_host unless @public_host.empty?
-      %w[-f -s].each do |flag|
-        out, = @cmd.run!('hostname', flag)
-        v = (out || '').strip
-        hosts << v unless v.empty?
-      end
       ips, = @cmd.run!('hostname', '-I')
       hosts.concat((ips || '').strip.split)
       hosts.uniq

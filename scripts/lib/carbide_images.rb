@@ -1,37 +1,58 @@
 # frozen_string_literal: true
 
 require 'fileutils'
+require 'time'
+require 'yaml'
 require_relative 'carbide_command'
+require_relative 'carbide_release'
+require_relative 'carbide_registry'
+require_relative 'carbide_identity'
+require_relative 'carbide_worktree'
 
 module Carbide
-  # Shared image/registry logic for build.rb and deploy.rb.
+  # Shared image logic for carcli and deploy.rb (ADR-028 §6, ADR-043).
   #
   # Owns exactly one thing: turning the meta-repo's submodule checkouts into
-  # immutable, SHA-tagged container images and (optionally) getting them into a
-  # self-hosted registry. It is the single source of truth for how the three
-  # carbide images are tagged and built — previously that logic was duplicated
-  # between scripts/build-all.sh (bash) and scripts/deploy.rb (ruby), which
-  # drifted. Both callers now go through here.
+  # immutable, SHA-tagged container images and (optionally) pushing them to a
+  # registry. It is the single source of truth for how the three carbide images
+  # are tagged and built — previously that logic was duplicated between
+  # scripts/build-all.sh (bash) and scripts/deploy.rb (ruby), which drifted.
+  #
+  # The registry itself — its coordinates, CA, cert, and container — is a
+  # Carbide::Registry handed in at construction. Images never runs one.
+  #
+  # Identity (what an artifact is called, and whether its tree is dirty) is
+  # Carbide::Identity's: this class no longer computes shas. That matters beyond
+  # tidiness — the image subjects gained dirty builds in ADR-043 §5, and a second
+  # implementation of "what is this called" is exactly how the tag in the
+  # registry and the tag in the helm release drift apart.
   #
   # It is a pure library: it takes injected TTY::Command runners (so the caller
-  # controls verbosity — build.rb streams, deploy.rb captures) and never sets up
+  # controls verbosity — carcli streams, deploy.rb captures) and never sets up
   # gems or parses CLI itself. It knows nothing about kubernetes, helm, TLS, or
-  # the client SPA; those stay in deploy.rb.
+  # the client SPA; those stay in deploy.rb and Carbide::Client.
+  #
+  # Failures RAISE (Carbide::Images::Error) rather than abort. A library that
+  # calls abort cannot be tested and cannot be given an exit code by its caller;
+  # carcli maps these to the ADR-043 §3 exit codes and deploy.rb aborts on them.
   class Images
     include Carbide::CommandRunner
+
+    Error = Class.new(StandardError)
+    DirtyRefused = Class.new(Error)
 
     # Logical component -> image repository name. The workspace pod image is
     # historically just "carbide2".
     NAMES = { workspace: 'carbide2', control: 'carbide2-control', shell: 'carbide2-shell' }.freeze
     ALL   = NAMES.keys.freeze
 
-    # cmd/quiet   : TTY::Command instances (pretty/streaming and null/capturing).
-    # root        : the meta-repo root (holds the submodule checkouts).
-    # registry_*  : self-hosted registry coordinates; host nil => local-only :dev.
-    # registry_ca : an externally-run registry's CA pem (preferred over mkcert).
-    # registry_container : docker container name for the local registry:2.
-    def initialize(cmd:, quiet:, root:, registry_host: nil, registry_port: '5000',
-                   registry_ca: nil, registry_container: 'carbide-registry')
+    CONSUME_MODES = %w[auto import pull].freeze
+
+    # cmd/quiet : TTY::Command instances (pretty/streaming and null/capturing).
+    # root      : the meta-repo root (holds the submodule checkouts).
+    # registry  : Carbide::Registry, or nil for local-only :dev tags.
+    # identity  : Carbide::Identity; injectable for tests, built from root here.
+    def initialize(cmd:, quiet:, root:, registry: nil, identity: nil)
       @cmd  = cmd
       @quiet = quiet
       @root  = root
@@ -39,67 +60,84 @@ module Carbide
       @control = File.join(root, 'carbide2-control')
       @worker  = File.join(root, 'carbide2-worker')
       @client  = File.join(root, 'carbide2-client')
-      host = registry_host&.strip
-      host = nil if host&.empty?
-      @registry_host = host
-      @registry_port = registry_port.to_s
-      @registry      = host ? "#{host}:#{@registry_port}/" : nil
-      ca = registry_ca&.strip
-      @registry_ca = (ca && !ca.empty?) ? ca : nil
-      container = registry_container.to_s.strip
-      @registry_container = container.empty? ? 'carbide-registry' : container
+      @registry_obj = registry
+      @registry = registry&.configured? ? registry.prefix : nil
+      @identity = identity || Carbide::Identity.new(cmd: cmd, root: root)
     end
 
-    # Config option specs owned by the image/registry layer (aggregated by deploy.rb).
+    # Config option specs owned by the image lifecycle (aggregated by deploy.rb).
     def self.options
       [
-        { key: 'registry.host', arg: 'HOST',
-          desc: 'Registry mode: push SHA-tagged images to a self-hosted registry at HOST (blank => single-node containerd import). Required for multi-node' },
-        { key: 'registry.port', arg: 'PORT', desc: 'Registry port (default: 5000)' },
-        { key: 'registry.ca', arg: 'PEM', desc: 'Inline CA PEM of an externally-run registry, so this node trusts it' },
-        { key: 'registry.ca', long: 'registry.ca-file', arg: 'FILE', file: true,
-          desc: 'Load registry.ca from a PEM file (mkcert rootCA.pem of the build host)' },
-        { key: 'registry.container', arg: 'NAME', desc: 'Local registry:2 container name (default: carbide-registry)' },
-        { key: 'registry.publish-only', long: 'publish-only', desc: 'Build + push SHA-tagged images to the registry, then exit (dedicated build/registry host). Needs registry.host' },
-        { key: 'registry.external', long: 'external-registry', desc: 'This node pulls from a registry run elsewhere: skip the local registry + build. Needs registry.host + registry.ca' }
+        { key: 'images.build', negatable: true,
+          desc: 'Build the container images (--no-images.build to redeploy what exists)' },
+        { key: 'images.shell', negatable: true,
+          desc: 'Include carbide2-shell in the build (slow, large; --no-images.shell reuses the existing one)' },
+        { key: 'images.push', negatable: true,
+          desc: 'Push SHA-tagged images to registry.host (implies build)' },
+        { key: 'images.consume', arg: 'MODE', values: CONSUME_MODES,
+          desc: "How this box's own cluster gets images: auto (k3d/single k3s import :dev; multi-node pulls), import, pull" }
       ]
     end
 
-    attr_reader :registry, :registry_host, :registry_port
+    attr_reader :registry, :identity
 
-    # 12-char short SHA of the checkout in `dir` (matches build-all.sh).
-    def short_sha(dir)
-      out, = @cmd.run!('git', '-C', dir, 'rev-parse', '--short=12', 'HEAD')
-      (out || '').strip
+    def registry_host = @registry_obj&.host
+    def registry_port = @registry_obj&.port
+
+    # The release manifest (manifest.yaml at the meta root) — authoritative
+    # version + codename, stamped into every image as OCI labels + runtime env.
+    # Sourced from Carbide::Release so images and anything else meta-versioned
+    # read one place; the CLIENT, which versions independently, does not use this.
+    def manifest         = Carbide::Release.manifest(@root)
+    def release_version  = Carbide::Release.version(@root)
+    def release_codename = Carbide::Release.codename(@root)
+
+    # Committer date (UTC Zulu) of the last commit in `dir` at `rev`, optionally
+    # limited to a path. Unlike build_time this is stable across rebuilds, so a
+    # registry reader can tell which of two builds is genuinely newer.
+    def commit_time(dir, path = nil, rev: 'HEAD')
+      args = ['git', '-C', dir, 'log', '-1', '--format=%cI', rev]
+      args += ['--', path] if path
+      out, = @cmd.run!(*args)
+      t = begin
+        Time.iso8601((out || '').strip)
+      rescue ArgumentError
+        nil
+      end
+      t&.utc&.strftime('%Y-%m-%dT%H:%M:%SZ')
     end
 
-    # 12-char git blob hash of a single file's contents. Used to tag an image
-    # whose only build input is that file, so unrelated repo commits (docs, app
-    # code) don't churn its tag and force a needless rebuild.
-    def blob_sha(path)
-      out, = @cmd.run!('git', 'hash-object', path)
-      (out || '').strip[0, 12]
+    # Immutable per-component tags for the CURRENT working trees. Kept as a
+    # no-argument public method because deploy.rb's control-plane install reads
+    # it as a hash; ref-aware callers use tags_for.
+    def image_tags = @image_tags ||= tags_for({})
+
+    # Tags as they would be with these ref overrides applied. Workspace ships
+    # server+worker so its tag is composite; shell is the content hash of
+    # Dockerfile.shell, so a docs or app commit does not churn a ~4GB image.
+    # A dirty tree yields <tag>-dirty (never for shell — see Carbide::Identity).
+    def tags_for(refs)
+      ALL.to_h { |component| [component, @identity.tag(component, refs: refs)] }
     end
 
-    # Immutable per-component tags. Workspace ships server+worker, so its tag is
-    # composite; control tracks its own repo. The shell image is built purely
-    # from Dockerfile.shell (it COPYs nothing from the repo and takes no build
-    # args), so it's tagged by that file's content — not the server repo SHA —
-    # so a docs/app commit doesn't rebuild it. with_refs resets the memo.
-    def image_tags
-      @image_tags ||= {
-        workspace: "#{short_sha(@server)}-#{short_sha(@worker)}",
-        control:   short_sha(@control),
-        shell:     blob_sha(File.join(@server, 'Dockerfile.shell'))
-      }
+    def dirty?(component, refs: {}) = @identity.dirty?(component, refs: refs)
+
+    # Commit time per component. Workspace ships server+worker, so its stamp is
+    # the NEWEST of the two (a change to either is a change to the image). Shell
+    # is built purely from Dockerfile.shell, so it tracks that file's own commit,
+    # matching its content-addressed tag.
+    def commit_times(sources = nil)
+      return @commit_times ||= commit_times_for(default_sources) if sources.nil?
+
+      commit_times_for(sources)
     end
 
     # Registry-prefixed immutable ref for a component (host:port/name:sha). Falls
     # back to the local :dev ref when there's no registry.
-    def image_ref(component)
+    def image_ref(component, tags = image_tags)
       return local_ref(component) unless @registry
 
-      "#{@registry}#{NAMES.fetch(component)}:#{image_tags.fetch(component)}"
+      "#{@registry}#{NAMES.fetch(component)}:#{tags.fetch(component)}"
     end
 
     # The always-built local tag (the k3d/k3s containerd-import path uses these).
@@ -109,30 +147,51 @@ module Carbide
     # image.repository and image.tag as separate values. Nil registry => bare name.
     def repository(component) = "#{@registry}#{NAMES.fetch(component)}"
 
-    # Build the requested components (default all) and, when push: true and a
-    # registry is configured, push each to it. Build and push happen inside the
-    # same with_refs block so the tags pushed are exactly the tags built even
-    # when refs: overrides temporarily check out other SHAs. Returns a map of
-    # component => the ref that was produced (registry ref when pushing/registry
-    # mode, else the local :dev ref), for the caller to print.
+    # Build the requested components and, when push: true and a registry is
+    # configured, push each.
     #
-    # force: false skips any component whose registry ref already exists (tags
-    # are immutable, so an existing tag is identical content) — this check is
-    # inside with_refs so it uses the same SHAs that would be built.
-    def build(components: ALL, refs: {}, push: false, force: false, quiet: true)
+    # Refs are materialized in DETACHED WORKTREES for the duration of the build
+    # (ADR-043 §5), not checked out in place: an explicit ref is pristine by
+    # construction, two builds on one host cannot collide, and an aborted build
+    # cannot leave a submodule detached. A bare build uses the working tree as it
+    # stands, dirty and all, because you should not have to commit to build.
+    #
+    # TWO forces, because they override two different decisions (ADR-043 §8):
+    #
+    #   force_rebuild:  source-side — build even though the tag already exists.
+    #   force:          destination-side — push even though the tag is already
+    #                   in the registry, overwriting it.
+    #
+    # They are independent and compose. force_rebuild alone rebuilds and then
+    # still skips the push, which is right: pushing an identical immutable tag
+    # is a no-op. force alone pushes whatever is in the local daemon, and the
+    # local-image guard says so plainly when there is nothing there.
+    #
+    # Without either, a component whose registry ref already exists is skipped
+    # (tags are immutable, so an existing tag is identical content). A DIRTY tag
+    # is never skipped on presence: <sha>-dirty names a class of tree, not an
+    # instance, so its presence is not information.
+    def build(components: ALL, refs: {}, push: false, force_rebuild: false, force: false,
+              quiet: true, allow_dirty: false)
+      tags = tags_for(refs)
+      guard_dirty!(components, tags, refs, allow_dirty)
       built = {}
-      with_refs(refs) do
-        ensure_registry if push && @registry
+      with_sources(refs) do |sources|
+        ensure_registry! if push && @registry
+        times = commit_times(sources)
         components.each do |component|
-          ref = image_ref(component)
-          if !force && @registry && in_registry?(ref)
+          ref = image_ref(component, tags)
+          if skip_present?(component, ref, tags, force_rebuild)
             log "skipping #{component}: #{ref} already in registry (use --force-rebuild)"
             built[component] = ref
             next
           end
-          build_component(component, quiet: quiet)
+          build_component(component, sources: sources, tags: tags, times: times, quiet: quiet)
           built[component] = ref
-          push_one(ref) if push && @registry
+          if push && @registry
+            push_one(ref, dirty: dirty_tag?(tags[component]),
+                     allow_dirty: allow_dirty, force: force)
+          end
         end
       end
       built
@@ -140,104 +199,224 @@ module Carbide
 
     # Push already-built components to the registry (no build). Used by deploy.rb
     # when it built earlier in the same process (no ref override in play).
-    def push(components: ALL)
-      raise 'push called without a registry' unless @registry
+    def push(components: ALL, allow_dirty: false, force: false)
+      raise Error, 'push called without a registry' unless @registry
 
-      ensure_registry
-      components.each { |component| push_one(image_ref(component)) }
+      # Gate before touching the network: a push that is going to be refused
+      # should not first start a registry container or wait out a TLS timeout.
+      tags = image_tags
+      guard_dirty!(components, tags, {}, allow_dirty)
+      ensure_registry!
+      components.each do |component|
+        push_one(image_ref(component, tags), dirty: dirty_tag?(tags[component]),
+                 allow_dirty: allow_dirty, force: force)
+      end
     end
 
     # True when every requested component's registry ref already exists — so the
     # (slow) build can be skipped entirely (immutable tags => identical content).
+    # A dirty tag is never "already present" in any useful sense, so a dirty tree
+    # never reports all-present.
     def all_present?(components = ALL)
       return false unless @registry
 
-      components.all? { |component| in_registry?(image_ref(component)) }
+      tags = image_tags
+      components.all? do |component|
+        !dirty_tag?(tags[component]) && in_registry?(image_ref(component, tags))
+      end
     end
 
-    # True if <name>:<tag> already exists in the registry (GET of the manifest).
+    # present / absent / unreachable (ADR-043 §7). Unreachable is never collapsed
+    # into absent: "the registry is down" must not read as "build it".
+    def detect(component, refs: {})
+      return :unreachable unless @registry
+
+      tags = refs.empty? ? image_tags : tags_for(refs)
+      name, tag = split_ref(image_ref(component, tags))
+      @registry_obj.detect(name, tag)
+    end
+
+    # Every component whose ref is NOT in the registry, as { component => verdict }
+    # with detect's tri-state preserved. Empty means all present.
+    #
+    # The caller deciding to deploy needs more than all_present?'s boolean: it has
+    # to name which refs are wrong and say whether they are absent (build them) or
+    # unverifiable (fix the registry), because those have opposite fixes. Nothing
+    # here decides anything — the exit code belongs to the caller (ADR-043 §3).
+    def missing(components = ALL)
+      components.to_h { |c| [c, detect(c)] }.reject { |_, verdict| verdict == :present }
+    end
+
+    # True if <name>:<tag> already exists in the registry.
     def in_registry?(ref)
       return false unless @registry
 
-      name, tag = ref.sub(@registry, '').split(':', 2)
-      url = "https://#{@registry_host}:#{@registry_port}/v2/#{name}/manifests/#{tag}"
-      registry_curl('-sf', '-o', '/dev/null',
-                    '-H', 'Accept: application/vnd.docker.distribution.manifest.v2+json',
-                    url).success?
-    end
-
-    # Resolve the CA pem that signs the registry's TLS cert: an externally-run
-    # registry supplies it explicitly; otherwise fall back to the local mkcert
-    # CAROOT. Returns nil when neither is available.
-    def mkcert_ca_pem
-      return @mkcert_ca if defined?(@mkcert_ca)
-      return @mkcert_ca = @registry_ca if @registry_ca && File.exist?(@registry_ca)
-
-      out, = @cmd.run!('mkcert', '-CAROOT')
-      pem  = File.join((out || '').strip, 'rootCA.pem')
-      @mkcert_ca = File.exist?(pem) ? pem : nil
-    end
-
-    # The CA PEM *text* (for handing to control as REGISTRY_CA env), or empty.
-    # registry.ca may be inline PEM text (from --yaml-out / --registry.ca) or a
-    # file path (from --registry.ca-file). Return the text either way; never
-    # fall back to the LOCAL mkcert root when inline PEM was supplied.
-    def registry_ca_text
-      return @registry_ca if @registry_ca&.include?('-----BEGIN')
-
-      path = mkcert_ca_pem
-      return '' unless path
-
-      File.read(path).strip
-    rescue StandardError
-      ''
-    end
-
-    # Bring up (or reuse) a standalone registry:2 on this host over TLS. The cert
-    # reuses the carbide mkcert root CA, so nodes that already trust that CA can
-    # pull without extra config. Idempotent.
-    def ensure_registry
-      log "ensuring standalone registry at #{@registry_host}:#{@registry_port}"
-      dir = File.expand_path('~/.carbide/registry')
-      crt = File.join(dir, 'registry.crt')
-      key = File.join(dir, 'registry.key')
-      ensure_registry_cert(dir, crt, key)
-      ensure_registry_container(dir)
-      verify_registry
+      name, tag = split_ref(ref)
+      @registry_obj.has_manifest?(name, tag)
     end
 
     private
 
-    def build_time = Time.now.utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    def default_sources
+      { server: @server, worker: @worker, control: @control, client: @client }
+    end
 
-    # Faithfully mirrors build-all.sh's three buildx invocations. Always tags the
-    # local :dev ref and additionally the registry SHA ref when a registry is set.
-    def build_component(component, quiet:)
-      tags = ['-t', local_ref(component)]
-      tags += ['-t', image_ref(component)] if @registry
-      meta = ["META_SHA=#{short_sha(@root)}", "CLIENT_SHA=#{short_sha(@client)}",
-              "BUILD_TIME=#{build_time}"]
+    def dirty_tag?(tag) = tag.to_s.end_with?('-dirty')
+
+    def split_ref(ref) = ref.sub(@registry, '').split(':', 2)
+
+    # Presence is only a trustworthy skip signal for a content-addressed tag.
+    def skip_present?(component, ref, tags, force_rebuild)
+      return false if force_rebuild || !@registry || dirty_tag?(tags[component])
+
+      in_registry?(ref)
+    end
+
+    # The build-dirty gate (ADR-043 §5). Building writes nothing, so the gate is
+    # not about danger: the tag class is a classification that decides whether
+    # detect means anything, whether auto applies, and whether a push is allowed
+    # downstream. Deriving that silently from `git status` is the one
+    # consequential inference this tool would make without saying so.
+    def guard_dirty!(components, tags, refs, allow_dirty)
+      return if allow_dirty
+
+      dirty = components.select { |c| dirty_tag?(tags[c]) }
+      return if dirty.empty?
+
+      detail = dirty.map { |c| "#{c} (#{describe_dirty(c, refs)})" }.join(', ')
+      raise DirtyRefused,
+            "refusing to build from a dirty tree: #{detail}. " \
+            'Pass --allow-dirty to build it as <sha>-dirty.'
+    end
+
+    # Which half of a composite is dirty is the thing you actually want in the
+    # message; the tag deliberately does not carry it.
+    def describe_dirty(component, refs)
+      state = @identity.state(component, refs: refs)
+      return "#{state[:sha]} dirty" unless component == :workspace
+
+      %i[server worker].select { |half| state[half][:dirty] }
+                       .map { |half| "#{half} dirty" }.join(' + ')
+    end
+
+    # A push needs the registry up. Only the box that serves it can bring it up;
+    # a box pushing to someone else's registry just needs it reachable.
+    def ensure_registry!
+      @registry_obj.serve? ? @registry_obj.ensure! : @registry_obj.check!
+    rescue StandardError => e
+      raise Error, e.message
+    end
+
+    # ONE build_time per invocation, used for both the OCI label and the runtime
+    # env build arg. Computing it twice let the label and the env disagree by a
+    # second, so the same image reported two build times depending which you read.
+    def build_time = @build_time ||= Time.now.utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    def commit_times_for(sources)
+      {
+        workspace: [commit_time(sources[:server]), commit_time(sources[:worker])].compact.max,
+        control:   commit_time(sources[:control]),
+        shell:     commit_time(sources[:server], 'Dockerfile.shell')
+      }
+    end
+
+    # Yield the directory each component builds from: its submodule checkout, or
+    # a detached worktree when a ref was given for it. Nested so that several ref
+    # overrides compose, and so every worktree is removed on the way out however
+    # the block leaves.
+    def with_sources(refs, &block)
+      pending = normalize_refs(refs)
+      materialize(pending.keys, pending, default_sources, &block)
+    end
+
+    def materialize(keys, refs, sources, &block)
+      return block.call(sources) if keys.empty?
+
+      key  = keys.first
+      repo = sources.fetch(key)
+      sha  = @identity.resolve(key, refs.fetch(key))
+      log "materializing #{key} @ #{sha[0, 12]} in a detached worktree"
+      Carbide::Worktree.with(cmd: @cmd, repo: repo, sha: sha) do |path|
+        materialize(keys[1..], refs, sources.merge(key => path), &block)
+      end
+    end
+
+    def normalize_refs(refs)
+      (refs || {}).each_with_object({}) do |(k, v), out|
+        next if v.nil? || v.to_s.strip.empty?
+
+        key = k.to_sym
+        next unless default_sources.key?(key)
+
+        out[key] = v.to_s.strip
+      end
+    end
+
+    # Always tags the local :dev ref and additionally the registry SHA ref when a
+    # registry is set. The release version/codename are stamped in as both build
+    # args (persisted as runtime env by the Dockerfiles) and OCI labels (visible
+    # in the registry).
+    #
+    # The *_SHA build args are commit provenance and stay bare 12-char shas even
+    # on a dirty build; dirtiness lives in the tag, which is the thing that has
+    # to stay distinguishable in a store.
+    def build_component(component, sources:, tags:, times:, quiet:)
+      refs = ['-t', local_ref(component)]
+      refs += ['-t', image_ref(component, tags)] if @registry
+      server = sources.fetch(:server)
+      meta = ["META_SHA=#{head_short(@root)}", "CLIENT_SHA=#{head_short(sources.fetch(:client))}",
+              "BUILD_TIME=#{build_time}",
+              "VERSION=#{release_version}", "CODENAME=#{release_codename}"]
+      labels = metadata_labels(component, times)
       case component
       when :workspace
-        run_build(quiet, 'docker', 'buildx', 'build', '--load', *tags,
-                  *build_args(*meta, "SERVER_SHA=#{short_sha(@server)}",
-                              "WORKER_SHA=#{short_sha(@worker)}"),
-                  '--build-context', "worker=#{@worker}", @server)
+        run_build(quiet, 'docker', 'buildx', 'build', '--load', *refs, *labels,
+                  *build_args(*meta, "SERVER_SHA=#{head_short(server)}",
+                              "WORKER_SHA=#{head_short(sources.fetch(:worker))}"),
+                  '--build-context', "worker=#{sources.fetch(:worker)}", server)
       when :control
-        run_build(quiet, 'docker', 'buildx', 'build', '--load', *tags,
-                  *build_args(*meta, "CONTROL_SHA=#{short_sha(@control)}"), @control)
+        control = sources.fetch(:control)
+        run_build(quiet, 'docker', 'buildx', 'build', '--load', *refs, *labels,
+                  *build_args(*meta, "CONTROL_SHA=#{head_short(control)}"), control)
       when :shell
-        run_build(quiet, 'docker', 'buildx', 'build', '--load', *tags,
-                  '-f', File.join(@server, 'Dockerfile.shell'), @server)
+        run_build(quiet, 'docker', 'buildx', 'build', '--load', *refs, *labels,
+                  *build_args("VERSION=#{release_version}", "CODENAME=#{release_codename}"),
+                  '-f', File.join(server, 'Dockerfile.shell'), server)
       else
         raise ArgumentError, "unknown component: #{component.inspect}"
       end
     end
 
+    # HEAD of an arbitrary directory — the meta repo, and the resolved source
+    # dirs (which may be worktrees, where HEAD is the pinned commit). Component
+    # identity is Carbide::Identity's; this is only the provenance stamp.
+    def head_short(dir)
+      out, = @cmd.run!('git', '-C', dir, 'rev-parse', '--short=12', 'HEAD')
+      (out || '').strip
+    end
+
     def build_args(*pairs) = pairs.flat_map { |p| ['--build-arg', p] }
 
-    # Run a build either streaming (build.rb: user watches progress; raises on
-    # failure) or captured (deploy.rb: surface output only on failure).
+    # OCI labels so the registry's image manifest (config.Labels) is
+    # self-describing without running the image: the release version + codename
+    # (from manifest.yaml — the meta release, which the images DO track) plus
+    # this component's build_time and commit_time. Every artifact exposes the
+    # same four keys, so a reader uses one interface regardless of artifact.
+    # Empty values are omitted.
+    def metadata_labels(component, times)
+      out = []
+      add = lambda do |key, val|
+        out += ['--label', "org.carbide.#{key}=#{val}"] unless val.to_s.empty?
+      end
+      add.call('version',    release_version)
+      add.call('codename',   release_codename)
+      add.call('build_time', build_time)
+      add.call('commit_time', times[component])
+      out
+    end
+
+    # Run a build either streaming (carcli: the user watches progress) or
+    # captured (deploy.rb: surface output only on failure).
     def run_build(quiet, *args)
       return @cmd.run(*args) unless quiet
 
@@ -246,45 +425,31 @@ module Carbide
 
       $stdout.write(res.out)
       $stderr.write(res.err)
-      abort "\e[1;31mxx\e[0m build failed (output above): #{args.last}"
+      raise Error, "build failed (output above): #{args.last}"
     end
 
-    # Check out the given refs in their submodules for the duration of the block,
-    # restoring each checkout's original HEAD afterwards. refs is a map of
-    # component-ish key => git ref, e.g. {server: 'feat/x', worker: '<sha>'}.
-    # The image-tag memo is reset around the swap so tags reflect the active SHAs.
-    def with_refs(refs)
-      refs = (refs || {}).reject { |_, v| v.nil? || v.to_s.strip.empty? }
-      return yield if refs.empty?
-
-      dirs = { server: @server, control: @control, worker: @worker, client: @client }
-      originals = {}
-      refs.each do |key, ref|
-        dir = dirs.fetch(key.to_sym)
-        orig, = @cmd.run!('git', '-C', dir, 'rev-parse', 'HEAD')
-        originals[dir] = (orig || '').strip
-        log "checkout #{key} @ #{ref}"
-        @cmd.run('git', '-C', dir, 'checkout', ref)
+    def push_one(ref, dirty: false, allow_dirty: false, force: false)
+      # The push-dirty gate lives HERE rather than only in the CLI, so a caller
+      # that bypasses the wrapper cannot seed a shared store with an artifact
+      # nobody can identify.
+      if dirty && !allow_dirty
+        raise DirtyRefused, "refusing to push #{ref}: a -dirty tag names a class of " \
+                            'working tree, not a build. Pass --allow-dirty if you mean it.'
       end
-      @image_tags = nil
-      yield
-    ensure
-      originals&.each do |dir, sha|
-        next if sha.empty?
 
-        @cmd.run!('git', '-C', dir, 'checkout', sha)
-      end
-      @image_tags = nil
-    end
-
-    def push_one(ref)
-      if in_registry?(ref)
+      # force is the ONLY way past this. Before it existed, a present tag could
+      # not be re-pushed at all: --force-rebuild bypassed the build skip and then
+      # this check silently dropped the push, so "rebuild and push it again"
+      # was unreachable — and a registry that had the tag was never written to,
+      # which is exactly the case you want when testing whether you CAN write.
+      if !dirty && !force && in_registry?(ref)
         log "  skip #{ref} (already in registry)"
         return
       end
-      unless @quiet.run!("docker image inspect #{ref}").success?
-        abort "\e[1;31mxx\e[0m #{ref} not present locally \u2014 build it first, then " \
-              "re-run. Refusing to publish a tag the cluster will ImagePullBackOff on."
+
+      unless @quiet.run!('docker', 'image', 'inspect', ref).success?
+        raise Error, "#{ref} not present locally — build it first, then re-run. " \
+                     'Refusing to publish a tag the cluster will ImagePullBackOff on.'
       end
       log "  push #{ref}"
       res = @quiet.run!('docker', 'push', ref)
@@ -292,62 +457,7 @@ module Carbide
 
       $stdout.write(res.out)
       $stderr.write(res.err)
-      abort "\e[1;31mxx\e[0m docker push failed for #{ref} (output above)."
-    end
-
-    def registry_curl(*args)
-      cmd = ['curl']
-      cmd += ['--cacert', mkcert_ca_pem] if mkcert_ca_pem
-      @quiet.run!(*cmd, *args)
-    end
-
-    def ensure_registry_cert(dir, crt, key)
-      return if File.exist?(crt) && File.exist?(key)
-
-      unless system('command -v mkcert >/dev/null 2>&1')
-        abort "\e[1;31mxx mkcert not found.\e[0m It mints the registry's TLS cert " \
-              "(and the CA nodes trust to pull). Install mkcert and retry."
-      end
-      FileUtils.mkdir_p(dir)
-      hosts = registry_tls_hosts
-      log "minting registry TLS cert via mkcert for: #{hosts.join(' ')}"
-      @cmd.run('mkcert', '-cert-file', crt, '-key-file', key, *hosts)
-    end
-
-    def registry_tls_hosts
-      hosts = [@registry_host, 'localhost', '127.0.0.1']
-      ips, = @cmd.run!('hostname', '-I')
-      hosts.concat((ips || '').strip.split)
-      hosts.uniq
-    end
-
-    def ensure_registry_container(dir)
-      name = @registry_container
-      running, = @cmd.run!('docker', 'ps', '-q', '-f', "name=^#{name}$")
-      unless (running || '').strip.empty?
-        log "registry container '#{name}' already running \u2014 reusing"
-        return
-      end
-
-      @quiet.run!('docker', 'rm', '-f', name)
-      log "starting registry:2 container '#{name}' on :#{@registry_port}"
-      @cmd.run('docker', 'run', '-d', '--restart=always', '--name', name,
-               '-p', "#{@registry_port}:5000",
-               '-v', "#{dir}:/certs:ro",
-               '-e', 'REGISTRY_HTTP_TLS_CERTIFICATE=/certs/registry.crt',
-               '-e', 'REGISTRY_HTTP_TLS_KEY=/certs/registry.key',
-               'registry:2')
-    end
-
-    def verify_registry
-      url = "https://#{@registry_host}:#{@registry_port}/v2/"
-      15.times do
-        return if registry_curl('-sf', '-o', '/dev/null', url).success?
-
-        sleep 1
-      end
-      abort "\e[1;31mxx\e[0m registry did not become reachable at #{url}. Check " \
-            "`docker logs carbide-registry` and that the mkcert CA is trusted on this host."
+      raise Error, "docker push failed for #{ref} (output above)."
     end
   end
 end

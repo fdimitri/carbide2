@@ -8,7 +8,9 @@ carbide-rootCA.pem
 carbide2-bridge*/
 carbide2-site/
 carbide2-docs/
+carbide2-experimental/
 legacy*/
 
 # Agent-local state (memories, etc.) — never commit
 /.carbide/
+AGENTS.md

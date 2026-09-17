@@ -18,27 +18,39 @@ module Carbide
     # namespace    : the control-plane namespace.
     # release      : the helm release name.
     # images       : Carbide::Images (registry prefix + per-component tags).
+    # pull         : this cluster pulls SHA tags from the registry (ADR-028 §5).
+    #                When false the chart gets bare :dev refs and a forced roll.
     # http_port/https_port/public_url : ingress values for the chart.
     # roll_scope   : 'all' | 'control' | 'none'.
     # workspace_storage_class : StorageClass the operator stamps into each
     #                workspace PVC (chart value workspace.storageClassName ->
     #                WORKSPACE_STORAGE_CLASS env); blank => chart default.
-    def initialize(cmd:, control_root:, namespace:, release:, images:,
+    def initialize(cmd:, control_root:, namespace:, release:, images:, pull: false,
                    http_port:, https_port:, public_url:, roll_scope:,
                    workspace_storage_class: nil, registry_url: nil,
+                   registry_path: nil, registry_repos: nil, registry_catalog: nil, registry_mode: nil,
+                   registry_user: nil, registry_pass: nil, registry_pull_secret: nil,
                    registry_ca: nil)
       @cmd        = cmd
       @control    = control_root
       @namespace  = namespace
       @release    = release
       @images     = images
+      @pull       = pull
       @http_port  = http_port
       @https_port = https_port
       @public_url = public_url
       @roll_scope = roll_scope
       @workspace_storage_class = workspace_storage_class.to_s.strip
-      @registry_url = registry_url.to_s.strip
-      @registry_ca  = registry_ca.to_s
+      @registry_url  = registry_url.to_s.strip
+      @registry_path    = registry_path.to_s.strip
+      @registry_repos   = registry_repos.to_s.strip
+      @registry_catalog = registry_catalog.to_s.strip
+      @registry_mode    = registry_mode.to_s.strip
+      @registry_user   = registry_user.to_s.strip
+      @registry_pass   = registry_pass.to_s
+      @registry_pull_secret = registry_pull_secret.to_s.strip
+      @registry_ca      = registry_ca.to_s
     end
 
     # Config option specs owned by the control plane (aggregated by deploy.rb).
@@ -70,7 +82,10 @@ module Carbide
       # on it (the multi-node binary-bytes durability fix). --set-string so a
       # class name is never coerced.
       args.push('--set-string', "workspace.storageClassName=#{@workspace_storage_class}") unless @workspace_storage_class.empty?
-      if @images.registry
+      # Only a PULLING cluster gets registry-pinned SHA tags. A box that pushes
+      # to a registry for others but imports :dev locally must not point its
+      # own pods at that registry (ADR-028 §5) — that was the ImagePullBackOff.
+      if @pull
         tags = @images.image_tags
         # --set-string so an all-digit SHA tag is never coerced to a number.
         args.push('--set-string', "image.repository=#{@images.repository(:control)}",
@@ -82,13 +97,29 @@ module Carbide
         # list available tags. The CA PEM is the mkcert rootCA that signs the
         # registry's cert — multi-line, so it must be a YAML block scalar in a
         # values file, never a --set-string (newlines would break helm).
-        args.push('--set-string', "registry.url=#{@registry_url}")
+        push_set_string(args, 'registry.url', @registry_url)
+        # Namespace between host and image (GitLab: group/project). Empty keeps
+        # the flat self-hosted shape.
+        push_set_string(args, 'registry.path', @registry_path) unless @registry_path.empty?
+        push_set_string(args, 'registry.repos', @registry_repos) unless @registry_repos.empty?
+        # mode=gitlab: a GitLab registry has no /v2/_catalog. Default the catalog
+        # check off unless it was set explicitly.
+        effective_catalog = @registry_catalog
+        effective_catalog = 'no' if effective_catalog.empty? && @registry_mode == 'gitlab'
+        push_set_string(args, 'registry.catalog', effective_catalog) unless effective_catalog.empty?
+        # Auth for the imagePullSecret the chart renders for its own pods and the
+        # operator builds per workspace namespace. Sent to helm so both get them;
+        # skipped entirely when unset (self-hosted, where trust is the CA).
+        push_set_string(args, 'registry.username', @registry_user) unless @registry_user.empty?
+        push_set_string(args, 'registry.password', @registry_pass) unless @registry_pass.empty?
+        push_set_string(args, 'registry.pullSecret', @registry_pull_secret) unless @registry_pull_secret.empty?
         if @registry_ca && !@registry_ca.empty?
           ca_file = write_registry_ca_values(@registry_ca)
           args.push('--values', ca_file)
         end
       end
-      args.push('--wait', '--timeout', '5m')
+      # Do NOT --wait on initial install, deadlock from 96853e9
+      #args.push('--wait', '--timeout', '5m')
       @cmd.run(*args)
     end
 
@@ -98,12 +129,12 @@ module Carbide
         return
       end
 
-      # Registry mode pins a new immutable tag on every code change, so the helm
-      # upgrade above already changed the pod spec and Kubernetes rolled the
+      # A pulling cluster pins a new immutable tag on every code change, so the
+      # helm upgrade above already changed the pod spec and Kubernetes rolled the
       # affected Deployments. A forced restart would only churn pods pointlessly
       # (and re-pull is a no-op on IfNotPresent), so skip it.
-      if @images.registry
-        log "registry mode — helm rolled changed deployments via new image tags; skipping forced restart"
+      if @pull
+        log 'pull mode — helm rolled changed deployments via new image tags; skipping forced restart'
         return
       end
 
@@ -144,6 +175,22 @@ module Carbide
     end
 
     private
+
+    # helm's --set-string takes a comma-separated list of key=value pairs, so a
+    # comma INSIDE a value ends the pair and the next fragment is read as a key
+    # with no value: `registry.repos=a,b,c` fails with
+    # `key "b" has no value (cannot end with ,)`. Braces open helm's own list
+    # literal and a backslash is its escape character, so all three are escaped,
+    # backslash first or the escapes would escape each other.
+    #
+    # Every --set-string goes through here rather than only the values known to
+    # contain commas today: a registry token or a password is opaque, and the
+    # failure mode is a deploy that dies mid-helm with a message naming a
+    # fragment of a credential.
+    def push_set_string(args, key, value)
+      escaped = value.to_s.gsub('\\', '\\\\\\\\').gsub(',', '\\,').gsub('{', '\\{').gsub('}', '\\}')
+      args.push('--set-string', "#{key}=#{escaped}")
+    end
 
     # Write the CA PEM as a YAML block scalar so helm can consume it without the
     # multi-line --set-string shell-mangling problem. Content must be indented
