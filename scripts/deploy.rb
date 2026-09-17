@@ -690,6 +690,13 @@ module Carbide
     # copy to compare against.
     def skip_build?
       return false unless @push
+      # A box that both pushes and imports is a real configuration (a dev box
+      # serving the fleet's registry runs its own k3d on imported :dev images),
+      # and for the import half a registry-side hit proves nothing: the local
+      # :dev images are a separate artifact. Skipping here left import_images
+      # aborting on a missing image or importing a stale one from an earlier
+      # checkout, while the registry held the current tags.
+      return false if @consume == :import
 
       skip = @images.all_present?
       log "all image tags already in registry #{@registry.endpoint} — skipping build" if skip

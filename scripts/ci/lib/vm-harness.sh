@@ -116,8 +116,12 @@ ensure_base_image() {
   for ((i = 1; i <= count; i++)); do
     host="$(vm_host "$i")"
     if [ -z "$host" ]; then
-      mkdir -p "$(dirname "$VM_IMG_CACHE")"
+      # prepare_disk and virt-install read ${VM_IMG_DIR}/${VM_IMG_FILE}, and
+      # vm_push is a no-op for a local host, so the cache alone is not enough
+      # here: the file has to land where the disk is built from.
+      mkdir -p "$VM_IMG_DIR" "$(dirname "$VM_IMG_CACHE")"
       [ -f "$VM_IMG_CACHE" ] || { _vm_log "downloading base image"; curl -fL --retry 3 -o "$VM_IMG_CACHE" "$VM_IMG_URL"; }
+      [ -f "${VM_IMG_DIR}/${VM_IMG_FILE}" ] || cp "$VM_IMG_CACHE" "${VM_IMG_DIR}/${VM_IMG_FILE}"
     else
       if ! vm_sh "$host" "test -f ${VM_IMG_DIR}/${VM_IMG_FILE}"; then
         _vm_log "syncing base image to $host"

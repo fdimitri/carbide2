@@ -39,7 +39,10 @@ wait_provisioned() {
 }
 
 deploy_args() {
-  local a=""
+  # --no-pull is not optional here. The VM cloned CARBIDE_REPO_REF (the pipeline
+  # commit), and deploy.rb self-updates to main by default — which would deploy
+  # something other than what CI is testing.
+  local a="--no-pull"
   [[ "${SKIP_SHELL:-0}" == "1" ]] && a+=" --no-images.shell"
   echo "$a"
 }
@@ -79,7 +82,7 @@ do_up() {
     scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       -i "$VM_SSH_KEY" "$CLUSTER_YAML" "${VM_SSH_USER}@${ip}:~/carbide2/cluster.yaml"
     vm_ssh "$n" "cd ~/carbide2 && ./scripts/deploy.rb --config cluster.yaml \
-      --node.role join --no-images.build --no-images.push --no-registry.serve"
+      --node.role join --no-images.build --no-images.push --no-registry.serve $(deploy_args)"
   done
 
   _vm_log "verifying cluster membership"

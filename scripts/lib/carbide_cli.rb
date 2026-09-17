@@ -569,7 +569,7 @@ module Carbide
       sha = tag_for(:client)
       unless @opts[:source] == 'build' || @opts[:force]
         case client.cache_detect(sha)
-        when :present     then return skip("registry has carbide2-client:#{sha}")
+        when :present     then return skip("registry has carbide2-client:#{sha}") unless @opts[:force_rebuild]
         when :unreachable then return strict_stop('registry')
         when :absent      then strict_absent!('registry') unless @opts[:source] == 'auto'
         end

@@ -91,9 +91,11 @@ build:images-old:
     # The client is not in the registry, so it is not built here.
     - echo "scripts/build.rb $ARGS"
     - scripts/build.rb $ARGS
+  # Kept in the file on purpose, but no longer scheduled: carcli supersedes it.
+  # when: never rather than deletion so the old argv is still here to compare
+  # against (and to restore in one line if the new path misbehaves).
   rules:
-    - if: $CI_PIPELINE_SOURCE == "push"          # every push
-    - if: $CI_COMMIT_TAG
+    - when: never
 build:images-new:
   stage: build
   tags: [build-fast]
@@ -116,9 +118,9 @@ build:client-old:
   script:
     - !reference [.ci-registry, script]
     - scripts/build-client --cache "$CI_REGISTRY_IMAGE" --no-upload
+  # Superseded by build:client; see build:images-old.
   rules:
-    - if: $CI_PIPELINE_SOURCE == "push"
-    - if: $CI_COMMIT_TAG
+    - when: never
 
 build:client:
   stage: build
@@ -149,6 +151,10 @@ cluster:bringup:
     VM_VG: "carbide-vg"
     # LV mode only; must be 1 to confirm VM_VG is CI-dedicated (see README).
     VM_LV_ACK: "0"
+    # What the VMs clone + check out. Without this the guests clone main and
+    # deploy.rb self-updates to main, so the pipeline would test main rather
+    # than the commit it is running for.
+    CARBIDE_REPO_REF: "$CI_COMMIT_SHA"
   script:
     - scripts/ci/cluster-bringup.sh up
   after_script:
