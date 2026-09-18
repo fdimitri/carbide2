@@ -10,5 +10,5 @@
 # The component SHAs are the submodule gitlinks (and the image tags); they are
 # not repeated here because they change every commit, whereas this file names a
 # release.
-version: 0.6.0
-codename: magnum
+version: 0.7.1
+codename: mugatu
