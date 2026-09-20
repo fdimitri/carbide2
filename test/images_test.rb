@@ -361,6 +361,27 @@ class ImagesTest < Minitest::Test
     assert_equal 1, docker.docker_commands('login').length
   end
 
+  def test_ci_login_does_not_write_the_shared_docker_config
+    prev_job = ENV['CI_JOB_ID']
+    prev_dir = ENV['CI_PROJECT_DIR']
+    prev_cfg = ENV['DOCKER_CONFIG']
+    ENV['CI_JOB_ID'] = 'job-99'
+    ENV.delete('CI_PROJECT_DIR')
+    ENV.delete('DOCKER_CONFIG')
+    docker = Carbide::TestSupport::FakeDocker.new
+    reg = Carbide::Registry.new(cmd: docker, quiet: docker, host: 'registry.test',
+                                port: '5000', username: 'gitlab-ci-token', password: 'tok')
+    reg.login!
+    cfg = ENV['DOCKER_CONFIG']
+    assert cfg && !cfg.empty?, 'CI login must set DOCKER_CONFIG'
+    assert_includes cfg, 'job-99'
+    refute_equal File.expand_path('~/.docker'), File.expand_path(cfg)
+  ensure
+    prev_job ? ENV['CI_JOB_ID'] = prev_job : ENV.delete('CI_JOB_ID')
+    prev_dir ? ENV['CI_PROJECT_DIR'] = prev_dir : ENV.delete('CI_PROJECT_DIR')
+    prev_cfg ? ENV['DOCKER_CONFIG'] = prev_cfg : ENV.delete('DOCKER_CONFIG')
+  end
+
   # No credentials configured (a self-hosted registry) must not attempt a login.
   def test_detect_does_not_log_in_without_credentials
     docker = Carbide::TestSupport::FakeDocker.new
