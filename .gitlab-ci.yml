@@ -41,6 +41,14 @@ variables:
       REGISTRY_PASSWORD="${REGISTRY_PASSWORD:-${CI_REGISTRY_PASSWORD:-$CI_JOB_TOKEN}}"
       [ -n "$REGISTRY_HOST" ] || { echo "no registry: CI_REGISTRY unset"; exit 1; }
       export REGISTRY_HOST REGISTRY_PORT REGISTRY_PATH REGISTRY_MODE REGISTRY_USERNAME REGISTRY_PASSWORD
+      # Shell executor: concurrent jobs share ~/.docker/config.json. The
+      # gitlab-ci-token password is this job's CI_JOB_TOKEN and dies when the
+      # job ends. Another job's `docker login` to the same registry host
+      # overwrites the file; this job's later `docker push` then gets HTTP
+      # Basic Access denied. Isolate the cred store to this job's build dir.
+      DOCKER_CONFIG="${DOCKER_CONFIG:-$CI_PROJECT_DIR/.docker-ci}"
+      mkdir -p "$DOCKER_CONFIG"
+      export DOCKER_CONFIG
     - echo "registry $REGISTRY_HOST:$REGISTRY_PORT path=$REGISTRY_PATH mode=$REGISTRY_MODE user=$REGISTRY_USERNAME"
     # What each script will actually WRITE to. The two are derived differently —
     # build.rb reassembles REGISTRY_HOST + REGISTRY_PORT + REGISTRY_PATH, while

@@ -2,6 +2,7 @@
 
 require 'fileutils'
 require 'tempfile'
+require 'tmpdir'
 require 'json'
 require_relative 'carbide_command'
 
@@ -159,11 +160,30 @@ module Carbide
     def login!
       return false unless auth?
 
+      isolate_docker_config!
       @cmd.run('docker', 'login', endpoint,
                '--username', @username, '--password-stdin',
                stdin: @password)
       true
     end
+
+    # Shell-executor runners share ~/.docker/config.json across concurrent
+    # jobs. `docker login gitlab-ci-token` writes this job's CI_JOB_TOKEN
+    # there; the next job on the same box overwrites it. A push after the
+    # build then authenticates as whoever logged in last — often a token
+    # GitLab has already revoked. Pin Docker's cred store to this job.
+    # Callers that already set DOCKER_CONFIG keep it.
+    def isolate_docker_config!
+      return if ENV['CI_JOB_ID'].to_s.strip.empty?
+      return unless ENV['DOCKER_CONFIG'].to_s.strip.empty?
+
+      base = ENV['CI_PROJECT_DIR'].to_s.strip
+      base = Dir.tmpdir if base.empty?
+      dir = File.join(base, ".docker-ci-#{ENV['CI_JOB_ID']}")
+      FileUtils.mkdir_p(dir)
+      ENV['DOCKER_CONFIG'] = dir
+    end
+    private :isolate_docker_config!
     def serve?      = @serve
     # "host[:port]" — the :port only when one is configured.
     def endpoint    = configured? ? (@port ? "#{@host}:#{@port}" : @host) : nil
